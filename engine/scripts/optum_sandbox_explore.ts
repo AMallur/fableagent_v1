@@ -26,7 +26,8 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 
-const TOKEN_URL = process.env.OPTUM_TOKEN_URL ?? 'https://apigw.optum.com/apip/auth/v2/token/';
+const TOKEN_URL =
+  process.env.OPTUM_TOKEN_URL ?? 'https://sandbox-apigw.optum.com/apip/auth/v2/token';
 const CLIENT_ID = process.env.OPTUM_CLIENT_ID;
 const CLIENT_SECRET = process.env.OPTUM_CLIENT_SECRET;
 const API_BASE = process.env.OPTUM_API_BASE_URL;
@@ -38,16 +39,19 @@ async function getAccessToken(): Promise<string> {
     throw new Error('Set OPTUM_CLIENT_ID and OPTUM_CLIENT_SECRET first.');
   }
 
-  const body = new URLSearchParams({
-    grant_type: 'client_credentials',
+  const body = {
     client_id: CLIENT_ID,
     client_secret: CLIENT_SECRET,
-  });
+    grant_type: 'client_credentials',
+  };
 
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
+    headers: {
+      Accept: '*/*',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
   });
 
   const text = await res.text();
