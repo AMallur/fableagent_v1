@@ -39,19 +39,19 @@ async function getAccessToken(): Promise<string> {
     throw new Error('Set OPTUM_CLIENT_ID and OPTUM_CLIENT_SECRET first.');
   }
 
-  const body = {
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
     client_id: CLIENT_ID,
     client_secret: CLIENT_SECRET,
-    grant_type: 'client_credentials',
-  };
+  });
 
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
     headers: {
       Accept: '*/*',
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: JSON.stringify(body),
+    body,
   });
 
   const text = await res.text();
