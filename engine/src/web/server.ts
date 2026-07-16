@@ -26,7 +26,8 @@ import {
   detectFileKind, ingestFileByKind, ingestParsed835, ingestParsed837, previewIngestFile,
 } from '../ingest/service.ts';
 import { dispatchAppealSubmission, dispatchCaseWriteback } from '../integration/connectors.ts';
-import { validatePassword } from '../security/crypto.ts';
+import { validatePassword, ensureDataEncryptionKeyConfigured } from '../security/crypto.ts';
+import { requireSecret } from '../security/secrets.ts';
 import {
   buildLoginUrl, loadSsoConfig, mapGroupsToRole, spMetadataXml, validateAcsResponse,
 } from '../security/sso.ts';
@@ -57,8 +58,23 @@ export interface ServerOptions {
   asOf?: () => string;   // injectable clock for tests
 }
 
+// HTTPS/Secure-cookie enforcement: on by default in production, no flag to
+// remember. FORCE_HTTPS=1 remains as an explicit override for staging or
+// other non-production environments that still sit behind TLS — but nothing
+// about production behavior depends on anyone setting it.
+const requireHttps = (): boolean =>
+  process.env.NODE_ENV === 'production' || process.env.FORCE_HTTPS === '1';
+
+function getSessionSecret(explicit?: string): string {
+  if (explicit) return explicit;
+  return requireSecret('SESSION_SECRET', { devFallback: 'dev-secret-change-me' });
+}
+
 export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
-  const secret = opts.sessionSecret ?? process.env.SESSION_SECRET ?? 'dev-secret-change-me';
+  // fail at boot, not on the first request that happens to need these
+  const secret = getSessionSecret(opts.sessionSecret);
+  ensureDataEncryptionKeyConfigured();
+
   const store = opts.store ?? new FileSystemDocumentStore();
   const today = opts.asOf ?? (() => new Date().toISOString().slice(0, 10));
 
@@ -76,7 +92,7 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     ctx.res.end();
   };
   const baseUrl = (ctx: Ctx): string => {
-    const proto = process.env.FORCE_HTTPS === '1' ? 'https'
+    const proto = requireHttps() ? 'https'
       : (ctx.req.headers['x-forwarded-proto'] as string) ?? 'http';
     return `${proto}://${ctx.req.headers.host ?? 'localhost'}`;
   };
@@ -164,6 +180,18 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
   const authed = (method: string, pattern: RegExp, h: Handler) =>
     route(method, pattern, requireAuth(h, pattern.source.startsWith('^\\/api') ? 'api' : 'page'));
 
+  // health check — unauthenticated, no session/tenant context; verifies the
+  // process can actually reach the database, not just that it's listening.
+  // Used by the Docker HEALTHCHECK and any external uptime/orchestrator probe.
+  route('GET', /^\/healthz$/, async (ctx) => {
+    try {
+      await pool.query('SELECT 1');
+      json(ctx, 200, { status: 'ok' });
+    } catch (err: any) {
+      json(ctx, 503, { status: 'unhealthy', error: err?.message ?? 'database unreachable' });
+    }
+  });
+
   // static assets
   route('GET', /^\/assets\/app\.css$/, async (ctx) => {
     ctx.res.writeHead(200, { 'Content-Type': 'text/css', 'Cache-Control': 'max-age=300' });
@@ -174,7 +202,7 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     ctx.res.end(CLIENT_JS);
   });
 
-  const secureFlag = process.env.FORCE_HTTPS === '1' ? '; Secure' : '';
+  const secureFlag = requireHttps() ? '; Secure' : '';
   const setSessionCookie = (ctx: Ctx, session: Session) => {
     ctx.res.setHeader('Set-Cookie',
       `${COOKIE_NAME}=${encodeSession(session, secret)}; HttpOnly; Path=/; SameSite=Lax${secureFlag}`);
@@ -800,8 +828,8 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     const url = new URL(req.url ?? '/', 'http://localhost');
 
     // HTTPS enforcement (behind a TLS-terminating proxy): redirect plain HTTP
-    // and pin HSTS. Enabled with FORCE_HTTPS=1.
-    if (process.env.FORCE_HTTPS === '1') {
+    // and pin HSTS. On by default in production — see requireHttps() above.
+    if (requireHttps()) {
       res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
       if ((req.headers['x-forwarded-proto'] ?? 'http') !== 'https') {
         res.writeHead(301, { Location: `https://${req.headers.host}${req.url}` });
@@ -821,8 +849,7 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     if (session?.tm && session.exp - Date.now() < (session.tm * 60_000) / 2) {
       const renewed = { ...session, exp: Date.now() + session.tm * 60_000 };
       res.setHeader('Set-Cookie',
-        `${COOKIE_NAME}=${encodeSession(renewed, secret)}; HttpOnly; Path=/; SameSite=Lax`
-        + (process.env.FORCE_HTTPS === '1' ? '; Secure' : ''));
+        `${COOKIE_NAME}=${encodeSession(renewed, secret)}; HttpOnly; Path=/; SameSite=Lax${secureFlag}`);
     }
 
     try {

@@ -41,8 +41,11 @@ if (!values.tenant && command !== 'schedule') {
 }
 
 const { default: pg } = await import('pg');
+const { pgSslConfig } = await import('./web/db_ssl.ts');
+const { readFileSync } = await import('node:fs');
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL ?? 'postgres://localhost:5432/rcm_dev',
+  ssl: pgSslConfig(readFileSync),
 });
 
 try {

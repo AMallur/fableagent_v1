@@ -16,8 +16,11 @@ import { generateAppealPackets } from '../src/appeals/service.ts';
 import { FileSystemDocumentStore } from '../src/appeals/storage.ts';
 
 const { default: pg } = await import('pg');
+const { pgSslConfig } = await import('../src/web/db_ssl.ts');
+const { readFileSync } = await import('node:fs');
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL ?? 'postgres://localhost:5432/rcm_dev',
+  ssl: pgSslConfig(readFileSync),
 });
 const q = (text: string, p?: unknown[]) => pool.query(text, p);
 

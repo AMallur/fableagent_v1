@@ -6,6 +6,7 @@
 // ============================================================================
 
 import { createCipheriv, createDecipheriv, createHmac, createHash, randomBytes } from 'node:crypto';
+import { requireSecret } from './secrets.ts';
 
 // ---------------------------------------------------------------------------
 // password policy
@@ -45,13 +46,25 @@ export function passwordExpiredForRole(
 
 // ---------------------------------------------------------------------------
 // secret encryption at rest (AES-256-GCM)
-// Key from DATA_ENCRYPTION_KEY env; a fixed dev key is used otherwise so
-// development works out of the box — production MUST set the env var.
+// Key from DATA_ENCRYPTION_KEY (env or DATA_ENCRYPTION_KEY_FILE). In
+// production this throws rather than silently falling back — see
+// security/secrets.ts. Call ensureDataEncryptionKeyConfigured() eagerly at
+// process startup so a misconfigured deploy fails at boot, not on the first
+// SFTP credential save.
 // ---------------------------------------------------------------------------
 
+function dataEncryptionKeySource(): string {
+  return requireSecret('DATA_ENCRYPTION_KEY', {
+    devFallback: 'dev-only-data-key-set-DATA_ENCRYPTION_KEY',
+  });
+}
+
+export function ensureDataEncryptionKeyConfigured(): void {
+  dataEncryptionKeySource();
+}
+
 function encryptionKey(): Buffer {
-  const source = process.env.DATA_ENCRYPTION_KEY ?? 'dev-only-data-key-set-DATA_ENCRYPTION_KEY';
-  return createHash('sha256').update(source).digest();
+  return createHash('sha256').update(dataEncryptionKeySource()).digest();
 }
 
 export function encryptSecret(plaintext: string): string {
