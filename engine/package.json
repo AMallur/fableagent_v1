@@ -9,16 +9,19 @@
   },
   "scripts": {
     "test": "node --test test/engine.test.ts test/appeals.test.ts test/ingest.test.ts test/security.test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration.test.ts test/pipeline_integration.test.ts test/web_integration.test.ts test/automation_integration.test.ts test/api_integration.test.ts test/admin_integration.test.ts",
+    "test:integration": "node --test --test-concurrency=1 test/integration.test.ts test/pipeline_integration.test.ts test/web_integration.test.ts test/automation_integration.test.ts test/api_integration.test.ts test/admin_integration.test.ts test/sftp_integration.test.ts",
     "detect": "node src/cli.ts detect",
     "appeals": "node src/cli.ts appeals",
     "queue": "node src/cli.ts queue",
     "web": "node src/web/main.ts",
     "seed": "node scripts/seed_demo.ts",
-    "scheduler": "node src/cli.ts schedule"
+    "scheduler": "node src/cli.ts schedule",
+    "test:sftp": "node --test test/sftp_integration.test.ts"
   },
   "dependencies": {
     "@node-saml/node-saml": "^5.1.0",
-    "pg": "^8.16.3"
+    "nodemailer": "^9.0.3",
+    "pg": "^8.16.3",
+    "ssh2": "^1.17.0"
   }
 }

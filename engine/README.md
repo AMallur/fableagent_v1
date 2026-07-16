@@ -179,9 +179,19 @@ and mutate it — run `node scripts/seed_demo.ts` before each integration pass.
 the scheduler sweeps every tick. Files are typed by extension/content
 (835/ERA, 837, CSV), ingested, and archived to `processed/<date>-<name>`;
 failures move to `errors/<name>` with `errors/<name>.log` carrying the parse
-error (the failed `system_job` row has it too). The SFTP server itself is
-deployment infrastructure (chrooted sshd or a managed transfer service) —
-this module owns everything from file arrival onward.
+error (the failed `system_job` row has it too).
+
+The SFTP server is real and embedded (`src/integration/sftp_server.ts`, via
+`ssh2` — `npm run` … `node src/cli.ts sftp-server`, or the `sftp` service in
+docker-compose). One process, one port, per-client credentials issued from
+the admin UI (Client Administration → Integration → "Generate new
+credentials," shown once, scrypt-hashed at rest). Each client is confined to
+their own folder — no read, delete, rename, or path-traversal escape; the
+only permitted operation is dropping a flat file, which the sweep then picks
+up exactly as if it arrived by hand. Deliberately narrower than a real
+general-purpose SFTP server, because upload is the only legitimate use.
+`test/sftp_integration.test.ts` drives a real `ssh2` client against a real
+running instance of it — not a mock of either side.
 
 **Inbound method 2 — manual upload.** The client admin page parses uploads
 for a preview (transactions, payers, checks, claim/line counts, totals, and
@@ -369,3 +379,43 @@ engine only identifies).
 
 All arithmetic goes through `round2` with a half-cent epsilon on comparisons
 (`moneyGt`) — no raw float equality anywhere.
+
+## Running this for real
+
+`docker-compose.yml` and `Caddyfile` at the repo root are the deployment
+reference: Postgres (dev/staging — point `DATABASE_URL` at a managed,
+encrypted-at-rest instance for anything carrying real PHI), a one-shot
+`migrate` service, the `app`, `scheduler`, and `sftp` containers, and Caddy
+handling TLS termination automatically (real Let's Encrypt certs, HSTS, no
+manual cert handling). `sftp` publishes port 2222 — map it to 22 at your
+firewall/load balancer if clients expect the standard port.
+
+```sh
+cp .env.example .env    # fill in real values; .env is gitignored
+docker compose up -d
+```
+
+Security posture, enforced in code rather than left to configuration
+discipline:
+- **HTTPS is mandatory whenever `NODE_ENV=production`** — no flag to
+  remember (`FORCE_HTTPS=1` still exists as an explicit override for
+  non-production environments that want it). See `requireHttps()` in
+  `src/web/server.ts`.
+- **`SESSION_SECRET` and `DATA_ENCRYPTION_KEY` are required in production** —
+  the process refuses to boot without them (`src/security/secrets.ts`),
+  rather than silently falling back to a dev value. Both support the
+  `${NAME}_FILE` convention for Docker/Kubernetes secrets or any secrets
+  manager that injects via a mounted file.
+- **`/healthz`** is unauthenticated and checks real DB connectivity, not
+  just that the process is listening — used by the Docker `HEALTHCHECK` and
+  any external uptime probe.
+- **Email notifications need SMTP configured to actually deliver** —
+  unconfigured, they're logged, not sent (`resolveEmailTransport()` in
+  `src/automation/notify.ts`). This is generic SMTP, so any provider works.
+  **Do not point this at a real inbox until a BAA is signed with whichever
+  provider owns `SMTP_HOST`** — these bodies carry PHI-derived content
+  (patient names, case/claim detail), and an unsigned relay is a HIPAA
+  violation independent of anything else being correct.
+
+What this does *not* do: provision the managed Postgres instance itself — an
+account with a cloud provider, no code can create that.
