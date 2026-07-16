@@ -17,7 +17,7 @@ import path from 'node:path';
 
 const [command, ...rest] = process.argv.slice(2);
 const COMMANDS = ['detect', 'appeals', 'queue', 'ingest-835', 'ingest-837',
-  'schedule', 'nightly', 'monitor', 'reconcile', 'weekly'];
+  'schedule', 'nightly', 'monitor', 'reconcile', 'weekly', 'sftp-server'];
 
 if (!command || !COMMANDS.includes(command)) {
   console.error(`usage: node src/cli.ts <${COMMANDS.join('|')}> --tenant <uuid> [options]`);
@@ -35,7 +35,7 @@ const { values } = parseArgs({
   },
 });
 
-if (!values.tenant && command !== 'schedule') {
+if (!values.tenant && command !== 'schedule' && command !== 'sftp-server') {
   console.error(`${command}: --tenant <uuid> is required`);
   process.exit(2);
 }
@@ -130,6 +130,19 @@ try {
       await new Promise<void>((resolve) => {
         process.on('SIGINT', () => { handle.stop(); resolve(); });
         process.on('SIGTERM', () => { handle.stop(); resolve(); });
+      });
+      break;
+    }
+
+    case 'sftp-server': {
+      // long-running: embedded per-client SFTP drop server until killed
+      const { startSftpServer } = await import('./integration/sftp_server.ts');
+      const srv = await startSftpServer(pool);
+      console.error(`SFTP server listening on port ${srv.port} — ctrl-c to stop`);
+      await new Promise<void>((resolve) => {
+        const stop = () => { srv.close().then(() => resolve()); };
+        process.on('SIGINT', stop);
+        process.on('SIGTERM', stop);
       });
       break;
     }

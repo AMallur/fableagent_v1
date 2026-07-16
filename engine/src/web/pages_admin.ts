@@ -295,6 +295,16 @@ export const CLIENT_ADMIN_BODY = `
       <button class="btn small" id="key-create">Create key</button>
     </div>
     <div id="key-new" class="sub" style="margin-top:6px"></div>
+    <h2 style="margin-top:14px">Inbound SFTP drop</h2>
+    <div class="sub" style="margin-bottom:6px">Credentials for the client's PM/clearinghouse
+      to push 835/837/CSV files directly. Files land in the same folder the manual upload
+      zone and nightly sweep use.</div>
+    <div id="sftp-cred-status"></div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn small" id="sftp-cred-generate">Generate new credentials</button>
+      <button class="btn small danger" id="sftp-cred-revoke" style="display:none">Revoke</button>
+    </div>
+    <div id="sftp-cred-new" class="sub" style="margin-top:6px"></div>
     <h2 style="margin-top:14px">Outbound deliveries</h2>
     <table class="data" id="deliveries"><tbody></tbody></table>
   </div>
@@ -379,6 +389,16 @@ async function load() {
   $('#ch-name').value = it.clearinghouseName || ''; $('#pm-name').value = it.pmSystem || '';
   $('#int-status').textContent = it.lastTestedAt
     ? 'last tested ' + fmtWhen(it.lastTestedAt) : 'never tested';
+
+  if (it.sftpInboundEnabled && it.sftpInboundUsername) {
+    $('#sftp-cred-status').innerHTML =
+      '<span class="badge won">active</span> username <code>' + esc(it.sftpInboundUsername) +
+      '</code> · issued ' + fmtWhen(it.sftpInboundCreatedAt);
+    $('#sftp-cred-revoke').style.display = '';
+  } else {
+    $('#sftp-cred-status').innerHTML = '<span class="badge lost">none configured</span>';
+    $('#sftp-cred-revoke').style.display = 'none';
+  }
 
   const steps = (await api('/api/admin/clients/' + clientId + '/onboarding')).steps;
   const done = steps.filter((s) => s.completed).length;
@@ -542,6 +562,27 @@ $('#key-create').addEventListener('click', async () => {
     $('#key-new').innerHTML = '<b>Copy this key now — it is shown once:</b> ' +
       '<code style="user-select:all">' + esc(r.apiKey) + '</code>';
     $('#key-name').value = ''; loadKeys();
+  } catch (e) { toast(e.message, true); }
+});
+$('#sftp-cred-generate').addEventListener('click', async () => {
+  if (detail.integration && detail.integration.sftpInboundEnabled) {
+    if (!confirm('This replaces the existing credentials — the old ones stop working immediately. Continue?')) return;
+  }
+  try {
+    const r = await api('/api/admin/clients/' + clientId + '/sftp-credentials', { method: 'POST', body: '{}' });
+    $('#sftp-cred-new').innerHTML =
+      '<b>Copy these now — the password is shown once:</b><br>' +
+      'Username: <code style="user-select:all">' + esc(r.username) + '</code><br>' +
+      'Password: <code style="user-select:all">' + esc(r.password) + '</code>';
+    load();
+  } catch (e) { toast(e.message, true); }
+});
+$('#sftp-cred-revoke').addEventListener('click', async () => {
+  if (!confirm('Revoke SFTP access for this client? Their PM/clearinghouse will no longer be able to connect.')) return;
+  try {
+    await api('/api/admin/clients/' + clientId + '/sftp-credentials/revoke', { method: 'POST', body: '{}' });
+    $('#sftp-cred-new').innerHTML = '';
+    toast('SFTP credentials revoked'); load();
   } catch (e) { toast(e.message, true); }
 });
 load(); loadKeys();`;

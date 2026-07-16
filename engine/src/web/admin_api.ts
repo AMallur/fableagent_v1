@@ -281,7 +281,8 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
     `SELECT sftp_host, sftp_port, sftp_username,
             (sftp_password_encrypted IS NOT NULL) AS sftp_password_set,
             sftp_path, clearinghouse_name, clearinghouse_status,
-            pm_system, pm_status, last_tested_at
+            pm_system, pm_status, last_tested_at,
+            sftp_inbound_enabled, sftp_inbound_username, sftp_inbound_created_at
      FROM client_integration WHERE client_id = $1`, [clientId]);
 
   return {
@@ -326,6 +327,9 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
       clearinghouseStatus: integration.rows[0].clearinghouse_status,
       pmSystem: integration.rows[0].pm_system, pmStatus: integration.rows[0].pm_status,
       lastTestedAt: when(integration.rows[0].last_tested_at),
+      sftpInboundEnabled: integration.rows[0].sftp_inbound_enabled,
+      sftpInboundUsername: integration.rows[0].sftp_inbound_username,
+      sftpInboundCreatedAt: when(integration.rows[0].sftp_inbound_created_at),
     } : null,
   };
 }
@@ -695,6 +699,49 @@ export async function testIntegration(db: Queryable, sess: Session, s: Scope, cl
      WHERE client_id = $1`, [clientId]);
   await adminAudit(db, sess, 'integration_tested', 'client', clientId, { host: i.sftp_host });
   return { ok: true, tested: true };
+}
+
+// ---------------------------------------------------------------------------
+// inbound SFTP credentials — WE run the server (integration/sftp_server.ts);
+// this issues the client a username/password to push 835/837/CSV files to
+// their own chrooted folder. Same shown-once pattern as API keys: the
+// plaintext password is returned exactly once and never stored reversibly.
+// ---------------------------------------------------------------------------
+
+function randomSftpUsername(clientId: UUID): string {
+  return `c-${clientId.slice(0, 8)}-${randomBytes(3).toString('hex')}`;
+}
+
+export async function generateSftpCredentials(
+  db: Queryable, sess: Session, s: Scope, clientId: UUID,
+): Promise<{ ok: true; username: string; password: string }> {
+  assertClientAccess(sess, s, clientId);
+  const username = randomSftpUsername(clientId);
+  const password = randomBytes(18).toString('base64url');
+  await db.query(
+    `INSERT INTO client_integration
+       (tenant_id, client_id, sftp_inbound_enabled, sftp_inbound_username,
+        sftp_inbound_password_hash, sftp_inbound_created_at)
+     VALUES ($1, $2, true, $3, $4, now())
+     ON CONFLICT (client_id) DO UPDATE SET
+       sftp_inbound_enabled = true,
+       sftp_inbound_username = $3,
+       sftp_inbound_password_hash = $4,
+       sftp_inbound_created_at = now()`,
+    [s.tenantId, clientId, username, hashPassword(password)]);
+  await adminAudit(db, sess, 'sftp_credentials_generated', 'client', clientId, { username });
+  return { ok: true, username, password };
+}
+
+export async function revokeSftpCredentials(
+  db: Queryable, sess: Session, s: Scope, clientId: UUID,
+): Promise<{ ok: true }> {
+  assertClientAccess(sess, s, clientId);
+  await db.query(
+    `UPDATE client_integration SET sftp_inbound_enabled = false WHERE client_id = $1`,
+    [clientId]);
+  await adminAudit(db, sess, 'sftp_credentials_revoked', 'client', clientId, {});
+  return { ok: true };
 }
 
 // ============================================================================

@@ -724,6 +724,12 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
   authed('POST', /^\/api\/admin\/api-keys\/([0-9a-f-]{36})\/revoke$/, async (ctx) =>
     json(ctx, 200, await pub.revokeApiKey(pool, ctx.session!, ctx.scope!, ctx.params[0])));
 
+  // ---- inbound SFTP credentials (admin UI) ------------------------------------
+  authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/sftp-credentials$/, async (ctx) =>
+    json(ctx, 200, await admin.generateSftpCredentials(pool, ctx.session!, ctx.scope!, ctx.params[0])));
+  authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/sftp-credentials\/revoke$/, async (ctx) =>
+    json(ctx, 200, await admin.revokeSftpCredentials(pool, ctx.session!, ctx.scope!, ctx.params[0])));
+
   // manual upload: parse-only preview before committing
   authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/ingest\/preview$/, async (ctx) => {
     admin.assertClientAccess(ctx.session!, ctx.scope!, ctx.params[0]);
