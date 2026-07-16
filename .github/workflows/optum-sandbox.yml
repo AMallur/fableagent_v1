@@ -30,4 +30,6 @@ jobs:
         env:
           OPTUM_CLIENT_ID: ${{ secrets.CLIENT_ID }}
           OPTUM_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          OPTUM_API_BASE_URL: https://sandbox-apigw.optum.com/rcm/prior-authorization/v1
+          OPTUM_ENDPOINT_PATH: /healthcheck
         run: node scripts/optum_sandbox_explore.ts
