@@ -123,7 +123,9 @@ try {
     case 'schedule': {
       // long-running: tick once a minute until killed
       const { startScheduler } = await import('./automation/scheduler.ts');
-      const handle = startScheduler(pool);
+      const { resolveEmailTransport } = await import('./automation/notify.ts');
+      const transport = await resolveEmailTransport();
+      const handle = startScheduler(pool, { transport });
       console.error('scheduler running — ctrl-c to stop');
       await new Promise<void>((resolve) => {
         process.on('SIGINT', () => { handle.stop(); resolve(); });

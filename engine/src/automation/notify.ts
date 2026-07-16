@@ -169,6 +169,78 @@ export class MemoryTransport implements EmailTransport {
   async send(email: any): Promise<void> { this.sent.push(email); }
 }
 
+/**
+ * Real delivery over SMTP. Deliberately generic — any provider that speaks
+ * SMTP works (Amazon SES, Postmark, SendGrid, Mailgun, a corporate relay),
+ * so there's no vendor SDK or lock-in here, just standard auth.
+ *
+ * IMPORTANT: these notification bodies can contain PHI-derived content
+ * (patient names, case/claim details in deadline and payment alerts). Do
+ * not point this at a real SMTP_HOST until a signed BAA is in place with
+ * whichever provider owns that host — an unsigned relay is a HIPAA
+ * violation the moment the first real email goes out, independent of how
+ * well the rest of the app is secured.
+ */
+export class SmtpTransport implements EmailTransport {
+  private readonly from: string;
+  private readonly transporter: import('nodemailer').Transporter;
+
+  /** private: use SmtpTransport.create() — nodemailer is loaded lazily via dynamic import */
+  private constructor(transporter: import('nodemailer').Transporter, from: string) {
+    this.transporter = transporter;
+    this.from = from;
+  }
+
+  static async create(opts: {
+    host: string; port: number; secure: boolean;
+    user?: string; pass?: string; from: string;
+  }): Promise<SmtpTransport> {
+    // dynamic import: environments that never construct an SmtpTransport
+    // (tests, the LogTransport-only default) never pay for loading it
+    const nodemailer = await import('nodemailer');
+    const transporter = nodemailer.default.createTransport({
+      host: opts.host, port: opts.port, secure: opts.secure,
+      auth: opts.user ? { user: opts.user, pass: opts.pass } : undefined,
+    });
+    return new SmtpTransport(transporter, opts.from);
+  }
+
+  async send(email: { toEmail: string; subject: string; bodyText: string }): Promise<void> {
+    await this.transporter.sendMail({
+      from: this.from, to: email.toEmail, subject: email.subject, text: email.bodyText,
+    });
+  }
+}
+
+/**
+ * Picks the transport from SMTP_* env vars. Falls back to LogTransport when
+ * unconfigured — loudly, in production, since silent non-delivery of
+ * deadline/payment alerts is a real operational problem, just not a
+ * boot-blocking one the way a missing encryption key is.
+ */
+export async function resolveEmailTransport(): Promise<EmailTransport> {
+  const host = process.env.SMTP_HOST;
+  if (!host) {
+    if (process.env.NODE_ENV === 'production') {
+      console.warn(
+        'SMTP_HOST is not set — notification emails (deadline alerts, '
+        + 'digests, weekly summaries) will only be logged, not delivered. '
+        + 'Set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/SMTP_FROM once a '
+        + 'BAA is signed with your email provider.',
+      );
+    }
+    return new LogTransport();
+  }
+  return SmtpTransport.create({
+    host,
+    port: Number(process.env.SMTP_PORT ?? 587),
+    secure: process.env.SMTP_SECURE === '1',
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+    from: process.env.SMTP_FROM ?? 'no-reply@localhost',
+  });
+}
+
 export async function deliverOutbox(
   db: Queryable, transport: EmailTransport, limit = 100,
 ): Promise<{ sent: number; failed: number }> {
