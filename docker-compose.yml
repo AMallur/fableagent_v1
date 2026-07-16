@@ -1,0 +1,138 @@
+# ============================================================================
+# Full-stack reference deployment: Postgres + one-shot migration + web app +
+# scheduler + Caddy (automatic TLS, no manual cert handling).
+#
+# The `db` service here is for local development and staging only — for a
+# real deployment carrying real PHI, point DATABASE_URL at a managed,
+# encrypted-at-rest Postgres instance (RDS, Cloud SQL, Supabase, Neon, etc.)
+# instead, and drop the `db` service + its `depends_on` entries via an
+# override file. Nothing about the app/scheduler services assumes the `db`
+# service specifically — they only read DATABASE_URL.
+#
+# Usage:
+#   cp .env.example .env        # fill in real values — .env is gitignored
+#   docker compose up -d
+#
+# Required in .env for a real (non-local) run: SESSION_SECRET,
+# DATA_ENCRYPTION_KEY, DOMAIN (for Caddy's TLS cert), and SMTP_* once a BAA
+# is signed with an email provider. The app refuses to boot in production
+# without the first two — see src/security/secrets.ts.
+# ============================================================================
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: rcm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: rcm
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"   # host-local only; never published beyond the host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rcm -d rcm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ./engine
+      target: migrate
+    volumes:
+      - ./db:/db:ro
+    environment:
+      DATABASE_URL: postgres://rcm:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/rcm
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: ./engine
+      target: runtime
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://rcm:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/rcm
+      PGSSLMODE: disable          # db is same compose network, not the internet
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    volumes:
+      - app_var:/app/var
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: ./engine
+      target: runtime
+    command: ["node", "src/cli.ts", "schedule"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://rcm:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/rcm
+      PGSSLMODE: disable
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    volumes:
+      - app_var:/app/var
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  sftp:
+    build:
+      context: ./engine
+      target: runtime
+    command: ["node", "src/cli.ts", "sftp-server"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://rcm:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/rcm
+      PGSSLMODE: disable
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env}
+      SFTP_PORT: 2222
+    ports:
+      - "2222:2222"   # map to host 22 externally at your firewall/LB if you want the classic port
+    volumes:
+      - app_var:/app/var   # shares the ingest folders with app/scheduler
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env — e.g. rcm.yourcompany.com}
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  db_data:
+  app_var:
+  caddy_data:
+  caddy_config:

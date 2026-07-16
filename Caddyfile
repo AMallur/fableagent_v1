@@ -1,0 +1,16 @@
+{$DOMAIN} {
+	# Caddy handles the ACME/Let's Encrypt handshake and cert renewal
+	# automatically — no manual certificate management. It also sets
+	# X-Forwarded-Proto for the upstream app, which is what makes the app's
+	# own HTTPS-enforcement check (requireHttps() in src/web/server.ts)
+	# correctly see the request as already-secure rather than redirect-loop.
+	reverse_proxy app:8787
+
+	encode gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+	}
+}

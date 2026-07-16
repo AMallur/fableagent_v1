@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rcm
+          POSTGRES_PASSWORD: rcm_ci_password
+          POSTGRES_DB: rcm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rcm -d rcm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://rcm:rcm_ci_password@localhost:5432/rcm
+      TEST_DATABASE_URL: postgres://rcm:rcm_ci_password@localhost:5432/rcm
+      PGSSLMODE: disable
+      # test-only values — never used outside this ephemeral CI database
+      SESSION_SECRET: ci-session-secret-not-for-production-use
+      DATA_ENCRYPTION_KEY: ci-data-key-not-for-production-use
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18"
+          cache: npm
+          cache-dependency-path: engine/package-lock.json
+
+      - name: Install dependencies
+        working-directory: engine
+        run: npm ci
+
+      - name: Install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Run migrations
+        run: bash db/migrate.sh
+
+      - name: Seed demo data (required by several integration suites)
+        working-directory: engine
+        run: npm run seed
+
+      - name: Unit tests
+        working-directory: engine
+        run: npm test
+
+      - name: Integration tests
+        working-directory: engine
+        run: npm run test:integration
+
+      - name: Build Docker image (smoke check)
+        run: docker build --target runtime -t rcm-engine:ci ./engine
