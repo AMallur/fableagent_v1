@@ -181,6 +181,78 @@ export async function createClient(
   }
 }
 
+const TENANT_TYPES = new Set(['provider_group', 'billing_company', 'health_system']);
+
+// ----------------------------------------------------------------------------
+// Platform bootstrap: create a brand-new tenant plus its first tenant_admin
+// user. Deliberately takes no Session — nobody can be authenticated into a
+// tenant that doesn't exist yet. This is why it's only reachable from the
+// CLI (`node src/cli.ts create-tenant`) run by whoever operates the platform,
+// never from an HTTP route: an unauthenticated "create a tenant" endpoint
+// would let anyone provision one. Every subsequent user (including
+// additional admins) goes through the normal inviteUser() flow below, which
+// does require a session.
+// ----------------------------------------------------------------------------
+export async function createTenant(
+  pool: PoolLike,
+  input: { tenantName: string; tenantType: string; adminEmail: string;
+           adminFirstName?: string; adminLastName?: string },
+): Promise<{ ok: true; tenantId: UUID; userId: UUID; inviteToken: string }> {
+  const tenantName = input.tenantName?.trim();
+  if (!tenantName) throw err('tenant name required', 400);
+  if (!TENANT_TYPES.has(input.tenantType)) {
+    throw err(`invalid tenant type: ${input.tenantType} (expected one of ${[...TENANT_TYPES].join(', ')})`, 400);
+  }
+  if (!input.adminEmail?.includes('@')) throw err('valid admin email required', 400);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let tenantId: UUID;
+    try {
+      const tenantRow = await client.query(
+        `INSERT INTO tenant (tenant_name, tenant_type) VALUES ($1, $2) RETURNING tenant_id`,
+        [tenantName, input.tenantType]);
+      tenantId = tenantRow.rows[0].tenant_id;
+    } catch (e: any) {
+      if (e?.code === '23505') throw err('a tenant with this name already exists', 409);
+      throw e;
+    }
+    // everything below operates within the tenant just created
+    await client.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [tenantId]);
+
+    const token = randomBytes(24).toString('base64url');
+    const userRow = await client.query(
+      `INSERT INTO app_user (tenant_id, email, first_name, last_name, role,
+                             status, invite_token, invite_expires_at)
+       VALUES ($1, $2, $3, $4, 'tenant_admin', 'pending', $5, now() + interval '7 days')
+       RETURNING user_id`,
+      [tenantId, input.adminEmail, input.adminFirstName ?? null, input.adminLastName ?? null, token]);
+    const userId: UUID = userRow.rows[0].user_id;
+
+    await client.query(
+      `INSERT INTO email_outbox (tenant_id, user_id, to_email, subject, body_text, kind)
+       VALUES ($1, $2, $3, $4, $5, 'immediate')`,
+      [tenantId, userId, input.adminEmail,
+       '[RCM] Your RCM Recovery account is ready',
+       `You've been set up as the tenant administrator for ${tenantName}. `
+       + `Accept your invitation and set a password:\n\n/accept-invite?token=${token}\n\n`
+       + `This link expires in 7 days.`]);
+
+    await client.query(
+      `SELECT app.log_security_event($1, NULL, 'tenant_created', $2, NULL)`,
+      [tenantId, JSON.stringify({ tenantName, tenantType: input.tenantType, adminEmail: input.adminEmail })]);
+
+    await client.query('COMMIT');
+    return { ok: true, tenantId, userId, inviteToken: token };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 /** auto-evaluate onboarding from real data; manual steps stay manual */
 export async function refreshOnboarding(db: Queryable, sess: Session, clientId: UUID) {
   const checks: Record<string, string> = {

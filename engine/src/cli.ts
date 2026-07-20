@@ -2,11 +2,13 @@
 // Manual trigger for the platform services. A scheduler calls the same
 // service functions; this is the human path.
 //
-//   node src/cli.ts detect     --tenant <uuid> [--client <uuid>] [--as-of D] [--dry-run]
-//   node src/cli.ts appeals    --tenant <uuid> [--client <uuid>] [--as-of D]
-//   node src/cli.ts queue      --tenant <uuid> [--client <uuid>]
-//   node src/cli.ts ingest-835 --tenant <uuid> --client <uuid> --file <path>
-//   node src/cli.ts ingest-837 --tenant <uuid> --client <uuid> --file <path>
+//   node src/cli.ts detect        --tenant <uuid> [--client <uuid>] [--as-of D] [--dry-run]
+//   node src/cli.ts appeals       --tenant <uuid> [--client <uuid>] [--as-of D]
+//   node src/cli.ts queue         --tenant <uuid> [--client <uuid>]
+//   node src/cli.ts ingest-835    --tenant <uuid> --client <uuid> --file <path>
+//   node src/cli.ts ingest-837    --tenant <uuid> --client <uuid> --file <path>
+//   node src/cli.ts create-tenant --name <name> --type <provider_group|billing_company|health_system>
+//                                 --admin-email <email> [--admin-first <name>] [--admin-last <name>]
 //
 // DATABASE_URL selects the database (default postgres://localhost:5432/rcm_dev).
 // ============================================================================
@@ -17,7 +19,7 @@ import path from 'node:path';
 
 const [command, ...rest] = process.argv.slice(2);
 const COMMANDS = ['detect', 'appeals', 'queue', 'ingest-835', 'ingest-837',
-  'schedule', 'nightly', 'monitor', 'reconcile', 'weekly', 'sftp-server'];
+  'schedule', 'nightly', 'monitor', 'reconcile', 'weekly', 'sftp-server', 'create-tenant'];
 
 if (!command || !COMMANDS.includes(command)) {
   console.error(`usage: node src/cli.ts <${COMMANDS.join('|')}> --tenant <uuid> [options]`);
@@ -32,10 +34,16 @@ const { values } = parseArgs({
     'as-of': { type: 'string' },
     'dry-run': { type: 'boolean', default: false },
     file: { type: 'string' },
+    name: { type: 'string' },
+    type: { type: 'string' },
+    'admin-email': { type: 'string' },
+    'admin-first': { type: 'string' },
+    'admin-last': { type: 'string' },
   },
 });
 
-if (!values.tenant && command !== 'schedule' && command !== 'sftp-server') {
+const NO_TENANT_REQUIRED = new Set(['schedule', 'sftp-server', 'create-tenant']);
+if (!values.tenant && !NO_TENANT_REQUIRED.has(command)) {
   console.error(`${command}: --tenant <uuid> is required`);
   process.exit(2);
 }
@@ -144,6 +152,30 @@ try {
         process.on('SIGINT', stop);
         process.on('SIGTERM', stop);
       });
+      break;
+    }
+
+    case 'create-tenant': {
+      if (!values.name || !values.type || !values['admin-email']) {
+        console.error('create-tenant: --name, --type '
+          + '(provider_group|billing_company|health_system), and --admin-email are required');
+        process.exit(2);
+      }
+      const { createTenant } = await import('./web/admin_api.ts');
+      const out = await createTenant(pool, {
+        tenantName: values.name,
+        tenantType: values.type,
+        adminEmail: values['admin-email'],
+        adminFirstName: values['admin-first'],
+        adminLastName: values['admin-last'],
+      });
+      console.log(JSON.stringify({ tenantId: out.tenantId, userId: out.userId }, null, 2));
+      console.error(
+        `\ntenant created. An invite email was queued to ${values['admin-email']} `
+        + `(sends for real once SMTP is configured; otherwise check the scheduler log).\n`
+        + `Invite link (expires in 7 days) in case you need to hand it over directly:\n`
+        + `  https://<your-domain>/accept-invite?token=${out.inviteToken}`,
+      );
       break;
     }
 

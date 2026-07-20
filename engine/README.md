@@ -141,6 +141,30 @@ node src/cli.ts appeals    --tenant <uuid> [--client <uuid>] [--as-of D]
 node src/cli.ts queue      --tenant <uuid> [--client <uuid>]
 ```
 
+**Onboarding a real tenant.** There is deliberately no HTTP endpoint for this —
+an unauthenticated "create a tenant" route would let anyone provision one, and
+nobody can be authenticated into a tenant that doesn't exist yet. It's a CLI
+command, run by whoever operates the platform:
+
+```sh
+node src/cli.ts create-tenant --name "Acme Billing Co" \
+  --type billing_company \
+  --admin-email admin@acme.com --admin-first Jane --admin-last Doe
+```
+
+This creates the `tenant` row and its first `tenant_admin` user (`status =
+'pending'`), queues a real invite email through the normal `email_outbox` (it
+sends once `SMTP_*` is configured and the scheduler is running — see
+`resolveEmailTransport` below — otherwise the invite link is also printed to
+stdout so you can hand it over directly), and records a `tenant_created`
+audit event. The admin accepts via `/accept-invite?token=...` (sets their own
+password under the same policy check as any other invite), then logs in —
+hitting the MFA enrollment gate on first login like any other admin account,
+since `tenant.enforce_mfa` defaults to `true` for real tenants (the demo seed
+turns it off for convenience only). From there, everything else — adding
+clients, inviting more users, configuring payers/integrations — goes through
+the normal `/admin` UI and `inviteUser`/`createClient` APIs.
+
 ```ts
 // from code (a scheduler / queue worker)
 import { runDetectionJob } from './src/service.ts';
@@ -166,7 +190,7 @@ transaction, and completes the job row with stats and the JSON summary in
 
 ```sh
 npm test                                      # 105 unit tests, all pure logic
-TEST_DATABASE_URL=postgres://... npm run test:integration   # 128 tests, real Postgres
+TEST_DATABASE_URL=postgres://... npm run test:integration   # 159 tests, real Postgres
 ```
 
 The web, automation, API, and admin suites run against the seeded demo tenant
