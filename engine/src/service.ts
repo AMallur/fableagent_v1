@@ -47,66 +47,73 @@ export async function runDetectionJob(
 ): Promise<DetectionJobResult> {
   const { tenantId } = params;
 
-  let jobId: UUID | null = null;
-  if (!params.dryRun) {
-    const job = await pool.query(
-      `INSERT INTO system_job (tenant_id, client_id, job_type, status, started_at)
-       VALUES ($1, $2, 'run_detection', 'running', now())
-       RETURNING job_id`,
-      [tenantId, params.clientId ?? null],
-    );
-    jobId = job.rows[0].job_id;
-  }
-
+  // One connection for the whole job, tenant context set once: every table
+  // touched below (system_job, plus whatever loadSnapshot/persistResult
+  // read/write) carries RLS scoped to app.current_tenant_id(), and a bare
+  // pool.query() call would grab a random pool connection with no tenant
+  // context set at all — RLS would then hide/reject rows even though the
+  // query's own explicit WHERE clauses are correct.
+  const client = await pool.connect();
   try {
-    const input = await loadSnapshot(pool, {
-      tenantId,
-      clientId: params.clientId,
-      asOf: params.asOf,
-      configOverrides: params.configOverrides,
-    });
+    await client.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [tenantId]);
 
-    const result = runEngine(input);
-
-    let persisted: PersistStats | null = null;
+    let jobId: UUID | null = null;
     if (!params.dryRun) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
+      const job = await client.query(
+        `INSERT INTO system_job (tenant_id, client_id, job_type, status, started_at)
+         VALUES ($1, $2, 'run_detection', 'running', now())
+         RETURNING job_id`,
+        [tenantId, params.clientId ?? null],
+      );
+      jobId = job.rows[0].job_id;
+    }
+
+    try {
+      const input = await loadSnapshot(client, {
+        tenantId,
+        clientId: params.clientId,
+        asOf: params.asOf,
+        configOverrides: params.configOverrides,
+      });
+
+      const result = runEngine(input);
+
+      let persisted: PersistStats | null = null;
+      if (!params.dryRun) {
+        try {
+          await client.query('BEGIN');
+          persisted = await persistResult(client, tenantId, result, jobId);
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        }
+
         await client.query(
-          `SELECT set_config('app.current_tenant_id', $1, true)`, [tenantId],
+          `UPDATE system_job
+           SET status = 'completed', completed_at = now(),
+               records_processed = $1, errors_count = $2, log_output = $3
+           WHERE job_id = $4`,
+          [result.summary.remitLinesProcessed,
+           result.summary.unmatched,
+           JSON.stringify(result.summary),
+           jobId],
         );
-        persisted = await persistResult(client, tenantId, result, jobId);
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      } finally {
-        client.release();
       }
 
-      await pool.query(
-        `UPDATE system_job
-         SET status = 'completed', completed_at = now(),
-             records_processed = $1, errors_count = $2, log_output = $3
-         WHERE job_id = $4`,
-        [result.summary.remitLinesProcessed,
-         result.summary.unmatched,
-         JSON.stringify(result.summary),
-         jobId],
-      );
+      return { jobId, dryRun: !!params.dryRun, result, persisted };
+    } catch (err) {
+      if (jobId) {
+        await client.query(
+          `UPDATE system_job
+           SET status = 'failed', completed_at = now(), errors_count = 1, log_output = $1
+           WHERE job_id = $2`,
+          [String(err instanceof Error ? err.stack ?? err.message : err), jobId],
+        ).catch(() => { /* job bookkeeping must not mask the real error */ });
+      }
+      throw err;
     }
-
-    return { jobId, dryRun: !!params.dryRun, result, persisted };
-  } catch (err) {
-    if (jobId) {
-      await pool.query(
-        `UPDATE system_job
-         SET status = 'failed', completed_at = now(), errors_count = 1, log_output = $1
-         WHERE job_id = $2`,
-        [String(err instanceof Error ? err.stack ?? err.message : err), jobId],
-      ).catch(() => { /* job bookkeeping must not mask the real error */ });
-    }
-    throw err;
+  } finally {
+    client.release();
   }
 }

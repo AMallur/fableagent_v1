@@ -419,6 +419,25 @@ cp .env.example .env    # fill in real values; .env is gitignored
 docker compose up -d
 ```
 
+For the managed-Postgres side specifically on GCP: `db/provision_cloudsql.sh`
+creates a real Cloud SQL for PostgreSQL instance with HA (regional,
+synchronous standby, automatic failover) and automated backups with
+point-in-time recovery, then `docker-compose.cloudsql.yml` (a standalone
+file — run it *instead of* `docker-compose.yml`, not layered on top) reaches
+it through the Cloud SQL Auth Proxy instead of the local `db` container:
+
+```sh
+PROJECT_ID=... DB_PASSWORD=$(openssl rand -hex 24) bash db/provision_cloudsql.sh
+# copy the two CLOUDSQL_* values it prints into .env, then:
+docker compose -f docker-compose.cloudsql.yml up -d
+```
+
+Appeal packets/letters default to local disk (`FileSystemDocumentStore`) —
+fine for one instance with a persistent volume, not fine once you run more
+than one. Set `GCS_DOCUMENT_BUCKET` to move them to Cloud Storage instead
+(`resolveDocumentStore()` in `src/appeals/storage.ts`); on GCE the VM's
+attached service account is used automatically, no key file needed.
+
 Security posture, enforced in code rather than left to configuration
 discipline:
 - **HTTPS is mandatory whenever `NODE_ENV=production`** — no flag to
@@ -441,5 +460,7 @@ discipline:
   (patient names, case/claim detail), and an unsigned relay is a HIPAA
   violation independent of anything else being correct.
 
-What this does *not* do: provision the managed Postgres instance itself — an
-account with a cloud provider, no code can create that.
+What this does *not* do: run a load balancer or real monitoring/alerting in
+front of any of this — a single-VM `docker compose up` is the reference
+deployment, not a highly-available one at the app layer (the database layer
+is, via `docker-compose.cloudsql.yml`).

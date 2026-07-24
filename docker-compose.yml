@@ -4,10 +4,11 @@
 #
 # The `db` service here is for local development and staging only — for a
 # real deployment carrying real PHI, point DATABASE_URL at a managed,
-# encrypted-at-rest Postgres instance (RDS, Cloud SQL, Supabase, Neon, etc.)
-# instead, and drop the `db` service + its `depends_on` entries via an
-# override file. Nothing about the app/scheduler services assumes the `db`
-# service specifically — they only read DATABASE_URL.
+# encrypted-at-rest Postgres instance instead. For Cloud SQL with HA and
+# automated backups specifically, see docker-compose.cloudsql.yml (a
+# standalone file — run it INSTEAD of this one) and db/provision_cloudsql.sh
+# to create the instance. Nothing about the app/scheduler services assumes
+# the `db` service specifically — they only read DATABASE_URL.
 #
 # Usage:
 #   cp .env.example .env        # fill in real values — .env is gitignored

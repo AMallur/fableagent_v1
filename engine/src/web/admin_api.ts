@@ -630,23 +630,37 @@ export async function inviteUser(
   return { ok: true, userId: inserted.rows[0].user_id, inviteToken: token };
 }
 
-export async function acceptInvite(db: Queryable, token: string, password: string) {
+export async function acceptInvite(pool: PoolLike, token: string, password: string) {
   const policy = validatePassword(password);
   if (!policy.ok) throw err(`password policy: ${policy.errors.join('; ')}`, 400);
-  const updated = await db.query(
-    `UPDATE app_user
-     SET password_hash = $2, password_changed_at = now(), status = 'active',
-         invite_token = NULL, invite_expires_at = NULL
-     WHERE invite_token = $1 AND invite_expires_at > now()
-       AND status = 'pending' AND deleted_at IS NULL
-     RETURNING user_id, tenant_id, email`,
-    [token, hashPassword(password)]);
-  if (!updated.rows[0]) throw err('invitation is invalid or expired', 410);
-  const u = updated.rows[0];
-  await db.query(
-    `SELECT app.log_security_event($1, $2, 'invite_accepted', $3, NULL)`,
-    [u.tenant_id, u.user_id, JSON.stringify({ email: u.email })]);
-  return { ok: true };
+
+  // pre-tenant-context, same situation as login — see auth.ts authenticate()
+  // and 0017_pretenant_lookup_functions.sql
+  const db = await pool.connect();
+  try {
+    const resolved = await db.query(
+      `SELECT app.resolve_tenant_by_invite_token($1) AS tenant_id`, [token]);
+    const tenantId = resolved.rows[0]?.tenant_id;
+    if (!tenantId) throw err('invitation is invalid or expired', 410);
+    await db.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [tenantId]);
+
+    const updated = await db.query(
+      `UPDATE app_user
+       SET password_hash = $2, password_changed_at = now(), status = 'active',
+           invite_token = NULL, invite_expires_at = NULL
+       WHERE invite_token = $1 AND invite_expires_at > now()
+         AND status = 'pending' AND deleted_at IS NULL
+       RETURNING user_id, tenant_id, email`,
+      [token, hashPassword(password)]);
+    if (!updated.rows[0]) throw err('invitation is invalid or expired', 410);
+    const u = updated.rows[0];
+    await db.query(
+      `SELECT app.log_security_event($1, $2, 'invite_accepted', $3, NULL)`,
+      [u.tenant_id, u.user_id, JSON.stringify({ email: u.email })]);
+    return { ok: true };
+  } finally {
+    db.release();
+  }
 }
 
 export async function deactivateUser(db: Queryable, sess: Session, s: Scope, userId: UUID) {

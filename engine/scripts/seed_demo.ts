@@ -7,7 +7,12 @@
 //
 //   DATABASE_URL=postgres://... node scripts/seed_demo.ts
 //
-// Idempotent: re-running removes and recreates the demo tenant.
+// Idempotent: re-running clears the tenant's claims/cases/appeals data and
+// resets the tenant/client/users in place (upsert, not delete-and-recreate —
+// audit_log is immutable and FK-references both, so those two can never be
+// hard-deleted once any audit history exists for them) and regenerates
+// everything else fresh. Requires no special database privileges — works
+// against a plain, non-superuser application role (e.g. Cloud SQL).
 // ============================================================================
 
 import { hashPassword } from '../src/web/auth.ts';
@@ -22,7 +27,28 @@ const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL ?? 'postgres://localhost:5432/rcm_dev',
   ssl: pgSslConfig(readFileSync),
 });
-const q = (text: string, p?: unknown[]) => pool.query(text, p);
+
+const T = 'de300000-0000-4000-8000-000000000001';
+const C = 'de300000-0000-4000-8000-000000000002';
+
+const PASSWORD = hashPassword('demo1234');
+const USERS = [
+  ['admin@meridianrcm.com', 'Maya', 'Admin', 'tenant_admin'],
+  ['sarah@meridianrcm.com', 'Sarah', 'Biller', 'biller'],
+  ['colin@meridianrcm.com', 'Colin', 'Collector', 'collector'],
+] as const;
+const DEMO_EMAILS = USERS.map((u) => u[0]);
+
+// One dedicated connection for the whole script (not pool.query() per call,
+// which hands back a random connection each time) — RLS needs
+// app.current_tenant_id set on the SAME connection every statement runs on.
+// Session-scoped (is_local=false), not transaction-scoped: each q() call
+// below auto-commits individually, same as the original pool.query() calls
+// did, which matters because runDetectionJob()/generateAppealPackets() read
+// this data back over their own separate connections partway through.
+const client = await pool.connect();
+await client.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [T]);
+const q = (text: string, p?: unknown[]) => client.query(text, p);
 
 // deterministic PRNG so re-seeds are comparable
 let rngState = 42;
@@ -37,54 +63,81 @@ const dayISO = (offset: number) => {
   return d.toISOString().slice(0, 10);
 };
 
-const T = 'de300000-0000-4000-8000-000000000001';
-const C = 'de300000-0000-4000-8000-000000000002';
-
 console.log('cleaning previous demo tenant…');
-{
-  const client = await pool.connect();
-  try {
-    await client.query(`SET session_replication_role = replica`);
-    for (const table of [
-      'onboarding_step', 'client_integration', 'sso_config', 'data_export_request', 'invoice',
-      'rule_execution', 'automation_rule', 'notification_preference', 'notification',
-      'email_outbox', 'dashboard_snapshot',
-      'appeal_packet_document', 'appeal_packet', 'corrected_claim', 'case_action',
-      'payment_event', 'recovery_case', 'document', 'remittance_line', 'remittance',
-      'claim_line', 'claim', 'encounter', 'patient', 'client_payer_config',
-      'contract_line', 'contract', 'provider', 'system_job', 'audit_log',
-      'app_user', 'client',
-    ]) await client.query(`DELETE FROM ${table} WHERE tenant_id = $1`, [T]);
-    await client.query(`DELETE FROM payer WHERE tenant_id = $1 OR payer_id_code LIKE 'DEMO%'`, [T]);
-    await client.query(`DELETE FROM medicare_fee_schedule WHERE locality = 'DEMO'`);
-    await client.query(`DELETE FROM tenant WHERE tenant_id = $1`, [T]);
-    await client.query(`SET session_replication_role = DEFAULT`);
-  } finally { client.release(); }
-}
+// audit_log is append-only at the database level (trg_audit_log_immutable
+// blocks DELETE/UPDATE even for the table owner — real safeguard, verified
+// elsewhere) and it FK-references both tenant and app_user, so those two
+// (and client, for the same "stable ID across reseeds" reason) can never be
+// hard-deleted-and-recreated once any audit history points at them — only
+// upserted in place, below. This also means every DELETE below now runs
+// under REAL foreign-key enforcement (no session_replication_role bypass),
+// so it has to be genuine dependency order, not just "worked because
+// triggers were off."
+for (const table of [
+  'onboarding_step', 'client_integration', 'sso_config', 'data_export_request', 'invoice',
+  'rule_execution', 'automation_rule', 'notification_preference', 'notification',
+  'email_outbox', 'dashboard_snapshot',
+  // outbound_delivery/appeal_packet_document/case_action/payment_event/
+  // corrected_claim all reference recovery_case (some also reference
+  // appeal_packet, document, remittance, claim, claim_line) — all must go
+  // before their referenced parent. appeal_packet itself references
+  // document (letter_document_id), so it has to go before document too,
+  // even though appeal_packet_document (which references BOTH) has to go
+  // before appeal_packet.
+  'outbound_delivery', 'appeal_packet_document', 'case_action', 'appeal_packet',
+  'document', 'payment_event', 'corrected_claim', 'recovery_case',
+  'remittance_line', 'remittance',
+  'claim_line', 'claim', 'encounter', 'patient', 'client_payer_config',
+  'contract_line', 'contract', 'provider', 'system_job',
+]) await q(`DELETE FROM ${table} WHERE tenant_id = $1`, [T]);
+await q(`DELETE FROM payer WHERE tenant_id = $1 OR payer_id_code LIKE 'DEMO%'`, [T]);
+await q(`DELETE FROM medicare_fee_schedule WHERE locality = 'DEMO'`);
+// other clients/users under this tenant (e.g. test-created via the real
+// admin API, which doesn't clean up after itself — it relies on this reset)
+// besides the known demo ones. client has no incoming FK from audit_log, so
+// it's safe to hard-delete; app_user does, so it's soft-deleted instead —
+// same reasoning as the tenant/client/app_user upserts above. Users first,
+// clearing client_id: app_user.client_id is a real FK to client, so a
+// stray user still pointing at a to-be-deleted client would block it even
+// once soft-deleted (the row, and its FK value, still exists either way).
+await q(`UPDATE app_user SET deleted_at = now(), status = 'inactive', client_id = NULL
+         WHERE tenant_id = $1 AND email <> ALL($2) AND deleted_at IS NULL`,
+  [T, DEMO_EMAILS]);
+await q(`DELETE FROM client WHERE tenant_id = $1 AND client_id <> $2`, [T, C]);
 
 console.log('creating tenant, client, users, payers, contracts…');
 // enforce_mfa=false is a demo convenience — production tenants default to
 // MFA-enforced for admin roles (the admin test suite proves that flow)
 await q(`INSERT INTO tenant (tenant_id, tenant_name, tenant_type, subscription_tier, enforce_mfa)
-         VALUES ($1, 'Meridian RCM Partners', 'billing_company', 'professional', false)`, [T]);
+         VALUES ($1, 'Meridian RCM Partners', 'billing_company', 'professional', false)
+         ON CONFLICT (tenant_id) DO UPDATE SET
+           tenant_name = EXCLUDED.tenant_name, tenant_type = EXCLUDED.tenant_type,
+           subscription_tier = EXCLUDED.subscription_tier, enforce_mfa = EXCLUDED.enforce_mfa,
+           status = 'active', deleted_at = NULL, updated_at = now()`, [T]);
 await q(`INSERT INTO client (client_id, tenant_id, client_name, tax_id, npi_group, specialty, state,
                              address, recovery_alert_threshold, appeal_review_threshold)
          VALUES ($1, $2, 'Alpha Orthopedic Group', '74-1234567', '1234567890', 'orthopedics', 'TX',
                  '{"line1":"100 Main St, Suite 400","city":"Austin","state":"TX","zip":"78701"}',
-                 25000, 4000)`, [C, T]);
+                 25000, 4000)
+         ON CONFLICT (client_id) DO UPDATE SET
+           client_name = EXCLUDED.client_name, tax_id = EXCLUDED.tax_id, npi_group = EXCLUDED.npi_group,
+           specialty = EXCLUDED.specialty, state = EXCLUDED.state, address = EXCLUDED.address,
+           recovery_alert_threshold = EXCLUDED.recovery_alert_threshold,
+           appeal_review_threshold = EXCLUDED.appeal_review_threshold,
+           status = 'active', deleted_at = NULL, updated_at = now()`, [C, T]);
 
-const PASSWORD = hashPassword('demo1234');
-const USERS = [
-  ['admin@meridianrcm.com', 'Maya', 'Admin', 'tenant_admin'],
-  ['sarah@meridianrcm.com', 'Sarah', 'Biller', 'biller'],
-  ['colin@meridianrcm.com', 'Colin', 'Collector', 'collector'],
-] as const;
 const userIds: string[] = [];
 for (const [email, first, last, role] of USERS) {
   const r = await q(
     `INSERT INTO app_user (tenant_id, email, first_name, last_name, role, password_hash,
                            mfa_enabled, password_changed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, false, now()) RETURNING user_id`,
+     VALUES ($1, $2, $3, $4, $5, $6, false, now())
+     ON CONFLICT (tenant_id, email) WHERE deleted_at IS NULL DO UPDATE SET
+       first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, role = EXCLUDED.role,
+       password_hash = EXCLUDED.password_hash, mfa_enabled = false, password_changed_at = now(),
+       client_id = NULL, status = 'active', failed_login_attempts = 0, locked_until = NULL,
+       mfa_secret = NULL, invite_token = NULL, invite_expires_at = NULL
+     RETURNING user_id`,
     [T, email, first, last, role, PASSWORD]);
   userIds.push(r.rows[0].user_id);
 }
@@ -106,17 +159,26 @@ await q(`UPDATE client SET baa_acknowledged_at = now(), baa_acknowledged_by = $2
 }
 
 const PAYERS = [
-  { name: 'Unity Health Plan', code: 'DEMO-UNI', type: 'commercial', portal: 'https://portal.unityhealth.example', deadline: 180, autopilot: true },
-  { name: 'Meridian Blue', code: 'DEMO-MBL', type: 'commercial', portal: 'https://providers.meridianblue.example', deadline: 90, autopilot: false },
-  { name: 'Great Plains Medicaid', code: 'DEMO-GPM', type: 'managed_medicaid', portal: null, deadline: 60, autopilot: false },
+  // shared: true showcases real global master-data payers (tenant_id NULL,
+  // visible to every tenant, not per-tenant editable) alongside tenant-owned
+  // ones — both are real, distinct product behaviors worth demonstrating
+  { name: 'Unity Health Plan', code: 'DEMO-UNI', type: 'commercial', portal: 'https://portal.unityhealth.example', deadline: 180, autopilot: true, shared: true },
+  { name: 'Meridian Blue', code: 'DEMO-MBL', type: 'commercial', portal: 'https://providers.meridianblue.example', deadline: 90, autopilot: false, shared: false },
+  { name: 'Great Plains Medicaid', code: 'DEMO-GPM', type: 'managed_medicaid', portal: null, deadline: 60, autopilot: false, shared: false },
 ];
 const payerIds: string[] = [];
 for (const p of PAYERS) {
+  // a shared payer needs tenant_id NULL, which payer_insert's RLS policy
+  // only allows through a connection with NO tenant context set at all
+  // (see 0018_payer_shared_insert.sql) — clear it for just this one insert
+  if (p.shared) await client.query(`SELECT set_config('app.current_tenant_id', '', false)`);
   const r = await q(
-    `INSERT INTO payer (payer_name, payer_type, payer_id_code, portal_url, appeal_address,
+    `INSERT INTO payer (tenant_id, payer_name, payer_type, payer_id_code, portal_url, appeal_address,
                         timely_filing_limit_days, appeal_deadline_days)
-     VALUES ($1, $2, $3, $4, $5, 95, $6) RETURNING payer_id`,
-    [p.name, p.type, p.code, p.portal, `PO Box ${randInt(100, 999)}, Hartford, CT 06101`, p.deadline]);
+     VALUES ($1, $2, $3, $4, $5, $6, 95, $7) RETURNING payer_id`,
+    [p.shared ? null : T, p.name, p.type, p.code, p.portal,
+     `PO Box ${randInt(100, 999)}, Hartford, CT 06101`, p.deadline]);
+  if (p.shared) await client.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [T]);
   payerIds.push(r.rows[0].payer_id);
   await q(`INSERT INTO client_payer_config (tenant_id, client_id, payer_id, autopilot_enabled)
            VALUES ($1, $2, $3, $4)`, [T, C, r.rows[0].payer_id, p.autopilot]);
@@ -354,4 +416,5 @@ const counts = await q(
 console.log('seed complete:', counts.rows[0]);
 console.log('\nlogin: admin@meridianrcm.com / sarah@meridianrcm.com / colin@meridianrcm.com');
 console.log('password: demo1234');
+client.release();
 await pool.end();

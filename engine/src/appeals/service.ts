@@ -62,62 +62,67 @@ export async function generateAppealPackets(
 ): Promise<GenerateAppealsResult> {
   const store = params.store ?? new FileSystemDocumentStore();
 
-  const job = await pool.query(
-    `INSERT INTO system_job (tenant_id, client_id, job_type, status, started_at)
-     VALUES ($1, $2, 'generate_appeals', 'running', now()) RETURNING job_id`,
-    [params.tenantId, params.clientId ?? null],
-  );
-  const jobId: UUID = job.rows[0].job_id;
-
+  // One connection for the whole job, tenant context set once — a bare
+  // pool.query() call grabs a random pool connection with no tenant
+  // context set, which RLS would treat as "no tenant" and hide/reject
+  // rows even though the query's own explicit WHERE clauses are correct.
+  const client = await pool.connect();
   try {
-    const contexts = await loadAppealContexts(pool, params);
-    const packets: PacketOutcome[] = [];
+    await client.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [params.tenantId]);
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(
-        `SELECT set_config('app.current_tenant_id', $1, true)`, [params.tenantId],
-      );
-      for (const ctx of contexts) {
-        packets.push(await buildPacket(client, store, params.tenantId, ctx));
-      }
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
-
-    const summary = {
-      casesProcessed: contexts.length,
-      packetsCreated: packets.filter((p) => !p.refreshed).length,
-      packetsRefreshed: packets.filter((p) => p.refreshed).length,
-      ready: packets.filter((p) => p.packetStatus === 'ready').length,
-      draft: packets.filter((p) => p.packetStatus === 'draft').length,
-      autoSubmit: packets.filter((p) => p.autoSubmit).length,
-      needsReview: packets.filter((p) => p.needsReview).length,
-      correctionsCreated: packets.filter((p) => p.correctedClaimId).length,
-    };
-
-    await pool.query(
-      `UPDATE system_job
-       SET status = 'completed', completed_at = now(),
-           records_processed = $1, errors_count = 0, log_output = $2
-       WHERE job_id = $3`,
-      [contexts.length, JSON.stringify(summary), jobId],
+    const job = await client.query(
+      `INSERT INTO system_job (tenant_id, client_id, job_type, status, started_at)
+       VALUES ($1, $2, 'generate_appeals', 'running', now()) RETURNING job_id`,
+      [params.tenantId, params.clientId ?? null],
     );
+    const jobId: UUID = job.rows[0].job_id;
 
-    return { jobId, packets, summary };
-  } catch (err) {
-    await pool.query(
-      `UPDATE system_job
-       SET status = 'failed', completed_at = now(), errors_count = 1, log_output = $1
-       WHERE job_id = $2`,
-      [String(err instanceof Error ? err.stack ?? err.message : err), jobId],
-    ).catch(() => { /* keep the original error */ });
-    throw err;
+    try {
+      const contexts = await loadAppealContexts(client, params);
+      const packets: PacketOutcome[] = [];
+
+      try {
+        await client.query('BEGIN');
+        for (const ctx of contexts) {
+          packets.push(await buildPacket(client, store, params.tenantId, ctx));
+        }
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      }
+
+      const summary = {
+        casesProcessed: contexts.length,
+        packetsCreated: packets.filter((p) => !p.refreshed).length,
+        packetsRefreshed: packets.filter((p) => p.refreshed).length,
+        ready: packets.filter((p) => p.packetStatus === 'ready').length,
+        draft: packets.filter((p) => p.packetStatus === 'draft').length,
+        autoSubmit: packets.filter((p) => p.autoSubmit).length,
+        needsReview: packets.filter((p) => p.needsReview).length,
+        correctionsCreated: packets.filter((p) => p.correctedClaimId).length,
+      };
+
+      await client.query(
+        `UPDATE system_job
+         SET status = 'completed', completed_at = now(),
+             records_processed = $1, errors_count = 0, log_output = $2
+         WHERE job_id = $3`,
+        [contexts.length, JSON.stringify(summary), jobId],
+      );
+
+      return { jobId, packets, summary };
+    } catch (err) {
+      await client.query(
+        `UPDATE system_job
+         SET status = 'failed', completed_at = now(), errors_count = 1, log_output = $1
+         WHERE job_id = $2`,
+        [String(err instanceof Error ? err.stack ?? err.message : err), jobId],
+      ).catch(() => { /* keep the original error */ });
+      throw err;
+    }
+  } finally {
+    client.release();
   }
 }
 

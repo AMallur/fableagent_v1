@@ -1,0 +1,144 @@
+# ============================================================================
+# Same topology as docker-compose.yml, but the database is a real Cloud SQL
+# for PostgreSQL instance (HA, automated backups) reached through the Cloud
+# SQL Auth Proxy, instead of a local Postgres container. Standalone file —
+# run this INSTEAD of docker-compose.yml, not layered on top of it.
+#
+# Provision the instance first: see db/provision_cloudsql.sh. That script
+# prints the two values this file needs in .env:
+#
+#   CLOUDSQL_INSTANCE_CONNECTION_NAME=project:region:instance-name
+#   CLOUDSQL_PASSWORD=<the rcm database user's password>
+#
+# Auth to Cloud SQL: on GCE, the VM's attached service account is picked up
+# automatically by the proxy — leave GOOGLE_APPLICATION_CREDENTIALS blank.
+# Off GCE, set it to a path and uncomment the matching volume mount below so
+# a real key file gets into the proxy container.
+#
+# Usage:
+#   PROJECT_ID=... INSTANCE_NAME=... DB_PASSWORD=... bash db/provision_cloudsql.sh
+#   cp .env.example .env   # fill in CLOUDSQL_* plus the usual SESSION_SECRET etc.
+#   docker compose -f docker-compose.cloudsql.yml up -d
+# ============================================================================
+
+services:
+  cloud-sql-proxy:
+    image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2
+    command:
+      - "--address=0.0.0.0"
+      - "--port=5432"
+      - "${CLOUDSQL_INSTANCE_CONNECTION_NAME:?set CLOUDSQL_INSTANCE_CONNECTION_NAME in .env — see db/provision_cloudsql.sh}"
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+    # off-GCE only: mount your service account key at the path above, e.g.
+    #   volumes:
+    #     - ${GOOGLE_APPLICATION_CREDENTIALS_HOST}:${GOOGLE_APPLICATION_CREDENTIALS}:ro
+    #
+    # No compose healthcheck here: the proxy image is distroless (no shell,
+    # no curl/wget — verified by inspecting it directly), so there's nothing
+    # to exec a health probe with. migrate.sh retries its own connection
+    # instead of depending on service_healthy timing.
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ./engine
+      target: migrate
+    volumes:
+      - ./db:/db:ro
+    environment:
+      DATABASE_URL: postgres://rcm:${CLOUDSQL_PASSWORD:?set CLOUDSQL_PASSWORD in .env}@cloud-sql-proxy:5432/rcm
+    depends_on:
+      cloud-sql-proxy:
+        condition: service_started
+    restart: "no"
+
+  app:
+    build:
+      context: ./engine
+      target: runtime
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://rcm:${CLOUDSQL_PASSWORD:?set CLOUDSQL_PASSWORD in .env}@cloud-sql-proxy:5432/rcm
+      PGSSLMODE: disable          # the proxy itself provides the encrypted, IAM-authenticated tunnel
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      GCS_DOCUMENT_BUCKET: ${GCS_DOCUMENT_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+    volumes:
+      - app_var:/app/var
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: ./engine
+      target: runtime
+    command: ["node", "src/cli.ts", "schedule"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://rcm:${CLOUDSQL_PASSWORD:?set CLOUDSQL_PASSWORD in .env}@cloud-sql-proxy:5432/rcm
+      PGSSLMODE: disable
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      GCS_DOCUMENT_BUCKET: ${GCS_DOCUMENT_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+    volumes:
+      - app_var:/app/var
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  sftp:
+    build:
+      context: ./engine
+      target: runtime
+    command: ["node", "src/cli.ts", "sftp-server"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://rcm:${CLOUDSQL_PASSWORD:?set CLOUDSQL_PASSWORD in .env}@cloud-sql-proxy:5432/rcm
+      PGSSLMODE: disable
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env}
+      SFTP_PORT: 2222
+    ports:
+      - "2222:2222"
+    volumes:
+      - app_var:/app/var
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env — e.g. rcm.yourcompany.com}
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  app_var:
+  caddy_data:
+  caddy_config:

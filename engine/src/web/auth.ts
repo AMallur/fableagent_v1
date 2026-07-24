@@ -6,6 +6,7 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import type { UUID } from '../types.ts';
 import type { Queryable } from '../db/snapshot.ts';
+import type { PoolLike } from '../service.ts';
 
 export const COOKIE_NAME = 'rcm_session';
 const LOCKOUT_ATTEMPTS = 5;
@@ -109,98 +110,116 @@ async function securityEvent(
 }
 
 export async function authenticate(
-  db: Queryable, email: string, password: string,
+  pool: PoolLike, email: string, password: string,
   opts: { totp?: string; ip?: string | null } = {},
 ): Promise<AuthOutcome> {
-  const rows = await db.query(
-    `SELECT u.user_id, u.tenant_id, u.client_id, u.role, u.first_name, u.last_name,
-            u.password_hash, u.failed_login_attempts, u.locked_until,
-            u.password_changed_at, u.mfa_enabled, u.mfa_secret,
-            t.session_timeout_minutes, t.enforce_mfa
-     FROM app_user u JOIN tenant t ON t.tenant_id = u.tenant_id
-     WHERE u.email = $1 AND u.status = 'active' AND u.deleted_at IS NULL
-     ORDER BY u.created_at LIMIT 1`,
-    [email],
-  );
-  const u = rows.rows[0];
-  if (!u) return { kind: 'invalid' };
-  const ip = opts.ip ?? null;
+  // Login is inherently pre-tenant-context: the tenant isn't known until
+  // the matching user is found. app.resolve_tenant_by_email() is a narrow
+  // SECURITY DEFINER lookup that resolves ONLY the tenant_id (not the row
+  // itself) — see 0017_pretenant_lookup_functions.sql for why. Once that's
+  // set, everything else runs as a normal, fully RLS-scoped query on one
+  // dedicated connection (tenant context is session-scoped, not
+  // transaction-scoped, so it has to stay on the same connection for the
+  // rest of this function).
+  const db = await pool.connect();
+  try {
+    const resolved = await db.query(`SELECT app.resolve_tenant_by_email($1) AS tenant_id`, [email]);
+    const tenantId = resolved.rows[0]?.tenant_id;
+    if (!tenantId) return { kind: 'invalid' };
+    await db.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [tenantId]);
 
-  // lockout check
-  if (u.locked_until && new Date(u.locked_until).getTime() > Date.now()) {
-    return { kind: 'locked', until: new Date(u.locked_until).toISOString() };
-  }
+    const rows = await db.query(
+      `SELECT u.user_id, u.tenant_id, u.client_id, u.role, u.first_name, u.last_name,
+              u.password_hash, u.failed_login_attempts, u.locked_until,
+              u.password_changed_at, u.mfa_enabled, u.mfa_secret,
+              t.session_timeout_minutes, t.enforce_mfa
+       FROM app_user u JOIN tenant t ON t.tenant_id = u.tenant_id
+       WHERE u.email = $1 AND u.status = 'active' AND u.deleted_at IS NULL
+       ORDER BY u.created_at LIMIT 1`,
+      [email],
+    );
+    const u = rows.rows[0];
+    if (!u) return { kind: 'invalid' };
+    const ip = opts.ip ?? null;
 
-  if (!verifyPassword(password, u.password_hash)) {
-    const attempts = u.failed_login_attempts + 1;
-    const lock = attempts >= LOCKOUT_ATTEMPTS;
+    // lockout check
+    if (u.locked_until && new Date(u.locked_until).getTime() > Date.now()) {
+      return { kind: 'locked', until: new Date(u.locked_until).toISOString() };
+    }
+
+    if (!verifyPassword(password, u.password_hash)) {
+      const attempts = u.failed_login_attempts + 1;
+      const lock = attempts >= LOCKOUT_ATTEMPTS;
+      await db.query(
+        `UPDATE app_user SET failed_login_attempts = $1,
+                locked_until = CASE WHEN $2 THEN now() + interval '${LOCKOUT_MINUTES} minutes' END
+         WHERE user_id = $3`,
+        [lock ? 0 : attempts, lock, u.user_id]);
+      await securityEvent(db, u.tenant_id, u.user_id,
+        lock ? 'login_lockout' : 'login_failed', { email, attempts }, ip);
+      if (lock) {
+        return { kind: 'locked', until: new Date(Date.now() + LOCKOUT_MINUTES * 60_000).toISOString() };
+      }
+      return { kind: 'invalid' };
+    }
+
+    // MFA for admin roles when the tenant enforces it
+    if (u.enforce_mfa && ADMIN_ROLES.has(u.role)) {
+      if (!u.mfa_enabled || !u.mfa_secret) {
+        // start enrollment: persist an (encrypted) pending secret
+        let secret: string;
+        if (u.mfa_secret) {
+          secret = decryptSecret(u.mfa_secret);
+        } else {
+          secret = generateTotpSecret();
+          // pending secret; mfa_enabled stays false until a code verifies
+          await db.query(
+            `UPDATE app_user SET mfa_secret = $1, mfa_enabled = false WHERE user_id = $2`,
+            [encryptSecret(secret), u.user_id]);
+        }
+        if (opts.totp && verifyTotp(secret, opts.totp)) {
+          await db.query(
+            `UPDATE app_user SET mfa_enabled = true WHERE user_id = $1`, [u.user_id]);
+          await securityEvent(db, u.tenant_id, u.user_id, 'mfa_enrolled', { email }, ip);
+          // fall through to normal login
+        } else {
+          return { kind: 'mfa_enroll', secret, otpauthUri: otpauthUri(secret, email) };
+        }
+      } else {
+        if (!opts.totp) return { kind: 'mfa_required' };
+        if (!verifyTotp(decryptSecret(u.mfa_secret), opts.totp)) {
+          await securityEvent(db, u.tenant_id, u.user_id, 'mfa_failed', { email }, ip);
+          return { kind: 'mfa_invalid' };
+        }
+      }
+    }
+
+    // 90-day rotation for admin roles
+    if (passwordExpiredForRole(u.role, u.password_changed_at)) {
+      return { kind: 'password_expired' };
+    }
+
     await db.query(
-      `UPDATE app_user SET failed_login_attempts = $1,
-              locked_until = CASE WHEN $2 THEN now() + interval '${LOCKOUT_MINUTES} minutes' END
-       WHERE user_id = $3`,
-      [lock ? 0 : attempts, lock, u.user_id]);
-    await securityEvent(db, u.tenant_id, u.user_id,
-      lock ? 'login_lockout' : 'login_failed', { email, attempts }, ip);
-    if (lock) {
-      return { kind: 'locked', until: new Date(Date.now() + LOCKOUT_MINUTES * 60_000).toISOString() };
-    }
-    return { kind: 'invalid' };
+      `UPDATE app_user SET last_login = now(), failed_login_attempts = 0, locked_until = NULL
+       WHERE user_id = $1`, [u.user_id]);
+    await securityEvent(db, u.tenant_id, u.user_id, 'login_succeeded', { email }, ip);
+
+    const timeoutMinutes = u.session_timeout_minutes ?? 30;
+    return {
+      kind: 'ok',
+      session: {
+        userId: u.user_id,
+        tenantId: u.tenant_id,
+        clientId: u.client_id,
+        role: u.role,
+        name: [u.first_name, u.last_name].filter(Boolean).join(' ') || email,
+        exp: Date.now() + timeoutMinutes * 60_000,
+        tm: timeoutMinutes,
+      },
+    };
+  } finally {
+    db.release();
   }
-
-  // MFA for admin roles when the tenant enforces it
-  if (u.enforce_mfa && ADMIN_ROLES.has(u.role)) {
-    if (!u.mfa_enabled || !u.mfa_secret) {
-      // start enrollment: persist an (encrypted) pending secret
-      let secret: string;
-      if (u.mfa_secret) {
-        secret = decryptSecret(u.mfa_secret);
-      } else {
-        secret = generateTotpSecret();
-        // pending secret; mfa_enabled stays false until a code verifies
-        await db.query(
-          `UPDATE app_user SET mfa_secret = $1, mfa_enabled = false WHERE user_id = $2`,
-          [encryptSecret(secret), u.user_id]);
-      }
-      if (opts.totp && verifyTotp(secret, opts.totp)) {
-        await db.query(
-          `UPDATE app_user SET mfa_enabled = true WHERE user_id = $1`, [u.user_id]);
-        await securityEvent(db, u.tenant_id, u.user_id, 'mfa_enrolled', { email }, ip);
-        // fall through to normal login
-      } else {
-        return { kind: 'mfa_enroll', secret, otpauthUri: otpauthUri(secret, email) };
-      }
-    } else {
-      if (!opts.totp) return { kind: 'mfa_required' };
-      if (!verifyTotp(decryptSecret(u.mfa_secret), opts.totp)) {
-        await securityEvent(db, u.tenant_id, u.user_id, 'mfa_failed', { email }, ip);
-        return { kind: 'mfa_invalid' };
-      }
-    }
-  }
-
-  // 90-day rotation for admin roles
-  if (passwordExpiredForRole(u.role, u.password_changed_at)) {
-    return { kind: 'password_expired' };
-  }
-
-  await db.query(
-    `UPDATE app_user SET last_login = now(), failed_login_attempts = 0, locked_until = NULL
-     WHERE user_id = $1`, [u.user_id]);
-  await securityEvent(db, u.tenant_id, u.user_id, 'login_succeeded', { email }, ip);
-
-  const timeoutMinutes = u.session_timeout_minutes ?? 30;
-  return {
-    kind: 'ok',
-    session: {
-      userId: u.user_id,
-      tenantId: u.tenant_id,
-      clientId: u.client_id,
-      role: u.role,
-      name: [u.first_name, u.last_name].filter(Boolean).join(' ') || email,
-      exp: Date.now() + timeoutMinutes * 60_000,
-      tm: timeoutMinutes,
-    },
-  };
 }
 
 /** issue a session directly (SSO assertion path) */
@@ -225,26 +244,37 @@ export async function sessionForUser(
 
 /** change password with old-password proof and policy enforcement (no session needed) */
 export async function changePassword(
-  db: Queryable, email: string, oldPassword: string, newPassword: string,
+  pool: PoolLike, email: string, oldPassword: string, newPassword: string,
   validate: (pw: string) => { ok: boolean; errors: string[] },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const rows = await db.query(
-    `SELECT user_id, tenant_id, password_hash FROM app_user
-     WHERE email = $1 AND status = 'active' AND deleted_at IS NULL
-     ORDER BY created_at LIMIT 1`, [email]);
-  const u = rows.rows[0];
-  if (!u || !verifyPassword(oldPassword, u.password_hash)) {
-    return { ok: false, error: 'invalid credentials' };
+  // same pre-tenant-context situation as authenticate() above
+  const db = await pool.connect();
+  try {
+    const resolved = await db.query(`SELECT app.resolve_tenant_by_email($1) AS tenant_id`, [email]);
+    const tenantId = resolved.rows[0]?.tenant_id;
+    if (!tenantId) return { ok: false, error: 'invalid credentials' };
+    await db.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [tenantId]);
+
+    const rows = await db.query(
+      `SELECT user_id, tenant_id, password_hash FROM app_user
+       WHERE email = $1 AND status = 'active' AND deleted_at IS NULL
+       ORDER BY created_at LIMIT 1`, [email]);
+    const u = rows.rows[0];
+    if (!u || !verifyPassword(oldPassword, u.password_hash)) {
+      return { ok: false, error: 'invalid credentials' };
+    }
+    const policy = validate(newPassword);
+    if (!policy.ok) return { ok: false, error: `password policy: ${policy.errors.join('; ')}` };
+    await db.query(
+      `UPDATE app_user SET password_hash = $1, password_changed_at = now(),
+              failed_login_attempts = 0, locked_until = NULL
+       WHERE user_id = $2`,
+      [hashPassword(newPassword), u.user_id]);
+    await securityEvent(db, u.tenant_id, u.user_id, 'password_changed', { email }, null);
+    return { ok: true };
+  } finally {
+    db.release();
   }
-  const policy = validate(newPassword);
-  if (!policy.ok) return { ok: false, error: `password policy: ${policy.errors.join('; ')}` };
-  await db.query(
-    `UPDATE app_user SET password_hash = $1, password_changed_at = now(),
-            failed_login_attempts = 0, locked_until = NULL
-     WHERE user_id = $2`,
-    [hashPassword(newPassword), u.user_id]);
-  await securityEvent(db, u.tenant_id, u.user_id, 'password_changed', { email }, null);
-  return { ok: true };
 }
 
 /** clients this session may see (client-scoped user -> theirs; else all of tenant) */

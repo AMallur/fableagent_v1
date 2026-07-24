@@ -90,30 +90,44 @@ export interface ApiIdentity {
 }
 
 export async function authenticateApiKey(
-  db: Queryable, headers: Record<string, string | string[] | undefined>,
+  pool: PoolLike, headers: Record<string, string | string[] | undefined>,
 ): Promise<ApiIdentity | null> {
   const auth = String(headers.authorization ?? '');
   const raw = auth.startsWith('Bearer ') ? auth.slice(7).trim()
     : String(headers['x-api-key'] ?? '').trim();
   if (!raw.startsWith('rcm_')) return null;
 
-  const rows = await db.query(
-    `SELECT k.api_key_id, k.tenant_id, k.client_id, k.scopes, k.rate_limit_per_minute
-     FROM api_key k
-     JOIN client c ON c.client_id = k.client_id AND c.deleted_at IS NULL
-       AND c.subscription_status <> 'cancelled'
-     WHERE k.key_hash = $1 AND k.revoked_at IS NULL`, [sha256(raw)]);
-  const k = rows.rows[0];
-  if (!k) return null;
-  // last_used, throttled to one write per minute per key
-  await db.query(
-    `UPDATE api_key SET last_used_at = now()
-     WHERE api_key_id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')`,
-    [k.api_key_id]).catch(() => {});
-  return {
-    apiKeyId: k.api_key_id, tenantId: k.tenant_id, clientId: k.client_id,
-    scopes: k.scopes, rateLimitPerMinute: k.rate_limit_per_minute,
-  };
+  // pre-tenant-context, same situation as login — see auth.ts authenticate()
+  // and 0017_pretenant_lookup_functions.sql
+  const db = await pool.connect();
+  try {
+    const hash = sha256(raw);
+    const resolved = await db.query(
+      `SELECT app.resolve_tenant_by_api_key_hash($1) AS tenant_id`, [hash]);
+    const tenantId = resolved.rows[0]?.tenant_id;
+    if (!tenantId) return null;
+    await db.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [tenantId]);
+
+    const rows = await db.query(
+      `SELECT k.api_key_id, k.tenant_id, k.client_id, k.scopes, k.rate_limit_per_minute
+       FROM api_key k
+       JOIN client c ON c.client_id = k.client_id AND c.deleted_at IS NULL
+         AND c.subscription_status <> 'cancelled'
+       WHERE k.key_hash = $1 AND k.revoked_at IS NULL`, [hash]);
+    const k = rows.rows[0];
+    if (!k) return null;
+    // last_used, throttled to one write per minute per key
+    await db.query(
+      `UPDATE api_key SET last_used_at = now()
+       WHERE api_key_id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')`,
+      [k.api_key_id]).catch(() => {});
+    return {
+      apiKeyId: k.api_key_id, tenantId: k.tenant_id, clientId: k.client_id,
+      scopes: k.scopes, rateLimitPerMinute: k.rate_limit_per_minute,
+    };
+  } finally {
+    db.release();
+  }
 }
 
 /**
