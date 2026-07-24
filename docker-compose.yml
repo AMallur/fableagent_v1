@@ -65,6 +65,13 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
+      # unset -> appeal packets/letters live on the app_var volume below (fine
+      # for one instance with a persistent volume, not fine once you run more
+      # than one). Set to move them to Cloud Storage. On GCE the VM's attached
+      # service account is used automatically (no key file needed); elsewhere,
+      # set GOOGLE_APPLICATION_CREDENTIALS to a mounted key file path.
+      GCS_DOCUMENT_BUCKET: ${GCS_DOCUMENT_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
     volumes:
       - app_var:/app/var
     depends_on:
@@ -88,6 +95,13 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
+      # unset -> appeal packets/letters live on the app_var volume below (fine
+      # for one instance with a persistent volume, not fine once you run more
+      # than one). Set to move them to Cloud Storage. On GCE the VM's attached
+      # service account is used automatically (no key file needed); elsewhere,
+      # set GOOGLE_APPLICATION_CREDENTIALS to a mounted key file path.
+      GCS_DOCUMENT_BUCKET: ${GCS_DOCUMENT_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
     volumes:
       - app_var:/app/var
     depends_on:

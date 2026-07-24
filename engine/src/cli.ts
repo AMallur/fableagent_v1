@@ -79,10 +79,12 @@ try {
 
     case 'appeals': {
       const { generateAppealPackets } = await import('./appeals/service.ts');
+      const { resolveDocumentStore } = await import('./appeals/storage.ts');
       const out = await generateAppealPackets(pool, {
         tenantId: values.tenant,
         clientId: values.client,
         asOf: values['as-of'],
+        store: await resolveDocumentStore(),
       });
       console.log(JSON.stringify({ jobId: out.jobId, summary: out.summary, packets: out.packets }, null, 2));
       const s = out.summary;
@@ -132,8 +134,10 @@ try {
       // long-running: tick once a minute until killed
       const { startScheduler } = await import('./automation/scheduler.ts');
       const { resolveEmailTransport } = await import('./automation/notify.ts');
+      const { resolveDocumentStore } = await import('./appeals/storage.ts');
       const transport = await resolveEmailTransport();
-      const handle = startScheduler(pool, { transport });
+      const store = await resolveDocumentStore();
+      const handle = startScheduler(pool, { transport, store });
       console.error('scheduler running — ctrl-c to stop');
       await new Promise<void>((resolve) => {
         process.on('SIGINT', () => { handle.stop(); resolve(); });
@@ -182,8 +186,10 @@ try {
     case 'nightly': {
       if (!values.client) { console.error('nightly: --client required'); process.exit(2); }
       const { runNightlyProcessing } = await import('./automation/jobs.ts');
+      const { resolveDocumentStore } = await import('./appeals/storage.ts');
       const out = await runNightlyProcessing(pool, {
         tenantId: values.tenant, clientId: values.client, asOf: values['as-of'],
+        store: await resolveDocumentStore(),
       });
       console.log(JSON.stringify(out, null, 2));
       break;

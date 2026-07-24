@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { startServer } from './server.ts';
 import { pgSslConfig } from './db_ssl.ts';
+import { resolveDocumentStore } from '../appeals/storage.ts';
 
 const { default: pg } = await import('pg');
 const pool = new pg.Pool({
@@ -12,6 +13,7 @@ const pool = new pg.Pool({
 const portArg = process.argv.indexOf('--port');
 const srv = await startServer(pool, {
   port: portArg > -1 ? Number(process.argv[portArg + 1]) : undefined,
+  store: await resolveDocumentStore(),
 });
 console.log(`RCM Recovery interface listening on http://localhost:${srv.port}`);
 
