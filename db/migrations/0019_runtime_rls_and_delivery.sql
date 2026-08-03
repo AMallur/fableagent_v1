@@ -20,12 +20,15 @@ BEGIN
     );
   END IF;
 END $$;
-GRANT USAGE, CREATE ON SCHEMA app TO rcm_catalog_lookup;
+-- Tables live in public, so the new owner needs CREATE there during ALTER
+-- OWNER. Revoke it as soon as the ownership transfers finish.
+GRANT USAGE, CREATE ON SCHEMA public, app TO rcm_catalog_lookup;
 
 ALTER TABLE tenant OWNER TO rcm_catalog_lookup;
 ALTER TABLE tenant NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE client OWNER TO rcm_catalog_lookup;
 ALTER TABLE client NO FORCE ROW LEVEL SECURITY;
+REVOKE CREATE ON SCHEMA public FROM rcm_catalog_lookup;
 GRANT SELECT, INSERT, UPDATE ON tenant, client TO CURRENT_USER;
 
 CREATE OR REPLACE FUNCTION app.list_active_clients()

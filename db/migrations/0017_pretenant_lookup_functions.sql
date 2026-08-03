@@ -48,15 +48,16 @@ BEGIN
     );
   END IF;
 END $$;
--- required to own anything inside schema app, including the functions below
--- (ALTER FUNCTION ... OWNER TO requires the NEW owner to have CREATE on the
--- schema, not just the role executing the statement)
-GRANT USAGE, CREATE ON SCHEMA app TO rcm_pretenant_lookup;
+-- ALTER OWNER requires the new owner to have CREATE on the object's schema.
+-- Tables live in public; functions live in app. Keep public CREATE only for
+-- the table ownership transfer below, then revoke it immediately.
+GRANT USAGE, CREATE ON SCHEMA public, app TO rcm_pretenant_lookup;
 
 ALTER TABLE app_user OWNER TO rcm_pretenant_lookup;
 ALTER TABLE app_user NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE api_key OWNER TO rcm_pretenant_lookup;
 ALTER TABLE api_key NO FORCE ROW LEVEL SECURITY;
+REVOKE CREATE ON SCHEMA public FROM rcm_pretenant_lookup;
 
 -- the app's connecting role lost its implicit table-owner privileges on
 -- these two tables with the ownership transfer above — restore what it
