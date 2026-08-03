@@ -15,6 +15,8 @@
 
 import type { UUID } from '../types.ts';
 import type { Queryable } from '../db/snapshot.ts';
+import type { PoolLike } from '../service.ts';
+import { optionalSecret } from '../security/secrets.ts';
 
 export type NotificationType =
   | 'case_assigned' | 'deadline_approaching' | 'payment_received'
@@ -151,6 +153,7 @@ export async function sendDigests(
 // ---------------------------------------------------------------------------
 
 export interface EmailTransport {
+  readonly delivers?: boolean;
   send(email: {
     emailId: UUID; toEmail: string; subject: string; bodyText: string; kind: string;
   }): Promise<void>;
@@ -158,6 +161,7 @@ export interface EmailTransport {
 
 /** default transport: logs the delivery (queued rows stay auditable) */
 export class LogTransport implements EmailTransport {
+  readonly delivers = false;
   async send(email: { toEmail: string; subject: string }): Promise<void> {
     console.log(`[email] to=${email.toEmail} subject="${email.subject}"`);
   }
@@ -165,6 +169,7 @@ export class LogTransport implements EmailTransport {
 
 /** test transport: collects sends in memory */
 export class MemoryTransport implements EmailTransport {
+  readonly delivers = true;
   readonly sent: Array<{ toEmail: string; subject: string; bodyText: string; kind: string }> = [];
   async send(email: any): Promise<void> { this.sent.push(email); }
 }
@@ -182,6 +187,7 @@ export class MemoryTransport implements EmailTransport {
  * well the rest of the app is secured.
  */
 export class SmtpTransport implements EmailTransport {
+  readonly delivers = true;
   private readonly from: string;
   private readonly transporter: import('nodemailer').Transporter;
 
@@ -236,17 +242,42 @@ export async function resolveEmailTransport(): Promise<EmailTransport> {
     port: Number(process.env.SMTP_PORT ?? 587),
     secure: process.env.SMTP_SECURE === '1',
     user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
+    pass: optionalSecret('SMTP_PASS'),
     from: process.env.SMTP_FROM ?? 'no-reply@localhost',
   });
 }
 
 export async function deliverOutbox(
-  db: Queryable, transport: EmailTransport, limit = 100,
+  db: PoolLike, transport: EmailTransport, limit = 100,
 ): Promise<{ sent: number; failed: number }> {
-  const rows = await db.query(
-    `SELECT email_id, to_email, subject, body_text, kind FROM email_outbox
-     WHERE status = 'queued' ORDER BY created_at LIMIT $1`, [limit]);
+  if (transport.delivers === false) {
+    // Preserve queued status. Console output is observability, not delivery.
+    return { sent: 0, failed: 0 };
+  }
+  const client = await db.connect();
+  let rows: { rows: any[] };
+  try {
+    await client.query('BEGIN');
+    rows = await client.query(
+      `WITH picked AS (
+         SELECT email_id FROM email_outbox
+         WHERE (status = 'queued' AND next_attempt_at <= now())
+            OR (status = 'processing' AND locked_at < now() - interval '15 minutes')
+         ORDER BY created_at
+         FOR UPDATE SKIP LOCKED LIMIT $1
+       )
+       UPDATE email_outbox e
+       SET status = 'processing', locked_at = now(), attempts = attempts + 1, error = NULL
+       FROM picked WHERE e.email_id = picked.email_id
+       RETURNING e.email_id, e.to_email, e.subject, e.body_text, e.kind, e.attempts`,
+      [limit]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
   let sent = 0, failed = 0;
   for (const r of rows.rows) {
     try {
@@ -255,13 +286,18 @@ export async function deliverOutbox(
         bodyText: r.body_text, kind: r.kind,
       });
       await db.query(
-        `UPDATE email_outbox SET status = 'sent', sent_at = now() WHERE email_id = $1`,
+        `UPDATE email_outbox
+         SET status = 'sent', sent_at = now(), locked_at = NULL WHERE email_id = $1`,
         [r.email_id]);
       sent += 1;
     } catch (err) {
       await db.query(
-        `UPDATE email_outbox SET status = 'failed', error = $2 WHERE email_id = $1`,
-        [r.email_id, String(err instanceof Error ? err.message : err)]);
+        `UPDATE email_outbox
+         SET status = CASE WHEN $3 >= 5 THEN 'failed' ELSE 'queued' END,
+             error = $2, locked_at = NULL,
+             next_attempt_at = now() + make_interval(mins => LEAST(60, (2 ^ LEAST($3, 5))::int))
+         WHERE email_id = $1`,
+        [r.email_id, String(err instanceof Error ? err.message : err), r.attempts]);
       failed += 1;
     }
   }

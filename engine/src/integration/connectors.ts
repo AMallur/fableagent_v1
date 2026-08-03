@@ -16,6 +16,7 @@
 
 import type { UUID } from '../types.ts';
 import type { PoolLike } from '../service.ts';
+import type { Queryable } from '../db/snapshot.ts';
 
 export interface ConnectorContext {
   tenantId: UUID;
@@ -90,7 +91,7 @@ const CLEARINGHOUSE_ALIASES: Record<string, string> = {
 // ---------------------------------------------------------------------------
 
 async function recordDelivery(
-  pool: PoolLike, ctx: ConnectorContext, connector: OutboundConnector,
+  pool: Queryable, ctx: ConnectorContext, connector: OutboundConnector,
   payload: Record<string, unknown>, result: ConnectorResult,
 ): Promise<UUID> {
   const inserted = await pool.query(
@@ -113,44 +114,83 @@ async function recordDelivery(
 export async function dispatchAppealSubmission(
   pool: PoolLike, args: { tenantId: UUID; packetId: UUID },
 ): Promise<{ deliveryId: UUID; connector: string; status: string } | null> {
-  const rows = await pool.query(
-    `SELECT ap.packet_id, ap.case_id, ap.submission_method, rc.client_id,
-            ci.clearinghouse_name, py.portal_url, py.payer_name,
-            cl.claim_number_internal
-     FROM appeal_packet ap
-     JOIN recovery_case rc ON rc.case_id = ap.case_id
-     JOIN claim cl ON cl.claim_id = rc.claim_id
-     JOIN payer py ON py.payer_id = cl.payer_id
-     LEFT JOIN client_integration ci ON ci.client_id = rc.client_id
-     WHERE ap.packet_id = $1 AND ap.tenant_id = $2`,
-    [args.packetId, args.tenantId]);
-  const p = rows.rows[0];
-  if (!p) return null;
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    await db.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [args.tenantId]);
+    // Serialize delivery of one packet across web replicas.
+    await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [args.packetId]);
+    const prior = await db.query(
+      `SELECT delivery_id, connector, status FROM outbound_delivery
+       WHERE packet_id = $1 AND tenant_id = $2 AND status = 'sent'
+       ORDER BY created_at DESC LIMIT 1`, [args.packetId, args.tenantId]);
+    if (prior.rows[0]) {
+      await db.query('COMMIT');
+      return {
+        deliveryId: prior.rows[0].delivery_id,
+        connector: prior.rows[0].connector,
+        status: prior.rows[0].status,
+      };
+    }
 
-  let connectorName: string;
-  if (p.submission_method === 'clearinghouse') {
-    connectorName = CLEARINGHOUSE_ALIASES[String(p.clearinghouse_name ?? '').toLowerCase()]
-      ?? 'change_healthcare';
-  } else if (p.submission_method === 'portal') {
-    connectorName = 'payer_portal';
-  } else {
-    return null;   // mail/fax are human workflows, not connector dispatches
+    const rows = await db.query(
+      `SELECT ap.packet_id, ap.case_id, ap.submission_method, rc.client_id,
+              ci.clearinghouse_name, py.portal_url, py.payer_name,
+              cl.claim_number_internal
+       FROM appeal_packet ap
+       JOIN recovery_case rc ON rc.case_id = ap.case_id
+       JOIN claim cl ON cl.claim_id = rc.claim_id
+       JOIN payer py ON py.payer_id = cl.payer_id
+       LEFT JOIN client_integration ci ON ci.client_id = rc.client_id
+       WHERE ap.packet_id = $1 AND ap.tenant_id = $2`,
+      [args.packetId, args.tenantId]);
+    const p = rows.rows[0];
+    if (!p) {
+      await db.query('COMMIT');
+      return null;
+    }
+
+    let connectorName: string;
+    if (p.submission_method === 'clearinghouse') {
+      connectorName = CLEARINGHOUSE_ALIASES[String(p.clearinghouse_name ?? '').toLowerCase()]
+        ?? 'change_healthcare';
+    } else if (p.submission_method === 'portal') {
+      connectorName = 'payer_portal';
+    } else {
+      await db.query('COMMIT');
+      return null;   // mail/fax are human workflows, not connector dispatches
+    }
+
+    const connector = getConnector(connectorName)!;
+    const ctx: ConnectorContext = {
+      tenantId: args.tenantId, clientId: p.client_id,
+      caseId: p.case_id, packetId: p.packet_id,
+      config: { portalUrl: p.portal_url, clearinghouse: p.clearinghouse_name },
+    };
+    const payload = {
+      type: 'appeal_packet', packetId: p.packet_id,
+      idempotencyKey: `fableagent:appeal:${p.packet_id}`,
+      claimNumber: p.claim_number_internal, payer: p.payer_name,
+      method: p.submission_method,
+    };
+    const result = await connector.send(ctx, payload);
+    const deliveryId = await recordDelivery(db, ctx, connector, payload, result);
+    await db.query('COMMIT');
+    return { deliveryId, connector: connector.name, status: result.status };
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    db.release();
   }
+}
 
-  const connector = getConnector(connectorName)!;
-  const ctx: ConnectorContext = {
-    tenantId: args.tenantId, clientId: p.client_id,
-    caseId: p.case_id, packetId: p.packet_id,
-    config: { portalUrl: p.portal_url, clearinghouse: p.clearinghouse_name },
-  };
-  const payload = {
-    type: 'appeal_packet', packetId: p.packet_id,
-    claimNumber: p.claim_number_internal, payer: p.payer_name,
-    method: p.submission_method,
-  };
-  const result = await connector.send(ctx, payload);
-  const deliveryId = await recordDelivery(pool, ctx, connector, payload, result);
-  return { deliveryId, connector: connector.name, status: result.status };
+export class ConnectorUnavailableError extends Error {
+  status = 409;
+  constructor(connector: string) {
+    super(`${connector} is not configured for live delivery; packet remains ready`);
+    this.name = 'ConnectorUnavailableError';
+  }
 }
 
 /** case status change -> PM/EHR write-back when the client has a PM configured */

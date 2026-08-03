@@ -4,8 +4,20 @@
 // object storage (S3/GCS) without touching database rows.
 // ============================================================================
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+
+function safeStoragePath(value: string): string {
+  if (!value || value.includes('\0') || path.isAbsolute(value)) {
+    throw new Error('invalid document storage path');
+  }
+  const normalized = path.posix.normalize(value.replaceAll('\\', '/'));
+  if (normalized === '..' || normalized.startsWith('../')) {
+    throw new Error('document storage path escapes store root');
+  }
+  return normalized;
+}
 
 export interface DocumentStore {
   /** write content, return the storage_path to persist on the DOCUMENT row */
@@ -26,18 +38,21 @@ export class FileSystemDocumentStore implements DocumentStore {
   }
 
   async put(relativePath: string, content: string | Uint8Array): Promise<string> {
+    relativePath = safeStoragePath(relativePath);
     const abs = path.join(this.root, relativePath);
     await mkdir(path.dirname(abs), { recursive: true });
-    await writeFile(abs, content);
+    const temp = `${abs}.tmp-${randomUUID()}`;
+    await writeFile(temp, content, { mode: 0o640 });
+    await rename(temp, abs);
     return relativePath;
   }
 
   async get(storagePath: string): Promise<string> {
-    return readFile(path.join(this.root, storagePath), 'utf8');
+    return readFile(path.join(this.root, safeStoragePath(storagePath)), 'utf8');
   }
 
   async getRaw(storagePath: string): Promise<Buffer> {
-    return readFile(path.join(this.root, storagePath));
+    return readFile(path.join(this.root, safeStoragePath(storagePath)));
   }
 }
 
@@ -60,6 +75,7 @@ export class GcsDocumentStore implements DocumentStore {
   }
 
   async put(relativePath: string, content: string | Uint8Array): Promise<string> {
+    relativePath = safeStoragePath(relativePath);
     await this.bucket.file(relativePath).save(Buffer.from(content), { resumable: false });
     return relativePath;
   }
@@ -69,6 +85,7 @@ export class GcsDocumentStore implements DocumentStore {
   }
 
   async getRaw(storagePath: string): Promise<Buffer> {
+    storagePath = safeStoragePath(storagePath);
     const [buf] = await this.bucket.file(storagePath).download();
     return buf;
   }

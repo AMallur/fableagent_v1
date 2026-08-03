@@ -11,6 +11,7 @@ import { randomBytes } from 'node:crypto';
 import dns from 'node:dns/promises';
 import type { UUID } from '../types.ts';
 import type { PoolLike } from '../service.ts';
+import { releaseTenantConnection } from '../db/tenant_pool.ts';
 import type { Queryable } from '../db/snapshot.ts';
 import type { Session } from './auth.ts';
 import { hashPassword } from './auth.ts';
@@ -659,7 +660,7 @@ export async function acceptInvite(pool: PoolLike, token: string, password: stri
       [u.tenant_id, u.user_id, JSON.stringify({ email: u.email })]);
     return { ok: true };
   } finally {
-    db.release();
+    await releaseTenantConnection(db);
   }
 }
 

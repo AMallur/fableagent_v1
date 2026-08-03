@@ -16,6 +16,7 @@ import type { Scope } from './queries.ts';
 import { assertClientAccess } from './admin_api.ts';
 import type { Remittance835 } from '../ingest/parse835.ts';
 import type { ClaimFile837 } from '../ingest/parse837.ts';
+import { releaseTenantConnection } from '../db/tenant_pool.ts';
 
 const err = (message: string, status: number) => Object.assign(new Error(message), { status });
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -126,7 +127,7 @@ export async function authenticateApiKey(
       scopes: k.scopes, rateLimitPerMinute: k.rate_limit_per_minute,
     };
   } finally {
-    db.release();
+    await releaseTenantConnection(db);
   }
 }
 
@@ -151,6 +152,18 @@ export class RateLimiter {
     }
     return null;
   }
+}
+
+/** Cross-replica fixed-window limiter backed by PostgreSQL. */
+export async function checkApiRateLimit(db: Queryable, id: ApiIdentity): Promise<number | null> {
+  const rows = await db.query(
+    `INSERT INTO api_rate_window (tenant_id, api_key_id, window_start, request_count)
+     VALUES ($1, $2, date_trunc('minute', now()), 1)
+     ON CONFLICT (api_key_id, window_start)
+     DO UPDATE SET request_count = api_rate_window.request_count + 1
+     RETURNING request_count`,
+    [id.tenantId, id.apiKeyId]);
+  return Number(rows.rows[0]?.request_count ?? 1) > id.rateLimitPerMinute ? 60 : null;
 }
 
 export async function logApiRequest(

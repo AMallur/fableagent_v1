@@ -230,10 +230,15 @@ const stBadge = (s) => '<span class="badge st ' + esc(s) + '">' + esc(String(s).
     }
   } catch { /* not logged in */ }
 })();
+document.getElementById('logout')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  fetch('/api/logout', { method: 'POST' }).then(() => { location.href = '/login'; });
+});
 `;
 
 export function layout(opts: {
   title: string; active: string; userName: string; role: string; body: string; script?: string;
+  nonce?: string;
 }): string {
   const isTenantAdmin = ['super_admin', 'tenant_admin'].includes(opts.role);
   const isAdmin = isTenantAdmin || opts.role === 'client_admin';
@@ -267,7 +272,7 @@ export function layout(opts: {
 <body><div class="shell">
 <nav class="side"><div class="brand">RCM Recovery</div>${nav}
 <div class="sect">Session</div>
-<a href="#" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false">Sign out</a>
+<a href="#" id="logout">Sign out</a>
 </nav>
 <main>
 <div class="topbar"><h1>${opts.title}</h1>
@@ -276,11 +281,11 @@ ${opts.body}
 </main></div>
 <div id="toast" class="toast"></div>
 <script src="/assets/app.js"></script>
-${opts.script ? `<script>${opts.script}</script>` : ''}
+${opts.script ? `<script${opts.nonce ? ` nonce="${opts.nonce}"` : ''}>${opts.script}</script>` : ''}
 </body></html>`;
 }
 
-export function loginPage(error?: string): string {
+export function loginPage(error?: string, nonce?: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"><title>Sign in — RCM Recovery</title>
 <link rel="stylesheet" href="/assets/app.css"></head>
 <body><div class="login-wrap"><form class="login" id="f">
@@ -295,7 +300,7 @@ export function loginPage(error?: string): string {
 <div class="err" id="err">${error ?? ''}</div>
 <button class="btn primary" style="width:100%" id="go">Sign in</button>
 </form></div>
-<script>
+<script${nonce ? ` nonce="${nonce}"` : ''}>
 const f = document.getElementById('f');
 let mode = 'login';
 f.addEventListener('submit', async (e) => {

@@ -10,14 +10,17 @@
 // ============================================================================
 
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import type { PoolLike } from '../service.ts';
 import { runDetectionJob } from '../service.ts';
 import { generateAppealPackets } from '../appeals/service.ts';
 import { FileSystemDocumentStore, type DocumentStore } from '../appeals/storage.ts';
 import {
   COOKIE_NAME, authenticate, changePassword, decodeSession, encodeSession,
-  sessionForUser, visibleClientIds, type Session,
+  refreshSession, sessionForUser, visibleClientIds, type Session,
 } from './auth.ts';
+import { TenantContextPool } from '../db/tenant_pool.ts';
 import * as admin from './admin_api.ts';
 import * as compliance from './compliance_api.ts';
 import * as pub from './public_api.ts';
@@ -25,7 +28,9 @@ import { API_ENDPOINTS, buildOpenApi, docsHtml } from './api_docs.ts';
 import {
   detectFileKind, ingestFileByKind, ingestParsed835, ingestParsed837, previewIngestFile,
 } from '../ingest/service.ts';
-import { dispatchAppealSubmission, dispatchCaseWriteback } from '../integration/connectors.ts';
+import {
+  ConnectorUnavailableError, dispatchAppealSubmission, dispatchCaseWriteback,
+} from '../integration/connectors.ts';
 import { validatePassword, ensureDataEncryptionKeyConfigured } from '../security/crypto.ts';
 import { requireSecret } from '../security/secrets.ts';
 import {
@@ -71,6 +76,11 @@ function getSessionSecret(explicit?: string): string {
 }
 
 export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
+  // All request work uses this wrapper. It binds RLS tenant state to the
+  // asynchronous request and never relies on whichever pg connection happens
+  // to be selected by pool.query().
+  const tenantPool = new TenantContextPool(pool);
+  pool = tenantPool;
   // fail at boot, not on the first request that happens to need these
   const secret = getSessionSecret(opts.sessionSecret);
   ensureDataEncryptionKeyConfigured();
@@ -83,8 +93,18 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     ctx.res.writeHead(status, { 'Content-Type': 'application/json' });
     ctx.res.end(JSON.stringify(body));
   };
-  const html = (ctx: Ctx, body: string, status = 200) => {
-    ctx.res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
+  const html = (ctx: Ctx, body: string, status = 200, nonce?: string) => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Referrer-Policy': 'no-referrer',
+      'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    };
+    if (nonce) {
+      headers['Content-Security-Policy'] =
+        `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; `
+        + `img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`;
+    }
+    ctx.res.writeHead(status, headers);
     ctx.res.end(body);
   };
   const redirect = (ctx: Ctx, to: string) => {
@@ -95,6 +115,12 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     const proto = requireHttps() ? 'https'
       : (ctx.req.headers['x-forwarded-proto'] as string) ?? 'http';
     return `${proto}://${ctx.req.headers.host ?? 'localhost'}`;
+  };
+  const clientIp = (ctx: Ctx): string | null => {
+    const forwarded = String(ctx.req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
+    if ((requireHttps() || process.env.TRUST_PROXY === '1') && isIP(forwarded)) return forwarded;
+    const direct = ctx.req.socket.remoteAddress ?? '';
+    return isIP(direct) ? direct : null;
   };
   const readBody = (req: http.IncomingMessage, limit = 25 * 1024 * 1024): Promise<Buffer> =>
     new Promise((resolve, reject) => {
@@ -115,15 +141,16 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     catch { throw Object.assign(new Error('invalid JSON body'), { status: 400 }); }
   };
 
-  const page = (ctx: Ctx, title: string, active: string, body: string, script: string) =>
-    html(ctx, layout({
+  const page = (ctx: Ctx, title: string, active: string, body: string, script: string) => {
+    const nonce = randomBytes(18).toString('base64');
+    return html(ctx, layout({
       title, active, body, script,
       userName: ctx.session!.name, role: ctx.session!.role,
-    }));
+      nonce,
+    }), 200, nonce);
+  };
 
   // ---- public API (/api/v1) helpers ----------------------------------------
-  const rateLimiter = new pub.RateLimiter();
-
   /** API-key-authenticated route: auth -> scope -> rate limit -> handler -> log */
   const apiKeyed = (
     method: string, pattern: RegExp, scope: 'read' | 'ingest',
@@ -142,27 +169,33 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
         status = 403;
         return json(ctx, 403, { error: `API key lacks the '${scope}' scope` });
       }
-      const retryAfter = rateLimiter.check(identity.apiKeyId, identity.rateLimitPerMinute);
-      if (retryAfter != null) {
-        status = 429;
-        ctx.res.setHeader('Retry-After', String(retryAfter));
-        return json(ctx, 429, { error: 'rate limit exceeded', retryAfterSeconds: retryAfter });
-      }
-      await h(ctx, identity);
+      await tenantPool.runAsTenant(identity.tenantId, async () => {
+        const retryAfter = await pub.checkApiRateLimit(pool, identity!);
+        if (retryAfter != null) {
+          status = 429;
+          ctx.res.setHeader('Retry-After', String(retryAfter));
+          return json(ctx, 429, { error: 'rate limit exceeded', retryAfterSeconds: retryAfter });
+        }
+        await h(ctx, identity!);
+      });
       status = ctx.res.statusCode;
     } catch (err: any) {
       status = err?.status ?? 500;
       if (status >= 500) console.error(err);
       if (!ctx.res.headersSent) {
-        json(ctx, status, { error: err?.message ?? 'internal error' });
+        json(ctx, status, {
+          error: status >= 500 ? 'internal error' : (err?.message ?? 'request failed'),
+        });
       }
     } finally {
-      await pub.logApiRequest(pool, {
+      const log = () => pub.logApiRequest(pool, {
         tenantId: identity?.tenantId ?? null, apiKeyId: identity?.apiKeyId ?? null,
         method, path: ctx.url.pathname, status,
         durationMs: Date.now() - started,
-        ip: ctx.req.socket.remoteAddress ?? null,
+        ip: clientIp(ctx),
       });
+      if (identity) await tenantPool.runAsTenant(identity.tenantId, log);
+      else await log();
     }
   });
 
@@ -170,8 +203,20 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     if (!ctx.session) {
       return kind === 'api' ? json(ctx, 401, { error: 'unauthorized' }) : redirect(ctx, '/login');
     }
-    ctx.scope = { tenantId: ctx.session.tenantId, clientIds: await visibleClientIds(pool, ctx.session) };
-    return h(ctx);
+    return tenantPool.runAsTenant(ctx.session.tenantId, async () => {
+      const current = await refreshSession(pool, ctx.session!);
+      if (!current) {
+        ctx.session = null;
+        return kind === 'api' ? json(ctx, 401, { error: 'session revoked' }) : redirect(ctx, '/login');
+      }
+      ctx.session = current;
+      if (current.tm && current.exp - Date.now() < (current.tm * 60_000) / 2) {
+        current.exp = Date.now() + current.tm * 60_000;
+        setSessionCookie(ctx, current);
+      }
+      ctx.scope = { tenantId: current.tenantId, clientIds: await visibleClientIds(pool, current) };
+      return h(ctx);
+    });
   };
 
   // ---- routes ---------------------------------------------------------------
@@ -188,7 +233,8 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
       await pool.query('SELECT 1');
       json(ctx, 200, { status: 'ok' });
     } catch (err: any) {
-      json(ctx, 503, { status: 'unhealthy', error: err?.message ?? 'database unreachable' });
+      console.error('health check failed', err);
+      json(ctx, 503, { status: 'unhealthy', error: 'database unreachable' });
     }
   });
 
@@ -209,12 +255,18 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
   };
 
   // auth
-  route('GET', /^\/login$/, async (ctx) => html(ctx, loginPage()));
+  route('GET', /^\/login$/, async (ctx) => {
+    const nonce = randomBytes(18).toString('base64');
+    html(ctx, loginPage(undefined, nonce), 200, nonce);
+  });
   route('POST', /^\/api\/login$/, async (ctx) => {
     const body = await readJson(ctx.req);
+    const source = clientIp(ctx) ?? 'unknown';
+    const allowed = await pool.query(`SELECT app.check_auth_rate($1, 20) AS allowed`, [source]);
+    if (!allowed.rows[0]?.allowed) return json(ctx, 429, { error: 'too many login attempts' });
     const outcome = await authenticate(
       pool, String(body.email ?? ''), String(body.password ?? ''),
-      { totp: body.totp ? String(body.totp) : undefined, ip: ctx.req.socket.remoteAddress },
+      { totp: body.totp ? String(body.totp) : undefined, ip: clientIp(ctx) },
     );
     switch (outcome.kind) {
       case 'ok':
@@ -261,18 +313,21 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
   });
   route('GET', /^\/sso\/login$/, async (ctx) => {
     const tenantId = ctx.url.searchParams.get('tenant') ?? '';
-    const cfg = await loadSsoConfig(pool, tenantId);
-    if (!cfg?.enabled) return json(ctx, 409, { error: 'SSO is not enabled for this tenant' });
-    redirect(ctx, await buildLoginUrl(baseUrl(ctx), tenantId, cfg));
+    await tenantPool.runAsTenant(tenantId, async () => {
+      const cfg = await loadSsoConfig(pool, tenantId);
+      if (!cfg?.enabled) return json(ctx, 409, { error: 'SSO is not enabled for this tenant' });
+      redirect(ctx, await buildLoginUrl(baseUrl(ctx), tenantId, cfg));
+    });
   });
   route('POST', /^\/sso\/acs$/, async (ctx) => {
     const tenantId = ctx.url.searchParams.get('tenant') ?? '';
-    const cfg = await loadSsoConfig(pool, tenantId);
-    if (!cfg?.enabled) return json(ctx, 409, { error: 'SSO is not enabled for this tenant' });
-    const raw = (await readBody(ctx.req, 1024 * 1024)).toString('utf8');
-    const form = Object.fromEntries(new URLSearchParams(raw));
-    const assertion = await validateAcsResponse(baseUrl(ctx), tenantId, cfg, form);
-    const role = mapGroupsToRole(cfg.group_role_mappings ?? [], assertion.groups, cfg.default_role);
+    await tenantPool.runAsTenant(tenantId, async () => {
+      const cfg = await loadSsoConfig(pool, tenantId);
+      if (!cfg?.enabled) return json(ctx, 409, { error: 'SSO is not enabled for this tenant' });
+      const raw = (await readBody(ctx.req, 1024 * 1024)).toString('utf8');
+      const form = Object.fromEntries(new URLSearchParams(raw));
+      const assertion = await validateAcsResponse(baseUrl(ctx), tenantId, cfg, form);
+      const role = mapGroupsToRole(cfg.group_role_mappings ?? [], assertion.groups, cfg.default_role);
 
     // match by email or JIT-provision
     let user = await pool.query(
@@ -292,11 +347,12 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
       `SELECT app.log_security_event($1, $2, 'sso_login', $3, $4::inet)`,
       [tenantId, user.rows[0].user_id,
        JSON.stringify({ email: assertion.email, role, groups: assertion.groups }),
-       ctx.req.socket.remoteAddress ?? null]);
-    const session = await sessionForUser(pool, user.rows[0].user_id);
-    if (!session) return json(ctx, 403, { error: 'user is not active' });
-    setSessionCookie(ctx, session);
-    redirect(ctx, '/dashboard');
+       clientIp(ctx)]);
+      const session = await sessionForUser(pool, user.rows[0].user_id);
+      if (!session) return json(ctx, 403, { error: 'user is not active' });
+      setSessionCookie(ctx, session);
+      redirect(ctx, '/dashboard');
+    });
   });
   route('POST', /^\/api\/logout$/, async (ctx) => {
     ctx.res.setHeader('Set-Cookie', `${COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0`);
@@ -366,7 +422,7 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     // HIPAA: record who viewed this patient's record
     await pool.query(`SELECT app.log_phi_access($1, $2, $3, $4, $5::inet)`,
       [ctx.scope!.tenantId, ctx.session!.userId, detail.patient.patientId,
-       `case detail ${ctx.params[0]}`, ctx.req.socket.remoteAddress ?? null]).catch(() => {});
+       `case detail ${ctx.params[0]}`, clientIp(ctx)]);
     json(ctx, 200, detail);
   });
 
@@ -419,10 +475,18 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
 
   authed('GET', /^\/api\/documents\/([0-9a-f-]{36})\/content$/, async (ctx) => {
     const doc = await pool.query(
-      `SELECT storage_path, file_name FROM document
-       WHERE document_id = $1 AND tenant_id = $2 AND client_id = ANY($3) AND deleted_at IS NULL`,
+      `SELECT d.storage_path, d.file_name, e.patient_id
+       FROM document d
+       LEFT JOIN recovery_case rc ON rc.case_id = d.case_id
+       LEFT JOIN claim cl ON cl.claim_id = rc.claim_id
+       LEFT JOIN encounter e ON e.encounter_id = cl.encounter_id
+       WHERE d.document_id = $1 AND d.tenant_id = $2
+         AND d.client_id = ANY($3) AND d.deleted_at IS NULL`,
       [ctx.params[0], ctx.scope!.tenantId, ctx.scope!.clientIds]);
     if (!doc.rows[0]) return json(ctx, 404, { error: 'document not found' });
+    await pool.query(`SELECT app.log_phi_access($1, $2, $3, $4, $5::inet)`,
+      [ctx.scope!.tenantId, ctx.session!.userId, doc.rows[0].patient_id,
+       `document ${ctx.params[0]}`, clientIp(ctx)]);
     const raw = await store.getRaw(doc.rows[0].storage_path);
     const isText = /\.(txt|csv|json)$/i.test(doc.rows[0].file_name);
     ctx.res.writeHead(200, {
@@ -434,6 +498,17 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
 
   authed('POST', /^\/api\/packets\/([0-9a-f-]{36})\/submit$/, async (ctx) => {
     const body = await readJson(ctx.req);
+    // Electronic delivery must succeed before the workflow can claim the
+    // packet was submitted. Recording stubs and transport failures fail closed.
+    let delivery = null;
+    if (!body.manual) {
+      delivery = await dispatchAppealSubmission(pool, {
+        tenantId: ctx.scope!.tenantId, packetId: ctx.params[0],
+      });
+      if (!delivery || delivery.status !== 'sent') {
+        throw new ConnectorUnavailableError(delivery?.connector ?? String(body.method ?? 'connector'));
+      }
+    }
     const out = await actions.submitPacket(pool, ctx.session!, ctx.scope!, ctx.params[0], {
       method: body.method, payerReference: body.payerReference, manual: !!body.manual,
     });
@@ -441,13 +516,6 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
       trigger: 'status_changed', tenantId: ctx.scope!.tenantId,
       caseId: out.caseId, detail: 'appeal submitted',
     }).catch(() => {});
-    // outbound hook: electronic submissions dispatch through the connector layer
-    let delivery = null;
-    if (!body.manual) {
-      delivery = await dispatchAppealSubmission(pool, {
-        tenantId: ctx.scope!.tenantId, packetId: ctx.params[0],
-      }).catch(() => null);
-    }
     json(ctx, 200, { ...out, delivery });
   });
 
@@ -816,7 +884,7 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     if (!detail) return json(ctx, 404, { error: 'case not found' });
     await pool.query(`SELECT app.log_phi_access($1, NULL, $2, $3, $4::inet)`,
       [id.tenantId, detail.patient.patientId, `api case detail (key ${id.apiKeyId})`,
-       ctx.req.socket.remoteAddress ?? null]).catch(() => {});
+       clientIp(ctx)]);
     json(ctx, 200, detail);
   });
 
@@ -835,7 +903,7 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
 
     // HTTPS enforcement (behind a TLS-terminating proxy): redirect plain HTTP
     // and pin HSTS. On by default in production — see requireHttps() above.
-    if (requireHttps()) {
+    if (requireHttps() && url.pathname !== '/healthz') {
       res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
       if ((req.headers['x-forwarded-proto'] ?? 'http') !== 'https') {
         res.writeHead(301, { Location: `https://${req.headers.host}${req.url}` });
@@ -850,12 +918,19 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     const session = decodeSession(cookies[COOKIE_NAME], secret);
     const ctx: Ctx = { req, res, url, session, scope: null, params: [] };
 
-    // sliding session: renew the cookie when less than half the tenant's
-    // timeout window remains
-    if (session?.tm && session.exp - Date.now() < (session.tm * 60_000) / 2) {
-      const renewed = { ...session, exp: Date.now() + session.tm * 60_000 };
-      res.setHeader('Set-Cookie',
-        `${COOKIE_NAME}=${encodeSession(renewed, secret)}; HttpOnly; Path=/; SameSite=Lax${secureFlag}`);
+    // SAML ACS is the deliberate cross-site POST exception and verifies a
+    // signed assertion. Cookie-authenticated mutations must match this host.
+    if (req.method === 'POST' && session && url.pathname !== '/sso/acs') {
+      const origin = req.headers.origin;
+      if (origin) {
+        let originHost = '';
+        try { originHost = new URL(origin).host; } catch { /* reject below */ }
+        if (!originHost || originHost !== req.headers.host) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'cross-site request rejected' }));
+          return;
+        }
+      }
     }
 
     try {
@@ -874,7 +949,9 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
       if (status >= 500) console.error(err);
       if (!res.headersSent) {
         res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err?.message ?? 'internal error' }));
+        res.end(JSON.stringify({
+          error: status >= 500 ? 'internal error' : (err?.message ?? 'request failed'),
+        }));
       } else res.end();
     }
   });

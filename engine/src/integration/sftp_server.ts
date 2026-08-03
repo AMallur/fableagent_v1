@@ -17,10 +17,12 @@ import { timingSafeEqual } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, stat, writeFile, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import ssh2 from 'ssh2';
 import type { PoolLike } from '../service.ts';
 import { verifyPassword } from '../web/auth.ts';
 import { provisionIngestFolder } from './sweep.ts';
+import { TenantContextPool } from '../db/tenant_pool.ts';
 
 const { Server, utils } = ssh2;
 const { OPEN_MODE, STATUS_CODE } = utils.sftp;
@@ -80,13 +82,18 @@ const DUMMY_HASH = 's2:000000000000000000000000000000000000000000000000000000000
   + '0'.repeat(64);
 
 async function lookupClient(pool: PoolLike, username: string): Promise<ClientAuth | null> {
-  const rows = await pool.query(
+  const scoped = pool instanceof TenantContextPool ? pool : new TenantContextPool(pool);
+  const resolved = await scoped.query(
+    `SELECT app.resolve_tenant_by_sftp_username($1) AS tenant_id`, [username]);
+  const tenantId = resolved.rows[0]?.tenant_id;
+  if (!tenantId) return null;
+  const rows = await scoped.runAsTenant(tenantId, () => scoped.query(
     `SELECT ci.tenant_id, ci.client_id, c.client_name, ci.sftp_inbound_password_hash
      FROM client_integration ci
      JOIN client c ON c.client_id = ci.client_id
      WHERE ci.sftp_inbound_username = $1 AND ci.sftp_inbound_enabled = true
        AND c.deleted_at IS NULL`,
-    [username]);
+    [username]));
   return rows.rows[0] ? {
     tenantId: rows.rows[0].tenant_id, clientId: rows.rows[0].client_id,
     clientName: rows.rows[0].client_name, passwordHash: rows.rows[0].sftp_inbound_password_hash,
@@ -104,6 +111,8 @@ export interface SftpServerOptions {
 }
 
 export async function startSftpServer(pool: PoolLike, opts: SftpServerOptions = {}) {
+  const scoped = pool instanceof TenantContextPool ? pool : new TenantContextPool(pool);
+  pool = scoped;
   const log = opts.log ?? ((m: string) => console.log(`[sftp] ${m}`));
   const hostKey = await ensureHostKey(
     opts.hostKeyPath ?? path.join(process.cwd(), 'var', 'sftp_host_key'),
@@ -117,8 +126,14 @@ export async function startSftpServer(pool: PoolLike, opts: SftpServerOptions = 
   // explicitly when closing, same graceful-then-bounded pattern as the HTTP
   // server's shutdown in web/main.ts.
   const activeClients = new Set<import('ssh2').Connection>();
+  const maxConnections = Number(process.env.SFTP_MAX_CONNECTIONS ?? 100);
+  const maxUploadBytes = Number(process.env.SFTP_MAX_UPLOAD_BYTES ?? 100 * 1024 * 1024);
 
   const server = new Server({ hostKeys: [hostKey] }, (client) => {
+    if (activeClients.size >= maxConnections) {
+      client.end();
+      return;
+    }
     activeClients.add(client);
     client.on('close', () => activeClients.delete(client));
 
@@ -127,7 +142,9 @@ export async function startSftpServer(pool: PoolLike, opts: SftpServerOptions = 
 
     client.on('authentication', (ctx) => {
       if (ctx.method !== 'password') return ctx.reject(['password']);
-      lookupClient(pool, ctx.username)
+      const source = String((client as any)._sock?.remoteAddress ?? 'unknown');
+      pool.query(`SELECT app.check_auth_rate($1, 10) AS allowed`, [`sftp:${source}`])
+        .then((r) => r.rows[0]?.allowed ? lookupClient(pool, ctx.username) : null)
         .then(async (found) => {
           // verifyPassword() short-circuits on a null hash without ever
           // calling scrypt, so a nonexistent username would otherwise return
@@ -147,7 +164,8 @@ export async function startSftpServer(pool: PoolLike, opts: SftpServerOptions = 
           // the time 'ready' happens and the session listener attaches
           // immediately as ssh2 expects.
           try {
-            root = await provisionIngestFolder(pool, found.tenantId, found.clientId);
+            root = await scoped.runAsTenant(found.tenantId, () =>
+              provisionIngestFolder(pool, found.tenantId, found.clientId));
           } catch (err) {
             log(`folder provisioning failed: ${err instanceof Error ? err.message : err}`);
             return ctx.reject();
@@ -169,7 +187,9 @@ export async function startSftpServer(pool: PoolLike, opts: SftpServerOptions = 
         const session = accept();
         session.on('sftp', (accept: () => any) => {
           const sftp = accept();
-          const openFiles = new Map<number, { fd: import('node:fs/promises').FileHandle; path: string }>();
+          const openFiles = new Map<number, {
+            fd: import('node:fs/promises').FileHandle; path: string; finalPath?: string; size?: number;
+          }>();
           let nextHandle = 0;
 
           const reject = (reqid: number, code = STATUS_CODE.PERMISSION_DENIED) =>
@@ -242,12 +262,13 @@ export async function startSftpServer(pool: PoolLike, opts: SftpServerOptions = 
             // no subdirectories from the client's side — keep the drop flat
             if (path.dirname(real) !== root) return reject(reqid);
 
+            const temp = path.join(root!, `.uploading-${randomUUID()}`);
             import('node:fs/promises').then(({ open }) =>
-              open(real, 'w', 0o640)
+              open(temp, 'wx', 0o640)
                 .then((fd) => {
                   const handle = Buffer.alloc(4);
                   handle.writeUInt32BE(nextHandle, 0);
-                  openFiles.set(nextHandle, { fd, path: real });
+                  openFiles.set(nextHandle, { fd, path: temp, finalPath: real, size: 0 });
                   nextHandle += 1;
                   sftp.handle(reqid, handle);
                 })
@@ -257,8 +278,14 @@ export async function startSftpServer(pool: PoolLike, opts: SftpServerOptions = 
           sftp.on('WRITE', (reqid: number, handleBuf: Buffer, offset: number, data: Buffer) => {
             const entry = openFiles.get(handleBuf.readUInt32BE(0));
             if (!entry?.fd) return reject(reqid, STATUS_CODE.FAILURE);
+            if (offset + data.length > maxUploadBytes) {
+              return reject(reqid, STATUS_CODE.FAILURE);
+            }
             entry.fd.write(data, 0, data.length, offset)
-              .then(() => sftp.status(reqid, STATUS_CODE.OK))
+              .then(() => {
+                entry.size = Math.max(entry.size ?? 0, offset + data.length);
+                sftp.status(reqid, STATUS_CODE.OK);
+              })
               .catch(() => reject(reqid, STATUS_CODE.FAILURE));
           });
 
@@ -269,8 +296,19 @@ export async function startSftpServer(pool: PoolLike, opts: SftpServerOptions = 
             if (!entry) return reject(reqid, STATUS_CODE.FAILURE);
             if (!entry.fd) return sftp.status(reqid, STATUS_CODE.OK); // dir handle
             entry.fd.close()
-              .then(() => sftp.status(reqid, STATUS_CODE.OK))
-              .catch(() => reject(reqid, STATUS_CODE.FAILURE));
+              .then(async () => {
+                // Hard-linking publishes a complete file atomically and fails
+                // if the requested name already exists; uploads never overwrite.
+                const { link, unlink } = await import('node:fs/promises');
+                await link(entry.path, entry.finalPath!);
+                await unlink(entry.path);
+                sftp.status(reqid, STATUS_CODE.OK);
+              })
+              .catch(async () => {
+                const { unlink } = await import('node:fs/promises');
+                await unlink(entry.path).catch(() => {});
+                reject(reqid, STATUS_CODE.FAILURE);
+              });
           });
 
           // upload-only: everything that mutates or reveals existing files

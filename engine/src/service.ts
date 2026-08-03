@@ -20,6 +20,7 @@ import type { EngineConfig, EngineResult, UUID } from './types.ts';
 import { runEngine } from './engine.ts';
 import { loadSnapshot, type Queryable } from './db/snapshot.ts';
 import { persistResult, type PersistStats } from './db/persist.ts';
+import { releaseTenantConnection } from './db/tenant_pool.ts';
 
 /** pg.Pool satisfies this. */
 export interface PoolLike extends Queryable {
@@ -114,6 +115,6 @@ export async function runDetectionJob(
       throw err;
     }
   } finally {
-    client.release();
+    await releaseTenantConnection(client);
   }
 }

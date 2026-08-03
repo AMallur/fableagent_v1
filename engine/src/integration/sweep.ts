@@ -15,9 +15,11 @@
 
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type { UUID } from '../types.ts';
 import type { PoolLike } from '../service.ts';
 import { detectFileKind, ingestFileByKind } from '../ingest/service.ts';
+import { TenantContextPool } from '../db/tenant_pool.ts';
 
 const INGESTIBLE = /\.(835|837|era|csv)$/i;
 
@@ -67,19 +69,21 @@ export async function sweepClientFolder(
   for (const entry of entries) {
     if (!entry.isFile() || !INGESTIBLE.test(entry.name)) continue;
     const full = path.join(folder, entry.name);
+    const claimed = path.join(folder, `.processing-${randomUUID()}-${entry.name}`);
     try {
-      const content = await readFile(full, 'utf8');
+      await rename(full, claimed); // atomic claim; another worker cannot process it
+      const content = await readFile(claimed, 'utf8');
       if (detectFileKind(entry.name, content) === 'unknown') {
         throw new Error('unrecognized file content — expected 835, 837, or CSV');
       }
       const out = await ingestFileByKind(pool, {
         tenantId: args.tenantId, clientId: args.clientId, content, fileName: entry.name,
       });
-      await rename(full, path.join(folder, 'processed', `${stamp}-${entry.name}`));
+      await rename(claimed, path.join(folder, 'processed', `${stamp}-${randomUUID()}-${entry.name}`));
       outcomes.push({ fileName: entry.name, status: 'ingested', records: out.recordsProcessed });
     } catch (err) {
       const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
-      await rename(full, path.join(folder, 'errors', entry.name)).catch(() => {});
+      await rename(claimed, path.join(folder, 'errors', `${randomUUID()}-${entry.name}`)).catch(() => {});
       await writeFile(
         path.join(folder, 'errors', `${entry.name}.log`),
         `file: ${entry.name}\nfailed at: ${new Date().toISOString()}\n\n${message}\n`,
@@ -97,17 +101,15 @@ export async function sweepClientFolder(
 export async function sweepAllFolders(
   pool: PoolLike, log: (msg: string) => void = () => {},
 ): Promise<SweepResult[]> {
-  const clients = await pool.query(
-    `SELECT c.client_id, c.tenant_id, c.client_name
-     FROM client c JOIN tenant t ON t.tenant_id = c.tenant_id
-     WHERE c.status = 'active' AND c.deleted_at IS NULL
-       AND t.status = 'active' AND t.deleted_at IS NULL`);
+  const scoped = pool instanceof TenantContextPool ? pool : new TenantContextPool(pool);
+  const clients = await scoped.query(
+    `SELECT client_id, tenant_id, client_name FROM app.list_active_clients()`);
   const results: SweepResult[] = [];
   for (const c of clients.rows) {
     try {
-      const result = await sweepClientFolder(pool, {
+      const result = await scoped.runAsTenant(c.tenant_id, () => sweepClientFolder(scoped, {
         tenantId: c.tenant_id, clientId: c.client_id,
-      });
+      }));
       if (result.files.length > 0) {
         log(`ingest sweep ${c.client_name}: `
           + result.files.map((f) => `${f.fileName}=${f.status}`).join(', '));

@@ -84,12 +84,17 @@ export async function assignCase(
   pool: PoolLike, sess: Session, s: Scope, caseId: UUID, userId: UUID | null,
 ) {
   return tx(pool, s.tenantId, async (db) => {
-    await ownCase(db, s, caseId);
-    const name = userId ? (await db.query(
-      `SELECT TRIM(first_name || ' ' || last_name) AS name FROM app_user
-       WHERE user_id = $1 AND tenant_id = $2`, [userId, s.tenantId],
-    )).rows[0]?.name : null;
-    if (userId && !name) throw Object.assign(new Error('user not found'), { status: 400 });
+    const target = userId ? (await db.query(
+      `SELECT TRIM(first_name || ' ' || last_name) AS name, client_id FROM app_user
+       WHERE user_id = $1 AND tenant_id = $2
+         AND status = 'active' AND deleted_at IS NULL`, [userId, s.tenantId],
+    )).rows[0] : null;
+    const name = target?.name ?? null;
+    if (userId && !target) throw Object.assign(new Error('user not found'), { status: 400 });
+    const owned = await ownCase(db, s, caseId);
+    if (target?.client_id && target.client_id !== owned.client_id) {
+      throw Object.assign(new Error('user cannot be assigned outside their client'), { status: 400 });
+    }
     await db.query(
       `UPDATE recovery_case SET assigned_to_user_id = $1 WHERE case_id = $2 AND tenant_id = $3`,
       [userId, caseId, s.tenantId],
@@ -144,7 +149,7 @@ export async function bulkAction(
   }
   return tx(pool, s.tenantId, async (db) => {
     const owned = await db.query(
-      `SELECT case_id FROM recovery_case
+      `SELECT case_id, client_id FROM recovery_case
        WHERE case_id = ANY($1) AND tenant_id = $2 AND client_id = ANY($3) AND deleted_at IS NULL`,
       [caseIds, s.tenantId, s.clientIds],
     );
@@ -152,6 +157,17 @@ export async function bulkAction(
     if (ids.length === 0) return { ok: true, updated: 0 };
 
     if (action.assignTo !== undefined) {
+      if (action.assignTo) {
+        const target = await db.query(
+          `SELECT client_id FROM app_user
+           WHERE user_id = $1 AND tenant_id = $2 AND status = 'active' AND deleted_at IS NULL`,
+          [action.assignTo, s.tenantId]);
+        if (!target.rows[0]) throw Object.assign(new Error('user not found'), { status: 400 });
+        if (target.rows[0].client_id
+            && owned.rows.some((r) => r.client_id !== target.rows[0].client_id)) {
+          throw Object.assign(new Error('user cannot be assigned outside their client'), { status: 400 });
+        }
+      }
       await db.query(
         `UPDATE recovery_case SET assigned_to_user_id = $1 WHERE case_id = ANY($2)`,
         [action.assignTo, ids],

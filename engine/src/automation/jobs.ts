@@ -6,6 +6,7 @@
 
 import { readdir, rename, readFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type { UUID } from '../types.ts';
 import type { PoolLike } from '../service.ts';
 import type { Queryable } from '../db/snapshot.ts';
@@ -103,12 +104,14 @@ export async function runNightlyProcessing(
       const is837 = /\.837$/i.test(entry.name);
       if (!is835 && !is837) continue;
       const full = path.join(folder, entry.name);
-      const content = await readFile(full, 'utf8');
+      const claimed = path.join(folder, `.processing-${randomUUID()}-${entry.name}`);
+      try { await rename(full, claimed); } catch { continue; }
+      const content = await readFile(claimed, 'utf8');
       const run = is835 ? ingest835Job : ingest837Job;
       const out = await run(pool, { tenantId, clientId, content, fileName: entry.name });
       ingestWarnings.push(...out.warnings);
       filesIngested.push(entry.name);
-      await rename(full, path.join(folder, 'processed', `${asOf}-${entry.name}`));
+      await rename(claimed, path.join(folder, 'processed', `${asOf}-${randomUUID()}-${entry.name}`));
     }
 
     // -- steps 3-7: match, price, detect, create/update cases ----------------

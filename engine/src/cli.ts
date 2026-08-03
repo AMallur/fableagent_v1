@@ -51,16 +51,22 @@ if (!values.tenant && !NO_TENANT_REQUIRED.has(command)) {
 const { default: pg } = await import('pg');
 const { pgSslConfig } = await import('./web/db_ssl.ts');
 const { readFileSync } = await import('node:fs');
+const { requireSecret } = await import('./security/secrets.ts');
 const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL ?? 'postgres://localhost:5432/rcm_dev',
+  connectionString: requireSecret('DATABASE_URL', {
+    devFallback: 'postgres://localhost:5432/rcm_dev',
+  }),
   ssl: pgSslConfig(readFileSync),
 });
+const { TenantContextPool } = await import('./db/tenant_pool.ts');
+const tenantPool = new TenantContextPool(pool);
+const runtimePool = values.tenant ? tenantPool.forTenant(values.tenant) : tenantPool;
 
 try {
   switch (command) {
     case 'detect': {
       const { runDetectionJob } = await import('./service.ts');
-      const out = await runDetectionJob(pool, {
+      const out = await runDetectionJob(runtimePool, {
         tenantId: values.tenant,
         clientId: values.client,
         asOf: values['as-of'],
@@ -80,7 +86,7 @@ try {
     case 'appeals': {
       const { generateAppealPackets } = await import('./appeals/service.ts');
       const { resolveDocumentStore } = await import('./appeals/storage.ts');
-      const out = await generateAppealPackets(pool, {
+      const out = await generateAppealPackets(runtimePool, {
         tenantId: values.tenant,
         clientId: values.client,
         asOf: values['as-of'],
@@ -99,7 +105,7 @@ try {
 
     case 'queue': {
       const { loadSubmissionQueue } = await import('./appeals/queue.ts');
-      const items = await loadSubmissionQueue(pool, {
+      const items = await loadSubmissionQueue(runtimePool, {
         tenantId: values.tenant, clientId: values.client,
       });
       console.log(JSON.stringify(items, null, 2));
@@ -116,7 +122,7 @@ try {
       const content = await readFile(values.file, 'utf8');
       const { ingest835Job, ingest837Job } = await import('./ingest/service.ts');
       const run = command === 'ingest-835' ? ingest835Job : ingest837Job;
-      const out = await run(pool, {
+      const out = await run(runtimePool, {
         tenantId: values.tenant,
         clientId: values.client,
         content,
@@ -137,7 +143,7 @@ try {
       const { resolveDocumentStore } = await import('./appeals/storage.ts');
       const transport = await resolveEmailTransport();
       const store = await resolveDocumentStore();
-      const handle = startScheduler(pool, { transport, store });
+      const handle = startScheduler(runtimePool, { transport, store });
       console.error('scheduler running — ctrl-c to stop');
       await new Promise<void>((resolve) => {
         process.on('SIGINT', () => { handle.stop(); resolve(); });
@@ -149,7 +155,7 @@ try {
     case 'sftp-server': {
       // long-running: embedded per-client SFTP drop server until killed
       const { startSftpServer } = await import('./integration/sftp_server.ts');
-      const srv = await startSftpServer(pool);
+      const srv = await startSftpServer(runtimePool);
       console.error(`SFTP server listening on port ${srv.port} — ctrl-c to stop`);
       await new Promise<void>((resolve) => {
         const stop = () => { srv.close().then(() => resolve()); };
@@ -166,7 +172,7 @@ try {
         process.exit(2);
       }
       const { createTenant } = await import('./web/admin_api.ts');
-      const out = await createTenant(pool, {
+      const out = await createTenant(runtimePool, {
         tenantName: values.name,
         tenantType: values.type,
         adminEmail: values['admin-email'],
@@ -187,7 +193,7 @@ try {
       if (!values.client) { console.error('nightly: --client required'); process.exit(2); }
       const { runNightlyProcessing } = await import('./automation/jobs.ts');
       const { resolveDocumentStore } = await import('./appeals/storage.ts');
-      const out = await runNightlyProcessing(pool, {
+      const out = await runNightlyProcessing(runtimePool, {
         tenantId: values.tenant, clientId: values.client, asOf: values['as-of'],
         store: await resolveDocumentStore(),
       });
@@ -197,7 +203,7 @@ try {
 
     case 'monitor': {
       const { runDeadlineMonitor } = await import('./automation/jobs.ts');
-      const out = await runDeadlineMonitor(pool, {
+      const out = await runDeadlineMonitor(runtimePool, {
         tenantId: values.tenant, clientId: values.client, asOf: values['as-of'],
       });
       console.log(JSON.stringify(out, null, 2));
@@ -206,7 +212,7 @@ try {
 
     case 'reconcile': {
       const { runPaymentReconciliation } = await import('./automation/jobs.ts');
-      const out = await runPaymentReconciliation(pool, {
+      const out = await runPaymentReconciliation(runtimePool, {
         tenantId: values.tenant, clientId: values.client,
       });
       console.log(JSON.stringify(out, null, 2));
@@ -216,7 +222,7 @@ try {
     case 'weekly': {
       if (!values.client) { console.error('weekly: --client required'); process.exit(2); }
       const { runWeeklySummary } = await import('./automation/jobs.ts');
-      const out = await runWeeklySummary(pool, {
+      const out = await runWeeklySummary(runtimePool, {
         tenantId: values.tenant, clientId: values.client, asOf: values['as-of'],
       });
       console.log(JSON.stringify(out, null, 2));
