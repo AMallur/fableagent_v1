@@ -74,6 +74,7 @@ console.log('cleaning previous demo tenant…');
 // so it has to be genuine dependency order, not just "worked because
 // triggers were off."
 for (const table of [
+  'api_rate_window', 'api_request_log', 'api_key', 'scheduler_lease',
   'onboarding_step', 'client_integration', 'sso_config', 'data_export_request', 'invoice',
   'rule_execution', 'automation_rule', 'notification_preference', 'notification',
   'email_outbox', 'dashboard_snapshot',
@@ -90,6 +91,7 @@ for (const table of [
   'claim_line', 'claim', 'encounter', 'patient', 'client_payer_config',
   'contract_line', 'contract', 'provider', 'system_job',
 ]) await q(`DELETE FROM ${table} WHERE tenant_id = $1`, [T]);
+await q(`DELETE FROM auth_rate_window`);
 await q(`DELETE FROM payer WHERE tenant_id = $1 OR payer_id_code LIKE 'DEMO%'`, [T]);
 await q(`DELETE FROM medicare_fee_schedule WHERE locality = 'DEMO'`);
 // other clients/users under this tenant (e.g. test-created via the real

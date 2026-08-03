@@ -15,6 +15,7 @@
 
 import type { UUID } from '../types.ts';
 import type { PoolLike } from '../service.ts';
+import { releaseTenantConnection } from '../db/tenant_pool.ts';
 import type { Queryable } from '../db/snapshot.ts';
 import type { AppealCaseContext, DocumentPlan } from './types.ts';
 import { loadAppealContexts, type AppealScope } from './context.ts';
@@ -122,7 +123,7 @@ export async function generateAppealPackets(
       throw err;
     }
   } finally {
-    client.release();
+    await releaseTenantConnection(client);
   }
 }
 

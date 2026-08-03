@@ -3,10 +3,13 @@ import { readFileSync } from 'node:fs';
 import { startServer } from './server.ts';
 import { pgSslConfig } from './db_ssl.ts';
 import { resolveDocumentStore } from '../appeals/storage.ts';
+import { requireSecret } from '../security/secrets.ts';
 
 const { default: pg } = await import('pg');
 const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL ?? 'postgres://localhost:5432/rcm_dev',
+  connectionString: requireSecret('DATABASE_URL', {
+    devFallback: 'postgres://localhost:5432/rcm_dev',
+  }),
   ssl: pgSslConfig(readFileSync),
 });
 

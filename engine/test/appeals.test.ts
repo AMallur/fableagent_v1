@@ -6,6 +6,7 @@ import { generateAppealLetter, letterCategory } from '../src/appeals/letter.ts';
 import { generateCorrection } from '../src/appeals/corrected_claim.ts';
 import { buildDocumentPlan } from '../src/appeals/assembly.ts';
 import { requiredAction } from '../src/appeals/queue.ts';
+import { FileSystemDocumentStore } from '../src/appeals/storage.ts';
 
 // ---------------------------------------------------------------------------
 // fixture
@@ -388,6 +389,25 @@ describe('document assembly', () => {
     assert.equal(plan.needsReview, true);
     assert.match(plan.needsReviewReasons.join(' '), /coder review/);
   });
+
+  it('needs_review: even high-confidence corrected claims require coder approval', () => {
+    const plan = buildDocumentPlan(ctx({
+      denialCategory: 'coding', denialReasonCode: 'CO-4', autopilotEnabled: true,
+      claimLines: [
+        { claimLineId: 'em', procedureCode: '99213', modifiers: [], billedAmount: 100, units: 1 },
+        { claimLineId: 'proc', procedureCode: '20610', modifiers: [], billedAmount: 200, units: 1 },
+      ],
+    }), generateCorrection(ctx({
+      denialCategory: 'coding', denialReasonCode: 'CO-4',
+      claimLines: [
+        { claimLineId: 'em', procedureCode: '99213', modifiers: [], billedAmount: 100, units: 1 },
+        { claimLineId: 'proc', procedureCode: '20610', modifiers: [], billedAmount: 200, units: 1 },
+      ],
+    })));
+    assert.equal(plan.needsReview, true);
+    assert.equal(plan.autoSubmit, false);
+    assert.ok(plan.needsReviewReasons.some((r) => r.includes('certified coder')));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -407,5 +427,13 @@ describe('submission queue actions', () => {
     assert.equal(requiredAction({
       autoSubmit: false, needsReview: false, needsReviewReasons: [], submissionMethod: 'mail',
     }), 'submit manually via mail');
+  });
+});
+
+describe('document storage confinement', () => {
+  it('rejects absolute paths and traversal outside the configured root', async () => {
+    const store = new FileSystemDocumentStore('/tmp/fableagent-storage-test');
+    await assert.rejects(() => store.put('../escape.txt', 'no'), /escapes store root/);
+    await assert.rejects(() => store.getRaw('/etc/passwd'), /invalid document storage path/);
   });
 });

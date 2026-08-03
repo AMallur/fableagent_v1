@@ -13,20 +13,22 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: rcm
-          POSTGRES_PASSWORD: rcm_ci_password
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_ci_admin
           POSTGRES_DB: rcm
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U rcm -d rcm"
+          --health-cmd "pg_isready -U postgres -d rcm"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
 
     env:
-      DATABASE_URL: postgres://rcm:rcm_ci_password@localhost:5432/rcm
-      TEST_DATABASE_URL: postgres://rcm:rcm_ci_password@localhost:5432/rcm
+      DATABASE_URL: postgres://rcm_runtime:rcm_ci_password@localhost:5432/rcm
+      TEST_DATABASE_URL: postgres://postgres:postgres_ci_admin@localhost:5432/rcm
+      RLS_DATABASE_URL: postgres://rcm_runtime:rcm_ci_password@localhost:5432/rcm
+      ADMIN_DATABASE_URL: postgres://postgres:postgres_ci_admin@localhost:5432/rcm
       PGSSLMODE: disable
       # test-only values — never used outside this ephemeral CI database
       SESSION_SECRET: ci-session-secret-not-for-production-use
@@ -48,12 +50,36 @@ jobs:
       - name: Install postgresql-client
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
 
+      - name: Bootstrap non-superuser runtime role
+        run: |
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE rcm_runtime LOGIN PASSWORD 'rcm_ci_password';
+          CREATE ROLE rcm_app NOLOGIN;
+          CREATE ROLE rcm_service NOLOGIN BYPASSRLS;
+          CREATE ROLE rcm_pretenant_lookup NOLOGIN;
+          CREATE ROLE rcm_catalog_lookup NOLOGIN;
+          -- Migration ownership transfers require SET membership, but runtime
+          -- must never inherit the owner roles' RLS exemption.
+          GRANT rcm_pretenant_lookup, rcm_catalog_lookup
+            TO rcm_runtime WITH ADMIN OPTION, INHERIT FALSE;
+          ALTER DATABASE rcm OWNER TO rcm_runtime;
+          ALTER SCHEMA public OWNER TO rcm_runtime;
+          SQL
+
       - name: Run migrations
         run: bash db/migrate.sh
 
+      - name: Revoke migration-only owner-role memberships
+        run: |
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          REVOKE rcm_pretenant_lookup, rcm_catalog_lookup FROM rcm_runtime;
+          SQL
+
       - name: Seed demo data (required by several integration suites)
         working-directory: engine
-        run: npm run seed
+        # Demo reseeding performs dependency-ordered hard deletes and is an
+        # administrator/maintenance operation, never an application-runtime task.
+        run: DATABASE_URL="$ADMIN_DATABASE_URL" npm run seed
 
       - name: Unit tests
         working-directory: engine
@@ -62,6 +88,14 @@ jobs:
       - name: Integration tests
         working-directory: engine
         run: npm run test:integration
+
+      - name: Non-superuser RLS regression tests
+        working-directory: engine
+        run: npm run test:rls
+
+      - name: Production dependency audit
+        working-directory: engine
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Build Docker image (smoke check)
         run: docker build --target runtime -t rcm-engine:ci ./engine

@@ -1,5 +1,8 @@
 # RCM Platform Services
 
+> Before using live PHI or enabling external delivery, complete the
+> [production release gates](docs/PRODUCTION_READINESS.md).
+
 Claims processing, recovery detection, and appeal automation for the RCM
 platform. Runs against the schema in [../db](../db).
 

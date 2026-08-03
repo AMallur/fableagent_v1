@@ -7,6 +7,8 @@ import {
 } from '../src/security/crypto.ts';
 import { mapGroupsToRole } from '../src/security/sso.ts';
 import { hashPassword, verifyPassword } from '../src/web/auth.ts';
+import { TenantContextPool } from '../src/db/tenant_pool.ts';
+import { deliverOutbox, LogTransport } from '../src/automation/notify.ts';
 
 describe('password policy', () => {
   it('requires 12+ chars and 3 of 4 character classes', () => {
@@ -112,5 +114,38 @@ describe('SSO group -> role mapping', () => {
 
   it('ignores mappings to invalid roles', () => {
     assert.equal(mapGroupsToRole([{ group: 'x', role: 'root' }], ['x'], 'viewer'), 'viewer');
+  });
+});
+
+describe('tenant-safe database pooling', () => {
+  it('sets tenant context transaction-locally for every pooled query', async () => {
+    const calls: Array<[string, unknown[] | undefined]> = [];
+    let released = false;
+    const client = {
+      query: async (text: string, params?: unknown[]) => {
+        calls.push([text, params]);
+        return { rows: text === 'SELECT work' ? [{ ok: true }] : [] };
+      },
+      release: () => { released = true; },
+    };
+    const raw = { query: client.query, connect: async () => client };
+    const pool = new TenantContextPool(raw as any);
+    const result = await pool.runAsTenant('tenant-a', () => pool.query('SELECT work'));
+    assert.deepEqual(result.rows, [{ ok: true }]);
+    assert.deepEqual(calls.map(([sql]) => sql), [
+      'BEGIN', `SELECT set_config('app.current_tenant_id', $1, true)`, 'SELECT work', 'COMMIT',
+    ]);
+    assert.deepEqual(calls[1][1], ['tenant-a']);
+    assert.equal(released, true);
+  });
+
+  it('does not claim console logging delivered an email', async () => {
+    let queried = false;
+    const db = {
+      query: async () => { queried = true; return { rows: [] }; },
+      connect: async () => { queried = true; throw new Error('should not claim rows'); },
+    };
+    assert.deepEqual(await deliverOutbox(db as any, new LogTransport()), { sent: 0, failed: 0 });
+    assert.equal(queried, false);
   });
 });

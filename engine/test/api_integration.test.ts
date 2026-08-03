@@ -310,7 +310,8 @@ describe('integration & ingestion layer', { skip: !url && 'TEST_DATABASE_URL not
     const processed = await readdir(path.join(folder, 'processed'));
     assert.ok(processed.some((f) => f.endsWith('good.835')));
     const errors = await readdir(path.join(folder, 'errors'));
-    assert.ok(errors.includes('bad.csv'));
+    assert.ok(errors.some((f) => f.endsWith('-bad.csv')),
+      'quarantined payload keeps its name with a collision-safe prefix');
     assert.ok(errors.includes('bad.csv.log'));
     const log = await readFile(path.join(folder, 'errors', 'bad.csv.log'), 'utf8');
     assert.match(log, /bad\.csv/);
@@ -331,10 +332,14 @@ describe('integration & ingestion layer', { skip: !url && 'TEST_DATABASE_URL not
       `SELECT ap.packet_id, ap.case_id FROM appeal_packet ap
        WHERE ap.packet_status = 'ready' AND ap.submission_method = 'portal' LIMIT 1`);
     assert.ok(ready.rows[0], 'a ready portal packet exists');
-    const sub = await admin.post(`/api/packets/${ready.rows[0].packet_id}/submit`, { manual: false });
-    assert.ok(sub.delivery, 'connector dispatch recorded');
-    assert.equal(sub.delivery.connector, 'payer_portal');
-    assert.equal(sub.delivery.status, 'not_configured');
+    const sub = await admin.post(
+      `/api/packets/${ready.rows[0].packet_id}/submit`, { manual: false }, 409);
+    assert.match(sub.error, /not configured/);
+    const appealDelivery = await pool.query(
+      `SELECT connector, status FROM outbound_delivery
+       WHERE packet_id = $1 ORDER BY created_at DESC LIMIT 1`, [ready.rows[0].packet_id]);
+    assert.equal(appealDelivery.rows[0].connector, 'payer_portal');
+    assert.equal(appealDelivery.rows[0].status, 'not_configured');
 
     // PM write-back on case status change
     const someCase = await pool.query(

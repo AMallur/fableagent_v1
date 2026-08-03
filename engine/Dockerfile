@@ -6,12 +6,12 @@
 # "install prod deps, copy source, run node."
 # ============================================================================
 
-FROM node:22-alpine AS deps
+FROM node:22.18.0-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-FROM node:22-alpine AS runtime
+FROM node:22.18.0-alpine AS runtime
 RUN apk add --no-cache tini \
   && addgroup -S rcm && adduser -S rcm -G rcm
 WORKDIR /app

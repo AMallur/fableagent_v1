@@ -209,7 +209,12 @@ describe('operational web interface', { skip: !url && 'TEST_DATABASE_URL not set
       `SELECT ap.packet_id, ap.case_id FROM appeal_packet ap
        WHERE ap.packet_status = 'ready' AND ap.submission_method = 'portal' LIMIT 1`);
     assert.ok(ready.rows[0], 'a ready portal packet exists');
-    const r = await post(`/api/packets/${ready.rows[0].packet_id}/submit`, { manual: false });
+    const blocked = await post(
+      `/api/packets/${ready.rows[0].packet_id}/submit`, { manual: false }, 409);
+    assert.match(blocked.error, /not configured/);
+    // A human-confirmed external submission can then be recorded explicitly.
+    const r = await post(`/api/packets/${ready.rows[0].packet_id}/submit`,
+      { manual: true, method: 'portal' });
     assert.equal(r.ok, true);
     // double submit is rejected
     await post(`/api/packets/${ready.rows[0].packet_id}/submit`, { manual: false }, 409);

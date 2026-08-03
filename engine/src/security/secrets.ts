@@ -26,21 +26,21 @@ export interface RequireSecretOptions {
   devFallback: string;
 }
 
-export function requireSecret(name: string, opts: RequireSecretOptions): string {
+export function optionalSecret(name: string): string | undefined {
   const filePath = process.env[`${name}_FILE`];
   if (filePath) {
     try {
       const value = readFileSync(filePath, 'utf8').trim();
-      if (value) return value;
+      return value || undefined;
     } catch (err) {
-      throw new Error(
-        `${name}_FILE was set to "${filePath}" but could not be read: `
-        + `${err instanceof Error ? err.message : err}`,
-      );
+      throw new Error(`${name}_FILE could not be read: ${err instanceof Error ? err.message : err}`);
     }
   }
+  return process.env[name] || undefined;
+}
 
-  const fromEnv = process.env[name];
+export function requireSecret(name: string, opts: RequireSecretOptions): string {
+  const fromEnv = optionalSecret(name);
   if (fromEnv) return fromEnv;
 
   if (isProduction()) {

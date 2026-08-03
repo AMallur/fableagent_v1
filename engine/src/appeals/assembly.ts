@@ -216,6 +216,11 @@ export function buildDocumentPlan(
   if (correction?.needsManualReview) {
     reasons.push(`correction confidence ${correction.confidenceScore} below 85 — coder review required`);
   }
+  if (correction && !correction.needsManualReview) {
+    // A rules-engine confidence score is not clinical documentation. Modifier
+    // and corrected-claim changes always require a certified coding review.
+    reasons.push('corrected claim requires certified coder review');
+  }
   const needsReview = reasons.length > 0;
 
   // auto_submit per spec (never auto-submit something flagged for review)

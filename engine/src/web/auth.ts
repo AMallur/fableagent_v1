@@ -7,6 +7,7 @@ import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypt
 import type { UUID } from '../types.ts';
 import type { Queryable } from '../db/snapshot.ts';
 import type { PoolLike } from '../service.ts';
+import { releaseTenantConnection } from '../db/tenant_pool.ts';
 
 export const COOKIE_NAME = 'rcm_session';
 const LOCKOUT_ATTEMPTS = 5;
@@ -218,7 +219,7 @@ export async function authenticate(
       },
     };
   } finally {
-    db.release();
+    await releaseTenantConnection(db);
   }
 }
 
@@ -273,8 +274,28 @@ export async function changePassword(
     await securityEvent(db, u.tenant_id, u.user_id, 'password_changed', { email }, null);
     return { ok: true };
   } finally {
-    db.release();
+    await releaseTenantConnection(db);
   }
+}
+
+/** Revalidate signed-cookie claims so deactivation and role changes take effect immediately. */
+export async function refreshSession(db: Queryable, signed: Session): Promise<Session | null> {
+  const rows = await db.query(
+    `SELECT u.user_id, u.tenant_id, u.client_id, u.role, u.first_name, u.last_name, u.email,
+            t.session_timeout_minutes
+     FROM app_user u JOIN tenant t ON t.tenant_id = u.tenant_id
+     WHERE u.user_id = $1 AND u.tenant_id = $2
+       AND u.status = 'active' AND u.deleted_at IS NULL`,
+    [signed.userId, signed.tenantId],
+  );
+  const u = rows.rows[0];
+  if (!u) return null;
+  const tm = u.session_timeout_minutes ?? signed.tm ?? 30;
+  return {
+    userId: u.user_id, tenantId: u.tenant_id, clientId: u.client_id, role: u.role,
+    name: [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
+    exp: signed.exp, tm,
+  };
 }
 
 /** clients this session may see (client-scoped user -> theirs; else all of tenant) */

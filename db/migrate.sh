@@ -3,8 +3,14 @@
 # Idempotency is tracked in schema_migrations; already-applied files are skipped.
 set -euo pipefail
 
-DB_URL="${DATABASE_URL:-postgres://localhost:5432/rcm_dev}"
+if [ -n "${DATABASE_URL_FILE:-}" ]; then
+  DB_URL="$(< "$DATABASE_URL_FILE")"
+else
+  DB_URL="${DATABASE_URL:-postgres://localhost:5432/rcm_dev}"
+fi
 DIR="$(cd "$(dirname "$0")/migrations" && pwd)"
+migration_sql=""
+trap 'if [ -n "${migration_sql:-}" ]; then rm -f "$migration_sql"; fi' EXIT
 
 # the DB behind DB_URL may not be ready to accept connections yet — a local
 # `db` container declares service_healthy before migrate starts, but a
@@ -36,9 +42,16 @@ for f in "$DIR"/*.sql; do
     continue
   fi
   echo "apply $name"
-  psql "$DB_URL" -v ON_ERROR_STOP=1 -q -f "$f"
-  psql "$DB_URL" -v ON_ERROR_STOP=1 -q -c \
-    "INSERT INTO schema_migrations (filename) VALUES ('$name')"
+  # The migration and its bookkeeping row commit atomically. Existing files
+  # carry standalone BEGIN/COMMIT for manual use; strip only those boundary
+  # lines in a temporary copy so psql -1 owns the transaction here.
+  migration_sql="$(mktemp)"
+  sed '/^BEGIN;$/d; /^COMMIT;$/d' "$f" > "$migration_sql"
+  psql "$DB_URL" -v ON_ERROR_STOP=1 -q -1 \
+    -f "$migration_sql" \
+    -c "INSERT INTO schema_migrations (filename) VALUES ('$name')"
+  rm -f "$migration_sql"
+  migration_sql=""
 done
 
 echo "done"
