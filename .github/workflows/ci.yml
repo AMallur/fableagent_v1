@@ -77,7 +77,9 @@ jobs:
 
       - name: Seed demo data (required by several integration suites)
         working-directory: engine
-        run: npm run seed
+        # Demo reseeding performs dependency-ordered hard deletes and is an
+        # administrator/maintenance operation, never an application-runtime task.
+        run: DATABASE_URL="$ADMIN_DATABASE_URL" npm run seed
 
       - name: Unit tests
         working-directory: engine
