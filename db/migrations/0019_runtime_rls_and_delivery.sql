@@ -65,6 +65,12 @@ REVOKE ALL ON FUNCTION app.resolve_tenant_by_sftp_username(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app.resolve_tenant_by_sftp_username(text)
   TO CURRENT_USER, rcm_app, rcm_service;
 
+-- Membership is needed only while migrations transfer ownership. Leaving the
+-- runtime role as a member would let it inherit the owner roles' RLS exemption
+-- and read tenant tables without app.current_tenant_id. Runtime access after
+-- this point is through ordinary RLS or the narrow SECURITY DEFINER functions.
+REVOKE rcm_pretenant_lookup, rcm_catalog_lookup FROM CURRENT_USER;
+
 -- Durable outbox leasing and bounded retries.
 ALTER TABLE email_outbox DROP CONSTRAINT IF EXISTS email_outbox_status_check;
 ALTER TABLE email_outbox
