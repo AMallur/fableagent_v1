@@ -49,8 +49,10 @@ GRANT EXECUTE ON FUNCTION app.list_active_clients() TO CURRENT_USER, rcm_app, rc
 
 -- SFTP authentication also starts before the tenant is known. Resolve only
 -- the tenant id, then perform the credential lookup under normal RLS.
+GRANT CREATE ON SCHEMA public TO rcm_pretenant_lookup;
 ALTER TABLE client_integration OWNER TO rcm_pretenant_lookup;
 ALTER TABLE client_integration NO FORCE ROW LEVEL SECURITY;
+REVOKE CREATE ON SCHEMA public FROM rcm_pretenant_lookup;
 GRANT SELECT, INSERT, UPDATE ON client_integration TO CURRENT_USER;
 CREATE OR REPLACE FUNCTION app.resolve_tenant_by_sftp_username(p_username text)
 RETURNS uuid
