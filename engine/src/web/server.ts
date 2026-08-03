@@ -10,7 +10,7 @@
 // ============================================================================
 
 import http from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import type { PoolLike } from '../service.ts';
 import { runDetectionJob } from '../service.ts';
@@ -261,12 +261,24 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
   });
   route('POST', /^\/api\/login$/, async (ctx) => {
     const body = await readJson(ctx.req);
-    const source = clientIp(ctx) ?? 'unknown';
-    const allowed = await pool.query(`SELECT app.check_auth_rate($1, 20) AS allowed`, [source]);
-    if (!allowed.rows[0]?.allowed) return json(ctx, 429, { error: 'too many login attempts' });
+    const requestIp = clientIp(ctx);
+    const sourceIp = requestIp ?? 'unknown';
+    const email = String(body.email ?? '').trim().toLowerCase();
+    // Protect an individual account aggressively without making every user
+    // behind the same office/NAT share a tiny bucket. The broader IP bucket
+    // still bounds username rotation and account-enumeration attempts.
+    const accountKey = createHash('sha256').update(email).digest('hex');
+    const allowed = await pool.query(
+      `SELECT app.check_auth_rate($1, 20) AS account_allowed,
+              app.check_auth_rate($2, 100) AS ip_allowed`,
+      [`login:account:${sourceIp}:${accountKey}`, `login:ip:${sourceIp}`],
+    );
+    if (!allowed.rows[0]?.account_allowed || !allowed.rows[0]?.ip_allowed) {
+      return json(ctx, 429, { error: 'too many login attempts' });
+    }
     const outcome = await authenticate(
-      pool, String(body.email ?? ''), String(body.password ?? ''),
-      { totp: body.totp ? String(body.totp) : undefined, ip: clientIp(ctx) },
+      pool, email, String(body.password ?? ''),
+      { totp: body.totp ? String(body.totp) : undefined, ip: requestIp },
     );
     switch (outcome.kind) {
       case 'ok':
