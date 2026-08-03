@@ -53,16 +53,14 @@ END $$;
 -- the table ownership transfer below, then revoke it immediately.
 GRANT USAGE, CREATE ON SCHEMA public, app TO rcm_pretenant_lookup;
 
-ALTER TABLE app_user OWNER TO rcm_pretenant_lookup;
 ALTER TABLE app_user NO FORCE ROW LEVEL SECURITY;
-ALTER TABLE api_key OWNER TO rcm_pretenant_lookup;
 ALTER TABLE api_key NO FORCE ROW LEVEL SECURITY;
-REVOKE CREATE ON SCHEMA public FROM rcm_pretenant_lookup;
-
--- the app's connecting role lost its implicit table-owner privileges on
--- these two tables with the ownership transfer above — restore what it
--- actually uses day to day (never DELETE; matches the rest of the schema)
+-- Preserve the connecting role's day-to-day privileges before transferring
+-- ownership (never DELETE; matches the rest of the schema).
 GRANT SELECT, INSERT, UPDATE ON app_user, api_key TO CURRENT_USER;
+ALTER TABLE app_user OWNER TO rcm_pretenant_lookup;
+ALTER TABLE api_key OWNER TO rcm_pretenant_lookup;
+REVOKE CREATE ON SCHEMA public FROM rcm_pretenant_lookup;
 
 CREATE OR REPLACE FUNCTION app.resolve_tenant_by_email(p_email citext) RETURNS uuid
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, app AS $$
@@ -70,6 +68,8 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, app AS $$
   WHERE email = p_email AND status = 'active' AND deleted_at IS NULL
   ORDER BY created_at LIMIT 1
 $$;
+REVOKE ALL ON FUNCTION app.resolve_tenant_by_email(citext) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app.resolve_tenant_by_email(citext) TO CURRENT_USER;
 ALTER FUNCTION app.resolve_tenant_by_email(citext) OWNER TO rcm_pretenant_lookup;
 
 CREATE OR REPLACE FUNCTION app.resolve_tenant_by_invite_token(p_token text) RETURNS uuid
@@ -78,16 +78,16 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, app AS $$
   WHERE invite_token = p_token AND invite_expires_at > now()
     AND status = 'pending' AND deleted_at IS NULL
 $$;
+REVOKE ALL ON FUNCTION app.resolve_tenant_by_invite_token(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app.resolve_tenant_by_invite_token(text) TO CURRENT_USER;
 ALTER FUNCTION app.resolve_tenant_by_invite_token(text) OWNER TO rcm_pretenant_lookup;
 
 CREATE OR REPLACE FUNCTION app.resolve_tenant_by_api_key_hash(p_hash text) RETURNS uuid
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, app AS $$
   SELECT tenant_id FROM api_key WHERE key_hash = p_hash AND revoked_at IS NULL
 $$;
+REVOKE ALL ON FUNCTION app.resolve_tenant_by_api_key_hash(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app.resolve_tenant_by_api_key_hash(text) TO CURRENT_USER;
 ALTER FUNCTION app.resolve_tenant_by_api_key_hash(text) OWNER TO rcm_pretenant_lookup;
-
-GRANT EXECUTE ON FUNCTION app.resolve_tenant_by_email TO CURRENT_USER;
-GRANT EXECUTE ON FUNCTION app.resolve_tenant_by_invite_token TO CURRENT_USER;
-GRANT EXECUTE ON FUNCTION app.resolve_tenant_by_api_key_hash TO CURRENT_USER;
 
 COMMIT;
