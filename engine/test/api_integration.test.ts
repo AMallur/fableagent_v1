@@ -310,7 +310,8 @@ describe('integration & ingestion layer', { skip: !url && 'TEST_DATABASE_URL not
     const processed = await readdir(path.join(folder, 'processed'));
     assert.ok(processed.some((f) => f.endsWith('good.835')));
     const errors = await readdir(path.join(folder, 'errors'));
-    assert.ok(errors.includes('bad.csv'));
+    assert.ok(errors.some((f) => f.endsWith('-bad.csv')),
+      'quarantined payload keeps its name with a collision-safe prefix');
     assert.ok(errors.includes('bad.csv.log'));
     const log = await readFile(path.join(folder, 'errors', 'bad.csv.log'), 'utf8');
     assert.match(log, /bad\.csv/);
