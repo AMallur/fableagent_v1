@@ -57,7 +57,7 @@ ALTER TABLE app_user NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE api_key NO FORCE ROW LEVEL SECURITY;
 -- Preserve the connecting role's day-to-day privileges before transferring
 -- ownership (never DELETE; matches the rest of the schema).
-GRANT SELECT, INSERT, UPDATE ON app_user, api_key TO CURRENT_USER;
+GRANT SELECT, INSERT, UPDATE, REFERENCES ON app_user, api_key TO CURRENT_USER;
 ALTER TABLE app_user OWNER TO rcm_pretenant_lookup;
 ALTER TABLE api_key OWNER TO rcm_pretenant_lookup;
 REVOKE CREATE ON SCHEMA public FROM rcm_pretenant_lookup;
