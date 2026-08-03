@@ -26,9 +26,11 @@ GRANT USAGE, CREATE ON SCHEMA public, app TO rcm_catalog_lookup;
 
 ALTER TABLE tenant NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE client NO FORCE ROW LEVEL SECURITY;
-GRANT SELECT, INSERT, UPDATE, REFERENCES ON tenant, client TO CURRENT_USER;
 ALTER TABLE tenant OWNER TO rcm_catalog_lookup;
 ALTER TABLE client OWNER TO rcm_catalog_lookup;
+SET LOCAL ROLE rcm_catalog_lookup;
+GRANT SELECT, INSERT, UPDATE, REFERENCES ON tenant, client TO SESSION_USER;
+RESET ROLE;
 REVOKE CREATE ON SCHEMA public FROM rcm_catalog_lookup;
 
 CREATE OR REPLACE FUNCTION app.list_active_clients()
@@ -43,16 +45,20 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, app AS $$
   WHERE c.status = 'active' AND c.deleted_at IS NULL
     AND t.status = 'active' AND t.deleted_at IS NULL
 $$;
-REVOKE ALL ON FUNCTION app.list_active_clients() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION app.list_active_clients() TO CURRENT_USER, rcm_app, rcm_service;
 ALTER FUNCTION app.list_active_clients() OWNER TO rcm_catalog_lookup;
+SET LOCAL ROLE rcm_catalog_lookup;
+REVOKE ALL ON FUNCTION app.list_active_clients() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app.list_active_clients() TO SESSION_USER, rcm_app, rcm_service;
+RESET ROLE;
 
 -- SFTP authentication also starts before the tenant is known. Resolve only
 -- the tenant id, then perform the credential lookup under normal RLS.
 GRANT CREATE ON SCHEMA public TO rcm_pretenant_lookup;
 ALTER TABLE client_integration NO FORCE ROW LEVEL SECURITY;
-GRANT SELECT, INSERT, UPDATE ON client_integration TO CURRENT_USER;
 ALTER TABLE client_integration OWNER TO rcm_pretenant_lookup;
+SET LOCAL ROLE rcm_pretenant_lookup;
+GRANT SELECT, INSERT, UPDATE ON client_integration TO SESSION_USER;
+RESET ROLE;
 REVOKE CREATE ON SCHEMA public FROM rcm_pretenant_lookup;
 CREATE OR REPLACE FUNCTION app.resolve_tenant_by_sftp_username(p_username text)
 RETURNS uuid
@@ -60,10 +66,12 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, app AS $$
   SELECT tenant_id FROM client_integration
   WHERE sftp_inbound_username = p_username AND sftp_inbound_enabled = true
 $$;
+ALTER FUNCTION app.resolve_tenant_by_sftp_username(text) OWNER TO rcm_pretenant_lookup;
+SET LOCAL ROLE rcm_pretenant_lookup;
 REVOKE ALL ON FUNCTION app.resolve_tenant_by_sftp_username(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app.resolve_tenant_by_sftp_username(text)
-  TO CURRENT_USER, rcm_app, rcm_service;
-ALTER FUNCTION app.resolve_tenant_by_sftp_username(text) OWNER TO rcm_pretenant_lookup;
+  TO SESSION_USER, rcm_app, rcm_service;
+RESET ROLE;
 
 -- Membership is needed only while migrations transfer ownership. Leaving the
 -- runtime role as a member would let it inherit the owner roles' RLS exemption
