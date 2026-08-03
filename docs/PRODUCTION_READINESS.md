@@ -35,6 +35,10 @@ customer and trading partner:
    target infrastructure.
 8. Complete the organizational HIPAA risk analysis, policies, workforce
    training, incident response plan and access-review process.
+9. If lookup-owner roles are provisioned by a separate database administrator,
+   grant their migration membership with `INHERIT FALSE` and revoke it after
+   migrations. The runtime login must not remain a member of
+   `rcm_pretenant_lookup` or `rcm_catalog_lookup`.
 
 ## Supported initial production scope
 

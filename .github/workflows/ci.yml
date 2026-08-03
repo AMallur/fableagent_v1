@@ -58,14 +58,22 @@ jobs:
           CREATE ROLE rcm_service NOLOGIN BYPASSRLS;
           CREATE ROLE rcm_pretenant_lookup NOLOGIN;
           CREATE ROLE rcm_catalog_lookup NOLOGIN;
+          -- Migration ownership transfers require SET membership, but runtime
+          -- must never inherit the owner roles' RLS exemption.
           GRANT rcm_pretenant_lookup, rcm_catalog_lookup
-            TO rcm_runtime WITH ADMIN OPTION;
+            TO rcm_runtime WITH ADMIN OPTION, INHERIT FALSE;
           ALTER DATABASE rcm OWNER TO rcm_runtime;
           ALTER SCHEMA public OWNER TO rcm_runtime;
           SQL
 
       - name: Run migrations
         run: bash db/migrate.sh
+
+      - name: Revoke migration-only owner-role memberships
+        run: |
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          REVOKE rcm_pretenant_lookup, rcm_catalog_lookup FROM rcm_runtime;
+          SQL
 
       - name: Seed demo data (required by several integration suites)
         working-directory: engine
