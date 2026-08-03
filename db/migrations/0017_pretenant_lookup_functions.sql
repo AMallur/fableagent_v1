@@ -36,9 +36,18 @@ BEGIN
     CREATE ROLE rcm_pretenant_lookup NOLOGIN;
   END IF;
 END $$;
--- explicit, not relying on whichever implicit membership-on-create behavior
--- this Postgres version/fork happens to have
-GRANT rcm_pretenant_lookup TO CURRENT_USER WITH ADMIN OPTION;
+-- PostgreSQL 16 grants the creator ADMIN membership automatically. CI and
+-- managed databases may also pre-provision the membership, and re-granting it
+-- from the member back to itself fails with "ADMIN option cannot be granted
+-- back to your own grantor". Grant only when membership is actually absent.
+DO $$
+BEGIN
+  IF NOT pg_has_role(CURRENT_USER, 'rcm_pretenant_lookup', 'MEMBER') THEN
+    EXECUTE format(
+      'GRANT rcm_pretenant_lookup TO %I WITH ADMIN OPTION', CURRENT_USER
+    );
+  END IF;
+END $$;
 -- required to own anything inside schema app, including the functions below
 -- (ALTER FUNCTION ... OWNER TO requires the NEW owner to have CREATE on the
 -- schema, not just the role executing the statement)

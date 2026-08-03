@@ -10,7 +10,16 @@ BEGIN
     CREATE ROLE rcm_catalog_lookup NOLOGIN;
   END IF;
 END $$;
-GRANT rcm_catalog_lookup TO CURRENT_USER WITH ADMIN OPTION;
+-- Idempotent across PostgreSQL versions and pre-provisioned managed roles;
+-- PostgreSQL 16 may already grant the role creator ADMIN membership.
+DO $$
+BEGIN
+  IF NOT pg_has_role(CURRENT_USER, 'rcm_catalog_lookup', 'MEMBER') THEN
+    EXECUTE format(
+      'GRANT rcm_catalog_lookup TO %I WITH ADMIN OPTION', CURRENT_USER
+    );
+  END IF;
+END $$;
 GRANT USAGE, CREATE ON SCHEMA app TO rcm_catalog_lookup;
 
 ALTER TABLE tenant OWNER TO rcm_catalog_lookup;
