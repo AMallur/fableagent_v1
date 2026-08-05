@@ -38,7 +38,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
             rl.payer_claim_number, rl.patient_member_id, rl.date_of_service,
             rl.procedure_code, rl.billed_amount, rl.allowed_amount, rl.paid_amount,
             rl.patient_responsibility, rl.adjustment_group_code,
-            rl.adjustment_reason_code, rl.remark_code, rl.claim_id, rl.claim_line_id
+            rl.adjustment_reason_code, rl.adjustments, rl.remark_code,
+            rl.claim_id, rl.claim_line_id
      FROM remittance_line rl
      JOIN remittance r ON r.remittance_id = rl.remittance_id
      WHERE rl.tenant_id = $1 ${scope.clientId ? 'AND r.client_id = $2' : ''}
@@ -74,6 +75,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
     `SELECT claim_line_id, claim_id, line_number, procedure_code,
             modifier_1, modifier_2, modifier_3, modifier_4, units,
             billed_amount, expected_amount, allowed_amount, paid_amount,
+            patient_responsibility,
             denial_reason_code, line_status
      FROM claim_line
      WHERE claim_id = ANY($1) AND deleted_at IS NULL
@@ -108,6 +110,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
       expectedAmount: num(l.expected_amount),
       allowedAmount: num(l.allowed_amount),
       paidAmount: num(l.paid_amount),
+      patientResponsibility: num(l.patient_responsibility),
       denialReasonCode: l.denial_reason_code,
       lineStatus: l.line_status,
     })),
@@ -243,6 +246,14 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
       allowedAmount: num(r.allowed_amount),
       paidAmount: num(r.paid_amount),
       patientResponsibility: num(r.patient_responsibility),
+      adjustments: Array.isArray(r.adjustments)
+        ? r.adjustments.map((a: any) => ({
+          groupCode: String(a.groupCode ?? ''),
+          reasonCode: String(a.reasonCode ?? ''),
+          amount: Number(a.amount ?? 0),
+          quantity: num(a.quantity),
+        })).filter((a: any) => a.groupCode && a.reasonCode)
+        : [],
       adjustmentGroupCode: r.adjustment_group_code,
       adjustmentReasonCode: r.adjustment_reason_code,
       remarkCode: r.remark_code,

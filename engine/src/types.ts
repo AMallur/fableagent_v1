@@ -60,6 +60,7 @@ export interface ClaimLineInput {
   expectedAmount?: number | null;      // may already be priced
   paidAmount?: number | null;
   allowedAmount?: number | null;
+  patientResponsibility?: number | null;
   denialReasonCode?: string | null;
   lineStatus?: string | null;
 }
@@ -92,11 +93,21 @@ export interface RemitLineInput {
   allowedAmount?: number | null;
   paidAmount?: number | null;
   patientResponsibility?: number | null;
+  /** All CAS adjustments on the service line. Legacy scalar fields below
+   * remain populated with the first adjustment for compatibility. */
+  adjustments?: RemitAdjustmentInput[];
   adjustmentGroupCode?: string | null; // CO / PR / OA / PI
   adjustmentReasonCode?: string | null;// CARC, e.g. '45'
   remarkCode?: string | null;          // RARC
   claimId?: UUID | null;               // pre-linked (already matched earlier)
   claimLineId?: UUID | null;
+}
+
+export interface RemitAdjustmentInput {
+  groupCode: string;
+  reasonCode: string;
+  amount: number;
+  quantity?: number | null;
 }
 
 export interface ContractLineInput {
@@ -202,6 +213,7 @@ export interface ClaimLineUpdate {
   claimId: UUID;
   paidAmount?: number | null;
   allowedAmount?: number | null;
+  patientResponsibility?: number | null;
   expectedAmount?: number | null;
   expectedSource?: ExpectedSource;
   denialReasonCode?: string | null;

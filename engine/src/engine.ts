@@ -23,12 +23,13 @@ import { DENIAL_TAXONOMY } from './taxonomy.ts';
 export function runEngine(input: EngineInput): EngineResult {
   // STEP 1 — claim-remit matching
   const matching = runMatching(input);
+  const aggregatedMatchedLines = aggregateMatchedLines(matching.matchedLines);
 
   // STEP 2 — expected reimbursement per matched claim line
-  const pricing = runExpectedCalculation(input, matching.matchedLines);
+  const pricing = runExpectedCalculation(input, aggregatedMatchedLines);
 
   // STEP 3 — variance detection / denial routing
-  const variance = runVarianceDetection(input, matching.matchedLines, pricing);
+  const variance = runVarianceDetection(input, aggregatedMatchedLines, pricing);
 
   // STEP 4 — denial classification -> case candidates (both paths)
   const candidates = [
@@ -43,14 +44,16 @@ export function runEngine(input: EngineInput): EngineResult {
   const rules = applyCaseRules(input, scored);
 
   // claim line updates: propagate remit amounts, pricing, and denial detail
-  const claimLineUpdates = buildClaimLineUpdates(input, matching, pricing, variance);
+  const claimLineUpdates = buildClaimLineUpdates(
+    input, { ...matching, matchedLines: aggregatedMatchedLines }, pricing, variance,
+  );
 
   // 'paid' refined to 'underpaid' where a case-worthy variance exists
   const claimStatusUpdates = refineStatuses(matching.claimStatusUpdates, variance, rules);
 
   // STEP 7 — aggregate and summarize
   const pricedLinesByPayer = new Map<string, number>();
-  for (const ml of matching.matchedLines) {
+  for (const ml of aggregatedMatchedLines) {
     const p = pricing.get(ml.claimLine.claimLineId);
     if (p && p.expectedSource === 'contract') {
       const payerId = ml.claim.payerId;
@@ -78,6 +81,65 @@ export function runEngine(input: EngineInput): EngineResult {
     skipped: rules.skipped,
     summary,
   };
+}
+
+/**
+ * A claim line may receive several new ERA entries (split payments or a later
+ * supplemental payment). Price it once and compare against cumulative cash,
+ * rather than evaluating only the first remittance line or overwriting a
+ * previously posted payment.
+ */
+function aggregateMatchedLines(
+  matchedLines: ReturnType<typeof runMatching>['matchedLines'],
+): ReturnType<typeof runMatching>['matchedLines'] {
+  const groups = new Map<string, typeof matchedLines>();
+  for (const matched of matchedLines) {
+    const id = matched.claimLine.claimLineId;
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id)!.push(matched);
+  }
+
+  return [...groups.values()].map((group) => {
+    const latest = [...group].sort((a, b) =>
+      (a.remitLine.checkDate ?? '').localeCompare(b.remitLine.checkDate ?? ''))
+      .at(-1)!;
+    const priorPaid = latest.claimLine.paidAmount ?? 0;
+    const newPaid = group.reduce((sum, m) => sum + (m.remitLine.paidAmount ?? 0), 0);
+    // Payment is cumulative, but adjustment and patient-liability context
+    // comes from the latest adjudication so an older denial does not remain
+    // active after a supplemental payment resolves it.
+    const latestEntries = group.filter(
+      (m) => m.remitLine.remittanceId === latest.remitLine.remittanceId,
+    );
+    const adjustments = latestEntries.flatMap((m) => m.remitLine.adjustments?.length
+      ? m.remitLine.adjustments
+      : m.remitLine.adjustmentReasonCode
+        ? [{
+          groupCode: m.remitLine.adjustmentGroupCode ?? '',
+          reasonCode: m.remitLine.adjustmentReasonCode,
+          amount: 0,
+        }]
+        : []);
+    const latestPatientAmounts = latestEntries
+      .map((m) => m.remitLine.patientResponsibility)
+      .filter((v): v is number => v != null);
+    const patientResponsibility = latestPatientAmounts.length
+      ? roundMoney(latestPatientAmounts.reduce((sum, value) => sum + value, 0))
+      : latest.claimLine.patientResponsibility ?? null;
+    return {
+      ...latest,
+      remitLine: {
+        ...latest.remitLine,
+        paidAmount: roundMoney(priorPaid + newPaid),
+        patientResponsibility,
+        adjustments,
+      },
+    };
+  });
+}
+
+function roundMoney(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
 function buildClaimLineUpdates(
@@ -112,6 +174,8 @@ function buildClaimLineUpdates(
       claimId: ml.claim.claimId,
       paidAmount: ml.remitLine.paidAmount ?? ml.claimLine.paidAmount ?? null,
       allowedAmount: ml.remitLine.allowedAmount ?? ml.claimLine.allowedAmount ?? null,
+      patientResponsibility: ml.remitLine.patientResponsibility
+        ?? ml.claimLine.patientResponsibility ?? null,
       expectedAmount: priced?.expectedAmount ?? ml.claimLine.expectedAmount ?? null,
       expectedSource: priced?.expectedSource,
       denialReasonCode: routedCode ?? null,

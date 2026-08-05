@@ -163,21 +163,40 @@ async function load835Transaction(
     // service lines when present; otherwise one header-level line
     const lines = claim.lines.length > 0 ? claim.lines : [null];
     for (const line of lines) {
-      const adj = line?.adjustments[0] ?? claim.adjustments[0] ?? null;
+      const adjustments = line?.adjustments.length ? line.adjustments : claim.adjustments;
+      const adj = adjustments[0] ?? null;
+      // CLP05 is claim-level. On service lines use the line's PR CAS total so
+      // a multi-line claim does not subtract the full patient amount per line.
+      const prAdjustments = adjustments.filter((a) => a.groupCode === 'PR');
+      const patientResponsibility = !line
+        ? claim.patientResponsibility
+        : prAdjustments.length
+          ? prAdjustments.reduce((sum, a) => sum + a.amount, 0)
+          : lines.length === 1 || claim.patientResponsibility === 0
+            ? claim.patientResponsibility
+            : null;
+      if (line && patientResponsibility == null && claim.patientResponsibility != null) {
+        warnings.push(
+          `claim ${claim.patientControlNumber}: claim-level patient responsibility could not be `
+          + 'allocated across service lines; underpayment detection will fail closed for this line',
+        );
+      }
       await db.query(
         `INSERT INTO remittance_line
            (tenant_id, remittance_id, procedure_code, billed_amount,
             allowed_amount, paid_amount, patient_responsibility,
-            adjustment_group_code, adjustment_reason_code, remark_code, quantity,
+            adjustment_group_code, adjustment_reason_code, adjustments,
+            remark_code, quantity,
             payer_claim_number, patient_member_id, date_of_service)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
         [params.tenantId, remittanceId,
          line?.procedureCode ?? null,
          line?.billedAmount ?? claim.billedAmount,
          line?.allowedAmount ?? null,
          line?.paidAmount ?? claim.paidAmount,
-         claim.patientResponsibility,
+         patientResponsibility,
          adj?.groupCode ?? null, adj?.reasonCode ?? null,
+         JSON.stringify(adjustments),
          line?.remarkCodes[0] ?? null,
          line?.units ?? null,
          claim.payerClaimNumber || claim.patientControlNumber || null,
@@ -257,12 +276,14 @@ export function ingestRemittanceCsvJob(
           `INSERT INTO remittance_line
              (tenant_id, remittance_id, procedure_code, billed_amount, allowed_amount,
               paid_amount, patient_responsibility, adjustment_group_code,
-              adjustment_reason_code, remark_code, quantity,
+              adjustment_reason_code, adjustments, remark_code, quantity,
               payer_claim_number, patient_member_id, date_of_service)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
           [params.tenantId, rem.rows[0].remittance_id, r.procedureCode, r.billedAmount,
            r.allowedAmount, r.paidAmount, r.patientResponsibility, r.groupCode,
-           r.reasonCode, r.remarkCode, r.units,
+           r.reasonCode, JSON.stringify(r.groupCode && r.reasonCode ? [{
+             groupCode: r.groupCode, reasonCode: r.reasonCode, amount: 0,
+           }] : []), r.remarkCode, r.units,
            r.payerClaimNumber ?? r.claimNumber, r.memberId, r.dos]);
         processed += 1;
       }

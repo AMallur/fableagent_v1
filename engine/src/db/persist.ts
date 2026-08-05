@@ -53,13 +53,15 @@ export async function persistResult(
       `UPDATE claim_line
        SET paid_amount = COALESCE($1, paid_amount),
            allowed_amount = COALESCE($2, allowed_amount),
-           expected_amount = COALESCE($3, expected_amount),
-           expected_source = COALESCE($4, expected_source),
-           denial_reason_code = COALESCE($5, denial_reason_code),
-           denial_reason_description = COALESCE($6, denial_reason_description),
-           line_status = COALESCE($7, line_status)
-       WHERE claim_line_id = $8 AND tenant_id = $9`,
-      [l.paidAmount, l.allowedAmount, l.expectedAmount, l.expectedSource ?? null,
+           patient_responsibility = COALESCE($3, patient_responsibility),
+           expected_amount = COALESCE($4, expected_amount),
+           expected_source = COALESCE($5, expected_source),
+           denial_reason_code = $6,
+           denial_reason_description = $7,
+           line_status = COALESCE($8, line_status)
+       WHERE claim_line_id = $9 AND tenant_id = $10`,
+      [l.paidAmount, l.allowedAmount, l.patientResponsibility,
+       l.expectedAmount, l.expectedSource ?? null,
        l.denialReasonCode, l.denialReasonDescription, l.lineStatus,
        l.claimLineId, tenantId],
     );

@@ -121,6 +121,22 @@ describe('835 parser', () => {
     const l2 = era.claims[1].lines[0];
     assert.deepEqual(l2.adjustments, [{ groupCode: 'CO', reasonCode: '197', amount: 250 }]);
   });
+
+  it('preserves every adjustment across repeating and multiple CAS segments', () => {
+    const parsed = parse835([
+      'ST*835*0001~',
+      'CLP*C1*1*250*80*45*12*ICN-1~',
+      'SVC*HC:99213*250*80**1~',
+      'CAS*CO*45*100**97*25~',
+      'CAS*PR*2*45~',
+      'SE*5*0001~',
+    ].join('\n'));
+    assert.deepEqual(parsed.claims[0].lines[0].adjustments, [
+      { groupCode: 'CO', reasonCode: '45', amount: 100 },
+      { groupCode: 'CO', reasonCode: '97', amount: 25 },
+      { groupCode: 'PR', reasonCode: '2', amount: 45 },
+    ]);
+  });
 });
 
 describe('837 parser', () => {
