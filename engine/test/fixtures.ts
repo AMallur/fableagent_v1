@@ -54,6 +54,7 @@ export function remitLine(overrides: Partial<RemitLineInput> = {}): RemitLineInp
     procedureCode: '99213',
     billedAmount: 250,
     paidAmount: 100,
+    patientResponsibility: 0,
     ...overrides,
   };
 }

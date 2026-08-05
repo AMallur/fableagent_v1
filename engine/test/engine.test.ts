@@ -159,6 +159,78 @@ describe('step 2: expected reimbursement', () => {
 // STEP 3 — variance detection
 // ---------------------------------------------------------------------------
 describe('step 3: variance detection', () => {
+  it('does not count deductible/copay/coinsurance as a payer underpayment', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 80 });
+    input.remitLines[0].patientResponsibility = 45;
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 0);
+    assert.equal(out.claimLineUpdates[0].expectedAmount, 125); // allowed amount retained
+    assert.equal(out.claimLineUpdates[0].paidAmount, 80);
+    assert.equal(out.claimLineUpdates[0].lineStatus, 'paid');
+  });
+
+  it('calculates recovery against expected payer liability after patient responsibility', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 70 });
+    input.remitLines[0].patientResponsibility = 25;
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 1);
+    assert.equal(out.casesCreated[0].expectedAmount, 100);
+    assert.equal(out.casesCreated[0].paidAmount, 70);
+    assert.equal(out.casesCreated[0].recoveryOpportunity, 30);
+  });
+
+  it('treats a PR-only zero payment as patient liability, not a denial', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 0 });
+    input.remitLines[0].adjustments = [
+      { groupCode: 'PR', reasonCode: '1', amount: 125 },
+    ];
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 0);
+    assert.equal(out.skipped.length, 0);
+    assert.equal(out.claimLineUpdates[0].denialReasonCode, null);
+  });
+
+  it('fails closed when line-level patient responsibility is unknown', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 80 });
+    input.remitLines[0].patientResponsibility = null;
+    input.remitLines[0].adjustments = [];
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 0);
+    assert.equal(out.claimLineUpdates[0].lineStatus, 'paid');
+  });
+
+  it('evaluates every CAS adjustment while excluding patient responsibility', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 80 });
+    input.remitLines[0].adjustments = [
+      { groupCode: 'CO', reasonCode: '45', amount: 125 },
+      { groupCode: 'PR', reasonCode: '2', amount: 45 },
+    ];
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 0);
+    assert.equal(out.claimLineUpdates[0].lineStatus, 'paid');
+  });
+
+  it('sums split remittance payments before calculating variance', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 80 });
+    input.remitLines.push(remitLine({
+      remittanceId: 'remittance-2', payerClaimNumber: 'ICN-1', paidAmount: 45,
+      checkDate: '2026-06-26',
+    }));
+    const out = runEngine(input);
+    assert.equal(out.matches.length, 2);
+    assert.equal(out.casesCreated.length, 0);
+    assert.equal(out.claimLineUpdates.length, 1);
+    assert.equal(out.claimLineUpdates[0].paidAmount, 125);
+  });
+
+  it('adds a supplemental remittance to an already-posted payment', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 45 });
+    input.claims[0].lines[0].paidAmount = 80;
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 0);
+    assert.equal(out.claimLineUpdates[0].paidAmount, 125);
+  });
+
   it('variance > $25 creates an underpayment case', () => {
     const input = matchedScenario({ contractRate: 125, paid: 80 }); // variance 45
     const out = runEngine(input);

@@ -2,7 +2,8 @@
 // STEP 3 — VARIANCE DETECTION
 //
 // For each claim line with a matched remit:
-//   variance = expected_amount - paid_amount
+//   expected_payer_amount = contract_allowed - patient_responsibility
+//   variance = expected_payer_amount - cumulative_paid_amount
 //   * denial code present -> route to denial classification (Step 4), never
 //     double-flagged as a plain underpayment
 //   * variance > $0                    -> flag line as underpayment
@@ -18,6 +19,8 @@ export interface VarianceFlag {
   matched: MatchedLine;
   pricing: LinePricing;
   variance: number;
+  /** Contract allowed amount less valid patient responsibility. */
+  expectedPayerAmount: number;
   variancePercent: number | null;
   /** crossed the case-creation trigger */
   caseWorthy: boolean;
@@ -28,6 +31,7 @@ export interface DenialRoute {
   pricing: LinePricing;
   normalizedCode: string;
   variance: number | null;
+  expectedPayerAmount: number | null;
 }
 
 export interface VarianceOutcome {
@@ -51,41 +55,86 @@ export function runVarianceDetection(
 
     const paid = remitLine.paidAmount ?? claimLine.paidAmount ?? 0;
     const expected = priced.expectedAmount;
-    const variance = expected != null ? round2(expected - paid) : null;
-
-    const code = normalizeDenialCode(
-      remitLine.adjustmentReasonCode ?? claimLine.denialReasonCode,
-      remitLine.adjustmentGroupCode,
-    );
-    const taxonomyEntry = code ? DENIAL_TAXONOMY[code] : undefined;
-    // a contractual-group code (CO-45 etc.) only counts as a denial when the
-    // line actually paid below expected; hard denial codes always route
-    const isDenial = code != null && (
-      (taxonomyEntry && !taxonomyEntry.requiresVariance)
-      || (taxonomyEntry?.requiresVariance && variance != null && moneyGt(variance, 0))
-      || (!taxonomyEntry && paid <= 0)  // unmapped code with nothing paid
-    );
+    const patientResponsibility = patientResponsibilityFor(remitLine);
+    const expectedPayerAmount = expected != null && patientResponsibility != null
+      ? round2(Math.max(0, expected - patientResponsibility))
+      : null;
+    const variance = expectedPayerAmount != null
+      ? round2(expectedPayerAmount - paid)
+      : null;
+    const denial = denialCodeFor(remitLine, claimLine.denialReasonCode, paid, variance);
 
     if (seenLine.has(claimLine.claimLineId)) continue;
     seenLine.add(claimLine.claimLineId);
 
-    if (isDenial && code) {
-      denialRoutes.push({ matched, pricing: priced, normalizedCode: code, variance });
+    if (denial) {
+      denialRoutes.push({
+        matched, pricing: priced, normalizedCode: denial, variance,
+        expectedPayerAmount,
+      });
       continue;
     }
 
     if (variance == null || !moneyGt(variance, 0)) continue;
 
-    const variancePercent = expected && expected > 0 ? variance / expected : null;
+    const variancePercent = expectedPayerAmount && expectedPayerAmount > 0
+      ? variance / expectedPayerAmount
+      : null;
     const caseWorthy =
       moneyGt(variance, input.config.varianceDollarTrigger)
       || (variancePercent != null && variancePercent > input.config.variancePercentTrigger);
 
     underpayments.push({
-      matched, pricing: priced, variance,
+      matched, pricing: priced, variance, expectedPayerAmount,
       variancePercent, caseWorthy,
     });
   }
 
   return { underpayments, denialRoutes };
+}
+
+function patientResponsibilityFor(remitLine: MatchedLine['remitLine']): number | null {
+  const prAdjustments = (remitLine.adjustments ?? [])
+    .filter((a) => a.groupCode.toUpperCase() === 'PR');
+  if (prAdjustments.length) {
+    return Math.max(0, prAdjustments.reduce((sum, a) => sum + a.amount, 0));
+  }
+  if (remitLine.patientResponsibility != null) {
+    return Math.max(0, remitLine.patientResponsibility);
+  }
+  if (remitLine.adjustments?.length) {
+    return 0;
+  }
+  // Null means the ERA did not provide enough line-level information. Do not
+  // assume zero and create a potentially false recovery opportunity.
+  return null;
+}
+
+function denialCodeFor(
+  remitLine: MatchedLine['remitLine'], claimCode: string | null | undefined,
+  paid: number, variance: number | null,
+): string | null {
+  const adjustments = remitLine.adjustments?.length
+    ? remitLine.adjustments
+    : remitLine.adjustmentReasonCode
+      ? [{
+        groupCode: remitLine.adjustmentGroupCode ?? '',
+        reasonCode: remitLine.adjustmentReasonCode,
+        amount: 0,
+      }]
+      : claimCode
+        ? [{ groupCode: '', reasonCode: claimCode, amount: 0 }]
+        : [];
+
+  for (const adjustment of adjustments) {
+    // PR adjustments represent patient liability, not a payer denial.
+    if (adjustment.groupCode.toUpperCase() === 'PR') continue;
+    const code = normalizeDenialCode(adjustment.reasonCode, adjustment.groupCode);
+    if (!code) continue;
+    const taxonomyEntry = DENIAL_TAXONOMY[code];
+    if ((taxonomyEntry && !taxonomyEntry.requiresVariance)
+      || (taxonomyEntry?.requiresVariance && variance != null && moneyGt(variance, 0))
+      || (!taxonomyEntry && paid <= 0)) return code;
+  }
+  return null;
 }
