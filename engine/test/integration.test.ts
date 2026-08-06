@@ -116,8 +116,9 @@ describe('detection service against Postgres', { skip: !url && 'TEST_DATABASE_UR
     await q(`INSERT INTO remittance (remittance_id, tenant_id, client_id, payer_id, check_date, check_number, total_paid)
              VALUES ($1, $2, $3, $4, '2026-06-25', 'IT-CHK', 80)`, [REM, T, C, P]);
     await q(`INSERT INTO remittance_line (remittance_line_id, tenant_id, remittance_id, payer_claim_number,
-                                          procedure_code, billed_amount, paid_amount, adjustment_group_code, adjustment_reason_code)
-             VALUES ($1, $2, $3, 'IT-ICN-1', '99213', 250, 80, 'CO', '45')`, [RL1, T, REM]);
+                                          procedure_code, billed_amount, paid_amount, patient_responsibility,
+                                          adjustment_group_code, adjustment_reason_code)
+             VALUES ($1, $2, $3, 'IT-ICN-1', '99213', 250, 80, 0, 'CO', '45')`, [RL1, T, REM]);
     await q(`INSERT INTO remittance_line (remittance_line_id, tenant_id, remittance_id, payer_claim_number,
                                           procedure_code, billed_amount, paid_amount, adjustment_group_code, adjustment_reason_code)
              VALUES ($1, $2, $3, 'IT-ICN-2', '99213', 250, 0, 'CO', '197')`, [RL2, T, REM]);
