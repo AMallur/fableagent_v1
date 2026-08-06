@@ -58,3 +58,13 @@ jobs:
           OPTUM_ENDPOINT_PATH: ${{ inputs.endpoint_path }}
           OPTUM_TEST_PAYLOAD: ${{ inputs.test_payload }}
         run: node scripts/optum_sandbox_explore.ts
+
+      - name: Print raw sandbox response
+        if: always()
+        run: |
+          for f in var/optum_sandbox/response_*.json; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            cat "$f"
+            echo
+          done
