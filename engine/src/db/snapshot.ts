@@ -39,7 +39,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
             rl.procedure_code, rl.billed_amount, rl.allowed_amount, rl.paid_amount,
             rl.patient_responsibility, rl.adjustment_group_code,
             rl.adjustment_reason_code, rl.adjustments, rl.remark_code,
-            rl.claim_id, rl.claim_line_id
+            rl.claim_id, rl.claim_line_id, rl.matched_at
      FROM remittance_line rl
      JOIN remittance r ON r.remittance_id = rl.remittance_id
      WHERE rl.tenant_id = $1 ${scope.clientId ? 'AND r.client_id = $2' : ''}
@@ -51,7 +51,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
   const claims = await db.query(
     `SELECT cl.claim_id, cl.client_id, cl.payer_id, cl.claim_type, cl.claim_status,
             cl.claim_number_internal, cl.claim_number_payer, cl.submission_date,
-            e.patient_id, e.date_of_service_start, e.authorization_number,
+            e.patient_id, e.date_of_service_start, e.place_of_service, e.authorization_number,
             COALESCE(docs.doc_types, '{}') AS doc_types
      FROM claim cl
      JOIN encounter e ON e.encounter_id = cl.encounter_id
@@ -96,6 +96,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
     claimNumberInternal: r.claim_number_internal,
     claimNumberPayer: r.claim_number_payer,
     dateOfServiceStart: iso(r.date_of_service_start),
+    placeOfService: r.place_of_service,
     submissionDate: iso(r.submission_date),
     claimStatus: r.claim_status,
     authorizationNumber: r.authorization_number,
@@ -136,7 +137,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
     `SELECT ct.contract_id, ct.client_id, ct.payer_id, ct.effective_date,
             ct.expiration_date, ct.fee_schedule_type
      FROM contract ct JOIN client c ON c.client_id = ct.client_id
-     WHERE ct.tenant_id = $1 ${clientFilter} AND ct.deleted_at IS NULL`,
+     WHERE ct.tenant_id = $1 ${clientFilter} AND ct.deleted_at IS NULL
+       AND ct.status = 'active'`,
     params,
   );
   const contractIds = contracts.rows.map((r) => r.contract_id);
@@ -169,15 +171,31 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
 
   // ---- medicare reference rates ----------------------------------------------
   const medicare = await db.query(
-    `SELECT DISTINCT ON (procedure_code, COALESCE(modifier, ''))
-            procedure_code, modifier, rate
-     FROM medicare_fee_schedule
-     ORDER BY procedure_code, COALESCE(modifier, ''), effective_year DESC`,
+    `SELECT DISTINCT ON (procedure_code, COALESCE(modifier, ''), COALESCE(locality, ''), service_setting)
+            m.procedure_code, m.modifier, m.rate, m.locality, m.service_setting, m.dataset_id
+     FROM medicare_fee_schedule m
+     LEFT JOIN reference_dataset rd ON rd.dataset_id = m.dataset_id
+     ORDER BY procedure_code, COALESCE(modifier, ''), COALESCE(locality, ''),
+              service_setting, COALESCE(rd.effective_date, make_date(effective_year, 1, 1)) DESC,
+              rd.imported_at DESC NULLS LAST`,
   );
   const medicareRates: Record<string, number> = {};
   for (const r of medicare.rows) {
-    medicareRates[`${r.procedure_code}|${r.modifier ?? ''}`] = Number(r.rate);
+    const detailed = `${r.procedure_code}|${r.modifier ?? ''}|${r.locality ?? ''}|${r.service_setting}`;
+    medicareRates[detailed] = Number(r.rate);
+    // Pre-provenance rows remain usable during migration. Versioned imports
+    // never populate the ambiguous legacy key.
+    if (r.dataset_id == null) medicareRates[`${r.procedure_code}|${r.modifier ?? ''}`] = Number(r.rate);
   }
+
+  const localityRows = await db.query(
+    `SELECT c.client_id, cmc.medicare_locality
+     FROM client c
+     JOIN client_medicare_config cmc
+       ON cmc.tenant_id = c.tenant_id AND cmc.client_id = c.client_id
+     WHERE c.tenant_id = $1 ${clientFilter}`, params);
+  const medicareLocalityByClient: Record<string, string> = {};
+  for (const r of localityRows.rows) medicareLocalityByClient[r.client_id] = r.medicare_locality;
 
   // ---- open cases (dedup), win-rate history, configs -------------------------
   const existingCases = await db.query(
@@ -259,9 +277,11 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
       remarkCode: r.remark_code,
       claimId: r.claim_id,
       claimLineId: r.claim_line_id,
+      previouslyProcessed: r.matched_at != null,
     })),
     contracts: contractInputs,
     medicareRates,
+    medicareLocalityByClient,
     existingCases: existingCases.rows.map((r) => ({
       caseId: r.case_id,
       claimId: r.claim_id,

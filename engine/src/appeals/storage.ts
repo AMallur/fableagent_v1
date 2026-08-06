@@ -91,6 +91,66 @@ export class GcsDocumentStore implements DocumentStore {
   }
 }
 
+interface S3CommandClient {
+  send(command: unknown): Promise<any>;
+}
+
+export class S3DocumentStore implements DocumentStore {
+  private readonly client: S3CommandClient;
+  private readonly bucket: string;
+  private readonly kmsKeyId?: string;
+
+  constructor(
+    client: S3CommandClient, bucket: string, kmsKeyId?: string,
+  ) {
+    this.client = client;
+    this.bucket = bucket;
+    this.kmsKeyId = kmsKeyId;
+  }
+
+  static async create(
+    bucket: string, options: { region?: string; kmsKeyId?: string } = {},
+  ): Promise<S3DocumentStore> {
+    if (!bucket.trim()) throw new Error('AWS_DOCUMENT_BUCKET cannot be empty');
+    const { S3Client } = await import('@aws-sdk/client-s3');
+    // The default AWS credential chain uses an ECS task role, EC2 instance
+    // profile, or local AWS profile. Static access keys are deliberately not
+    // accepted by this API or stored by FableAgent.
+    const client = new S3Client({ region: options.region ?? process.env.AWS_REGION });
+    return new S3DocumentStore(client, bucket, options.kmsKeyId);
+  }
+
+  async put(relativePath: string, content: string | Uint8Array): Promise<string> {
+    relativePath = safeStoragePath(relativePath);
+    const { PutObjectCommand } = await import('@aws-sdk/client-s3');
+    await this.client.send(new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: relativePath,
+      Body: Buffer.from(content),
+      ...(this.kmsKeyId ? {
+        ServerSideEncryption: 'aws:kms' as const,
+        SSEKMSKeyId: this.kmsKeyId,
+      } : {}),
+    }));
+    return relativePath;
+  }
+
+  async get(storagePath: string): Promise<string> {
+    return (await this.getRaw(storagePath)).toString('utf8');
+  }
+
+  async getRaw(storagePath: string): Promise<Buffer> {
+    storagePath = safeStoragePath(storagePath);
+    const { GetObjectCommand } = await import('@aws-sdk/client-s3');
+    const response = await this.client.send(new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: storagePath,
+    }));
+    if (!response.Body) throw new Error(`empty S3 object: ${storagePath}`);
+    return Buffer.from(await response.Body.transformToByteArray());
+  }
+}
+
 /**
  * Picks the document store from environment: GCS_DOCUMENT_BUCKET set ->
  * object storage (durable, shared across instances); unset -> local
@@ -101,20 +161,30 @@ export class GcsDocumentStore implements DocumentStore {
  * outlive the VM itself.
  */
 export async function resolveDocumentStore(): Promise<DocumentStore> {
-  const bucket = process.env.GCS_DOCUMENT_BUCKET;
-  if (!bucket) {
+  const gcsBucket = process.env.GCS_DOCUMENT_BUCKET;
+  const s3Bucket = process.env.AWS_DOCUMENT_BUCKET;
+  if (gcsBucket && s3Bucket) {
+    throw new Error('configure exactly one document store: GCS_DOCUMENT_BUCKET or AWS_DOCUMENT_BUCKET');
+  }
+  if (s3Bucket) {
+    return S3DocumentStore.create(s3Bucket, {
+      region: process.env.AWS_REGION,
+      kmsKeyId: process.env.AWS_DOCUMENT_KMS_KEY_ID,
+    });
+  }
+  if (!gcsBucket) {
     if (process.env.NODE_ENV === 'production') {
       console.warn(
-        'GCS_DOCUMENT_BUCKET is not set — appeal packets and letters will be '
+        'No object-storage bucket is set — appeal packets and letters will be '
         + 'written to local disk. Fine for a single instance with a persistent '
         + 'volume; does not survive losing that volume and cannot be shared '
-        + 'across more than one app instance. Set GCS_DOCUMENT_BUCKET to move '
-        + 'to Cloud Storage.',
+        + 'across more than one app instance. Set GCS_DOCUMENT_BUCKET or '
+        + 'AWS_DOCUMENT_BUCKET for a durable shared store.',
       );
     }
     return new FileSystemDocumentStore();
   }
-  return GcsDocumentStore.create(bucket);
+  return GcsDocumentStore.create(gcsBucket);
 }
 
 /** In-memory store for tests. */

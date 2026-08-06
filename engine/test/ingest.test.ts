@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { parseX12, x12Date } from '../src/ingest/x12.ts';
 import { parse835 } from '../src/ingest/parse835.ts';
 import { parse837 } from '../src/ingest/parse837.ts';
+import { assertValidX12File, validateX12File } from '../src/ingest/validation.ts';
 
 // canonical fixed-width ISA (105 chars + terminator) — proves separator detection
 const ISA = 'ISA*00*          *00*          *ZZ*SENDERID       *ZZ*RECEIVERID     *260625*1200*^*00501*000000001*0*P*:~';
@@ -181,6 +182,8 @@ import { parseRemittanceCsv, splitCsvLine } from '../src/ingest/csv.ts';
 import { detectFileKind, previewIngestFile } from '../src/ingest/service.ts';
 
 export const FIXTURE_835_MULTI = [
+  ISA,
+  'GS*HP*SENDER*RECEIVER*20260701*1200*1*X*005010X221A1~',
   'ST*835*0001~',
   'BPR*I*100.00*C*ACH***01*1*DA*1*1**01*1*DA*1*20260701~',
   'TRN*1*CHK-M-1*1~',
@@ -199,7 +202,30 @@ export const FIXTURE_835_MULTI = [
   'SVC*HC:99214*300.00*0.00**1~',
   'CAS*CO*197*300~',
   'SE*9*0002~',
+  'GE*2*1~',
+  'IEA*1*000000001~',
 ].join('\n');
+
+describe('X12 ingestion-boundary validation', () => {
+  it('accepts the supported CMS 5010 implementation versions', () => {
+    assert.equal(validateX12File(FIXTURE_835, '835').errors.length, 0);
+    assert.equal(validateX12File(FIXTURE_837, '837P').errors.length, 0);
+  });
+
+  it('rejects an 837I implementation because this product currently supports 837P only', () => {
+    const result = validateX12File(
+      FIXTURE_837.replaceAll('005010X222A1', '005010X223A2'), '837P');
+    assert.match(result.errors[0].message, /005010X222A1/);
+  });
+
+  it('rejects incomplete envelopes and missing recovery-critical segments', () => {
+    const result = validateX12File('ST*835*1~BPR*I*1~SE*3*1~', '835');
+    assert.ok(result.errors.some((i) => i.code === 'incomplete_interchange'));
+    assert.ok(result.errors.some((i) => i.code === 'missing_payer'));
+    assert.ok(result.errors.some((i) => i.code === 'missing_clp'));
+    assert.throws(() => assertValidX12File('ST*835*1~SE*2*1~', '835'), /rejected/);
+  });
+});
 
 describe('835 multi-transaction files', () => {
   it('splits one file into one remittance per ST/SE set', () => {

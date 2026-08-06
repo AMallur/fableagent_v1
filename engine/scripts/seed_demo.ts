@@ -127,6 +127,11 @@ await q(`INSERT INTO client (client_id, tenant_id, client_name, tax_id, npi_grou
            recovery_alert_threshold = EXCLUDED.recovery_alert_threshold,
            appeal_review_threshold = EXCLUDED.appeal_review_threshold,
            status = 'active', deleted_at = NULL, updated_at = now()`, [C, T]);
+await q(`INSERT INTO client_medicare_config (tenant_id, client_id, medicare_locality)
+         VALUES ($1, $2, 'DEMO')
+         ON CONFLICT (client_id) DO UPDATE SET
+           tenant_id = EXCLUDED.tenant_id,
+           medicare_locality = EXCLUDED.medicare_locality`, [T, C]);
 
 const userIds: string[] = [];
 for (const [email, first, last, role] of USERS) {
@@ -192,8 +197,9 @@ const RATES: Record<string, number> = {
 };
 for (const payerId of payerIds) {
   const ct = await q(
-    `INSERT INTO contract (tenant_id, client_id, payer_id, effective_date, fee_schedule_type)
-     VALUES ($1, $2, $3, $4, 'fee_schedule') RETURNING contract_id`,
+    `INSERT INTO contract (tenant_id, client_id, payer_id, effective_date, fee_schedule_type,
+                           status, approved_at)
+     VALUES ($1, $2, $3, $4, 'fee_schedule', 'active', now()) RETURNING contract_id`,
     [T, C, payerId, dayISO(-400)]);
   for (const [code, rate] of Object.entries(RATES)) {
     await q(`INSERT INTO contract_line (tenant_id, contract_id, procedure_code, allowed_amount)
@@ -202,8 +208,10 @@ for (const payerId of payerIds) {
   }
 }
 for (const [code, rate] of Object.entries(RATES)) {
-  await q(`INSERT INTO medicare_fee_schedule (procedure_code, rate, effective_year, locality)
-           VALUES ($1, $2, $3, 'DEMO')`, [code, Math.round(rate * 0.7 * 100) / 100, TODAY.getUTCFullYear()]);
+  await q(`INSERT INTO medicare_fee_schedule
+             (procedure_code, rate, effective_year, locality, service_setting)
+           VALUES ($1, $2, $3, 'DEMO', 'nonfacility')`,
+    [code, Math.round(rate * 0.7 * 100) / 100, TODAY.getUTCFullYear()]);
 }
 
 console.log('creating providers, patients…');

@@ -169,7 +169,7 @@ describe('integration & ingestion layer', { skip: !url && 'TEST_DATABASE_URL not
         checkNumber: 'CHK-API-1', checkDate: '2026-07-06', totalPaid: 100,
         claims: [{
           claimNumber: 'API-CLM-1', payerClaimNumber: 'API-ICN-1',
-          billedAmount: 400, paidAmount: 100,
+          billedAmount: 400, paidAmount: 100, patientResponsibility: 0,
           patient: { firstName: 'Api', lastName: 'Patient', memberId: 'MEM-API-1' },
           lines: [{
             procedureCode: '99214', billedAmount: 400, paidAmount: 100,

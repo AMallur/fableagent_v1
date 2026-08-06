@@ -660,6 +660,9 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
   authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/contracts$/, async (ctx) =>
     json(ctx, 200, await admin.createContract(
       pool, ctx.session!, ctx.scope!, ctx.params[0], await readJson(ctx.req))));
+  authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/contracts\/([0-9a-f-]{36})\/activate$/,
+    async (ctx) => json(ctx, 200, await admin.activateContract(
+      pool, ctx.session!, ctx.scope!, ctx.params[0], ctx.params[1])));
   authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/documents$/, async (ctx) => {
     admin.assertClientAccess(ctx.session!, ctx.scope!, ctx.params[0]);
     const fileName = (ctx.url.searchParams.get('filename') ?? 'upload.bin')

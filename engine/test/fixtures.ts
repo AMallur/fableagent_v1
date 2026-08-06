@@ -74,6 +74,7 @@ export function baseInput(overrides: Partial<EngineInput> = {}): EngineInput {
     remitLines: [],
     contracts: [],
     medicareRates: {},
+    medicareLocalityByClient: {},
     existingCases: [],
     winRates: [],
     clientPayerConfigs: [],

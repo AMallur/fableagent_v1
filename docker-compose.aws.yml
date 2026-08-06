@@ -1,0 +1,76 @@
+# Single-host AWS pilot runtime. Use with an encrypted private RDS PostgreSQL
+# instance and private S3 bucket. EC2 credentials come from its instance role;
+# no static AWS keys belong in this file. For horizontally scaled production,
+# use the ECS Terraform stack under infra/aws/terraform.
+services:
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/aws/Dockerfile
+      target: migrate
+    environment:
+      DB_HOST: ${DB_HOST:?RDS endpoint required}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-fableagent}
+      DB_ADMIN_USER: ${DB_ADMIN_USER:-fableadmin}
+      DB_ADMIN_PASSWORD: ${DB_ADMIN_PASSWORD:?retrieve the RDS admin secret}
+      DB_RUNTIME_USER: ${DB_RUNTIME_USER:-fable_runtime}
+      DB_RUNTIME_PASSWORD: ${DB_RUNTIME_PASSWORD:?store in Secrets Manager}
+      PGSSLMODE: verify-full
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: infra/aws/Dockerfile
+      target: runtime
+    environment: &runtime_env
+      NODE_ENV: production
+      DB_HOST: ${DB_HOST:?RDS endpoint required}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-fableagent}
+      DB_USER: ${DB_RUNTIME_USER:-fable_runtime}
+      DB_PASSWORD: ${DB_RUNTIME_PASSWORD:?store in Secrets Manager}
+      PGSSLMODE: verify-full
+      SESSION_SECRET: ${SESSION_SECRET:?store in Secrets Manager}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?store in Secrets Manager}
+      AWS_REGION: ${AWS_REGION:?AWS region required}
+      AWS_DOCUMENT_BUCKET: ${AWS_DOCUMENT_BUCKET:?private S3 bucket required}
+      AWS_DOCUMENT_KMS_KEY_ID: ${AWS_DOCUMENT_KMS_KEY_ID:?KMS key ARN required}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: infra/aws/Dockerfile
+      target: runtime
+    command: ["node", "src/cli.ts", "schedule"]
+    environment: *runtime_env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      DOMAIN: ${DOMAIN:?public DNS name required}
+    depends_on: [app]
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -7,6 +7,8 @@
 //   node src/cli.ts queue         --tenant <uuid> [--client <uuid>]
 //   node src/cli.ts ingest-835    --tenant <uuid> --client <uuid> --file <path>
 //   node src/cli.ts ingest-837    --tenant <uuid> --client <uuid> --file <path>
+//   node src/cli.ts reference-import --kind <kind> --version <version> --file <path>
+//                  --source-url <official URL> [--scope <scope>] [--service-setting <setting>]
 //   node src/cli.ts create-tenant --name <name> --type <provider_group|billing_company|health_system>
 //                                 --admin-email <email> [--admin-first <name>] [--admin-last <name>]
 //
@@ -19,7 +21,8 @@ import path from 'node:path';
 
 const [command, ...rest] = process.argv.slice(2);
 const COMMANDS = ['detect', 'appeals', 'queue', 'ingest-835', 'ingest-837',
-  'schedule', 'nightly', 'monitor', 'reconcile', 'weekly', 'sftp-server', 'create-tenant'];
+  'schedule', 'nightly', 'monitor', 'reconcile', 'weekly', 'sftp-server', 'create-tenant',
+  'reference-import'];
 
 if (!command || !COMMANDS.includes(command)) {
   console.error(`usage: node src/cli.ts <${COMMANDS.join('|')}> --tenant <uuid> [options]`);
@@ -39,10 +42,16 @@ const { values } = parseArgs({
     'admin-email': { type: 'string' },
     'admin-first': { type: 'string' },
     'admin-last': { type: 'string' },
+    kind: { type: 'string' },
+    version: { type: 'string' },
+    scope: { type: 'string' },
+    'source-url': { type: 'string' },
+    'effective-date': { type: 'string' },
+    'service-setting': { type: 'string' },
   },
 });
 
-const NO_TENANT_REQUIRED = new Set(['schedule', 'sftp-server', 'create-tenant']);
+const NO_TENANT_REQUIRED = new Set(['schedule', 'sftp-server', 'create-tenant', 'reference-import']);
 if (!values.tenant && !NO_TENANT_REQUIRED.has(command)) {
   console.error(`${command}: --tenant <uuid> is required`);
   process.exit(2);
@@ -51,11 +60,9 @@ if (!values.tenant && !NO_TENANT_REQUIRED.has(command)) {
 const { default: pg } = await import('pg');
 const { pgSslConfig } = await import('./web/db_ssl.ts');
 const { readFileSync } = await import('node:fs');
-const { requireSecret } = await import('./security/secrets.ts');
+const { databaseConnectionString } = await import('./db/connection.ts');
 const pool = new pg.Pool({
-  connectionString: requireSecret('DATABASE_URL', {
-    devFallback: 'postgres://localhost:5432/rcm_dev',
-  }),
+  connectionString: databaseConnectionString(),
   ssl: pgSslConfig(readFileSync),
 });
 const { TenantContextPool } = await import('./db/tenant_pool.ts');
@@ -186,6 +193,30 @@ try {
         + `Invite link (expires in 7 days) in case you need to hand it over directly:\n`
         + `  https://<your-domain>/accept-invite?token=${out.inviteToken}`,
       );
+      break;
+    }
+
+    case 'reference-import': {
+      const allowedKinds = new Set(['medicare_pfs', 'carc', 'rarc', 'ncci_ptp']);
+      if (!values.kind || !allowedKinds.has(values.kind) || !values.version
+        || !values.file || !values['source-url']) {
+        console.error('reference-import: --kind medicare_pfs|carc|rarc|ncci_ptp, '
+          + '--version, --file, and --source-url are required');
+        process.exit(2);
+      }
+      const serviceSetting = values['service-setting'];
+      if (serviceSetting && !['practitioner', 'outpatient_hospital'].includes(serviceSetting)) {
+        console.error('reference-import: --service-setting must be practitioner or outpatient_hospital');
+        process.exit(2);
+      }
+      const { importReferenceDataset } = await import('./reference/import.ts');
+      const out = await importReferenceDataset(runtimePool, {
+        kind: values.kind as any, version: values.version, scope: values.scope,
+        sourceUrl: values['source-url'], effectiveDate: values['effective-date'],
+        serviceSetting: serviceSetting as any,
+        content: await readFile(values.file, 'utf8'),
+      });
+      console.log(JSON.stringify(out, null, 2));
       break;
     }
 

@@ -375,11 +375,12 @@ async function load() {
   }));
 
   $('#contracts tbody').innerHTML =
-    '<tr><th>Payer</th><th>Effective</th><th>Type</th><th class="num">Lines</th></tr>' +
+    '<tr><th>Payer</th><th>Effective</th><th>Type</th><th>Status</th><th class="num">Lines</th></tr>' +
     detail.contracts.map((x) => '<tr><td>' + esc(x.payerName) + '</td>' +
       '<td>' + fmtDate(x.effectiveDate) + '</td><td>' + esc(x.feeScheduleType) + '</td>' +
+      '<td>' + stBadge(x.status) + '</td>' +
       '<td class="num">' + x.lines + '</td></tr>').join('')
-    || '<tr><td class="sub" colspan="4">no contracts</td></tr>';
+    || '<tr><td class="sub" colspan="5">no contracts</td></tr>';
   $('#docs').innerHTML = detail.documents.map((d) =>
     '<li>' + esc(d.fileName) + ' <span class="meta">' + esc(d.type) + ' · ' + fmtWhen(d.uploadedAt) + '</span></li>').join('');
 

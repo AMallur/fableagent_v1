@@ -17,6 +17,7 @@ import type { Queryable } from '../db/snapshot.ts';
 import { parse835File, type Remittance835 } from './parse835.ts';
 import { parse837, type ClaimFile837 } from './parse837.ts';
 import { parseRemittanceCsv, type CsvRemitRow } from './csv.ts';
+import { assertValidX12File, validateX12File } from './validation.ts';
 
 export interface IngestParams {
   tenantId: UUID;
@@ -224,6 +225,7 @@ export function ingestParsed835(
 }
 
 export function ingest835Job(pool: PoolLike, params: IngestParams): Promise<IngestResult> {
+  assertValidX12File(params.content, '835');
   return ingestParsed835(pool, params, parse835File(params.content));
 }
 
@@ -297,6 +299,7 @@ export function ingestRemittanceCsvJob(
 // ---------------------------------------------------------------------------
 
 export function ingest837Job(pool: PoolLike, params: IngestParams): Promise<IngestResult> {
+  assertValidX12File(params.content, '837P');
   return ingestParsed837(pool, params, parse837(params.content));
 }
 
@@ -452,11 +455,16 @@ export function previewIngestFile(fileName: string, content: string): IngestPrev
   const empty = { claims: 0, lines: 0, totalBilled: 0, totalPaid: 0, sample: [] as any[] };
   try {
     if (kind === '835') {
+      const validation = validateX12File(content, '835');
       const remits = parse835File(content);
       const claims = remits.flatMap((r) => r.claims);
       const lines = claims.flatMap((c) => c.lines);
       return {
-        kind, ok: claims.length > 0, errors: claims.length ? [] : ['no claims found in 835'],
+        kind, ok: claims.length > 0 && validation.errors.length === 0,
+        errors: [
+          ...validation.errors.map((i) => i.message),
+          ...(claims.length ? [] : ['no claims found in 835']),
+        ],
         summary: {
           transactions: remits.length,
           payers: [...new Set(remits.map((r) => r.payerName).filter(Boolean))],
@@ -478,10 +486,14 @@ export function previewIngestFile(fileName: string, content: string): IngestPrev
       };
     }
     if (kind === '837') {
+      const validation = validateX12File(content, '837P');
       const file = parse837(content);
       return {
-        kind, ok: file.claims.length > 0,
-        errors: file.claims.length ? [] : ['no claims found in 837'],
+        kind, ok: file.claims.length > 0 && validation.errors.length === 0,
+        errors: [
+          ...validation.errors.map((i) => i.message),
+          ...(file.claims.length ? [] : ['no claims found in 837']),
+        ],
         summary: {
           transactions: 1,
           payers: [...new Set(file.claims.map((c) => c.payerName).filter(Boolean))] as string[],

@@ -154,8 +154,16 @@ function addRemit(map: Map<string, RemitLineInput[]>, claimId: string, r: RemitL
 function statusFromRemits(remits: RemitLineInput[]): ClaimStatus | null {
   const totalPaid = remits.reduce((s, r) => s + (r.paidAmount ?? 0), 0);
   const hasDenial = remits.some((r) => {
-    const code = normalizeDenialCode(r.adjustmentReasonCode, r.adjustmentGroupCode);
-    return code !== null && code in DENIAL_TAXONOMY && !DENIAL_TAXONOMY[code].requiresVariance;
+    const adjustments = r.adjustments?.length ? r.adjustments
+      : r.adjustmentReasonCode
+        ? [{ groupCode: r.adjustmentGroupCode ?? '', reasonCode: r.adjustmentReasonCode }]
+        : [];
+    return adjustments.some((adjustment) => {
+      if (adjustment.groupCode.toUpperCase() === 'PR') return false;
+      const code = normalizeDenialCode(adjustment.reasonCode, adjustment.groupCode);
+      return code !== null && code in DENIAL_TAXONOMY
+        && !DENIAL_TAXONOMY[code].requiresVariance;
+    });
   });
   if (totalPaid <= MONEY_EPSILON && hasDenial) return 'denied';
   if (totalPaid > MONEY_EPSILON) return 'paid';

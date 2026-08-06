@@ -102,11 +102,10 @@ function patientResponsibilityFor(remitLine: MatchedLine['remitLine']): number |
   if (remitLine.patientResponsibility != null) {
     return Math.max(0, remitLine.patientResponsibility);
   }
-  if (remitLine.adjustments?.length) {
-    return 0;
-  }
   // Null means the ERA did not provide enough line-level information. Do not
-  // assume zero and create a potentially false recovery opportunity.
+  // infer zero merely because a CO/OA/PI adjustment is present: on a
+  // multi-line claim, CLP05 can carry patient responsibility that could not
+  // be allocated to this SVC line.
   return null;
 }
 

@@ -15,7 +15,8 @@
 // Optional env vars (only needed once you're ready to call an actual
 // endpoint — get the exact values from the OpenAPI spec you download in the
 // developer.optum.com portal for the product you're testing):
-//   OPTUM_TOKEN_URL       - defaults to the documented sandbox token endpoint
+//   OPTUM_TOKEN_URL       - exact token URL from the subscribed product docs
+//   OPTUM_TOKEN_AUTH_MODE - json, form, or basic, exactly as those docs require
 //   OPTUM_API_BASE_URL    - e.g. https://apigw.optum.com/apip/<product-path>
 //   OPTUM_ENDPOINT_PATH   - the specific resource path, e.g. /eligibility/v3/...
 //   OPTUM_TEST_PAYLOAD    - JSON string body, built from the sandbox's
@@ -26,8 +27,8 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 
-const TOKEN_URL =
-  process.env.OPTUM_TOKEN_URL ?? 'https://sandbox-apigw.optum.com/apip/auth/v2/token';
+const TOKEN_URL = process.env.OPTUM_TOKEN_URL;
+const TOKEN_AUTH_MODE = process.env.OPTUM_TOKEN_AUTH_MODE;
 const CLIENT_ID = process.env.OPTUM_CLIENT_ID;
 const CLIENT_SECRET = process.env.OPTUM_CLIENT_SECRET;
 const API_BASE = process.env.OPTUM_API_BASE_URL;
@@ -35,23 +36,35 @@ const ENDPOINT_PATH = process.env.OPTUM_ENDPOINT_PATH;
 const TEST_PAYLOAD = process.env.OPTUM_TEST_PAYLOAD;
 
 async function getAccessToken(): Promise<string> {
-  if (!CLIENT_ID || !CLIENT_SECRET) {
-    throw new Error('Set OPTUM_CLIENT_ID and OPTUM_CLIENT_SECRET first.');
+  if (!TOKEN_URL || !CLIENT_ID || !CLIENT_SECRET) {
+    throw new Error('Set OPTUM_TOKEN_URL, OPTUM_CLIENT_ID, and OPTUM_CLIENT_SECRET from the subscribed sandbox.');
+  }
+  if (!['json', 'form', 'basic'].includes(TOKEN_AUTH_MODE ?? '')) {
+    throw new Error('Set OPTUM_TOKEN_AUTH_MODE to json, form, or basic according to the product documentation.');
   }
 
-  const body = {
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
-    grant_type: 'client_credentials',
-  };
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  let body: string;
+  if (TOKEN_AUTH_MODE === 'basic') {
+    headers.Authorization = `Basic ${Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64')}`;
+    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    body = new URLSearchParams({ grant_type: 'client_credentials' }).toString();
+  } else if (TOKEN_AUTH_MODE === 'form') {
+    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    body = new URLSearchParams({
+      client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'client_credentials',
+    }).toString();
+  } else {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify({
+      client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'client_credentials',
+    });
+  }
 
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
-    headers: {
-      Accept: '*/*',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+    headers,
+    body,
   });
 
   const text = await res.text();
@@ -59,9 +72,8 @@ async function getAccessToken(): Promise<string> {
     throw new Error(
       `Token request failed (${res.status}) at ${TOKEN_URL}.\n` +
         `Response: ${text}\n` +
-        `If this 404s or rejects the field names, check "Access our APIs" in the ` +
-        `developer.optum.com portal — the sandbox may want the credentials as a ` +
-        `Basic Auth header instead of form fields, or a different grant_type.`,
+        `Verify the exact URL, auth mode, scopes, and grant fields against the ` +
+        `subscribed product's current Optum documentation.`,
     );
   }
 

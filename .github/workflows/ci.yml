@@ -97,5 +97,18 @@ jobs:
         working-directory: engine
         run: npm audit --omit=dev --audit-level=high
 
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Validate AWS Terraform
+        working-directory: infra/aws/terraform
+        run: |
+          terraform init -backend=false
+          terraform validate
+
       - name: Build Docker image (smoke check)
         run: docker build --target runtime -t rcm-engine:ci ./engine
+
+      - name: Build AWS runtime and migration images
+        run: |
+          docker build -f infra/aws/Dockerfile --target runtime -t fableagent-aws-runtime:ci .
+          docker build -f infra/aws/Dockerfile --target migrate -t fableagent-aws-migrate:ci .

@@ -2,6 +2,24 @@ name: Test Optum Sandbox
 
 on:
   workflow_dispatch:
+    inputs:
+      token_url:
+        description: "Exact sandbox token URL from the subscribed Optum product documentation"
+        required: true
+        type: string
+      token_auth_mode:
+        description: "OAuth credential placement required by that documentation"
+        required: true
+        type: choice
+        options: [json, form, basic]
+      api_base_url:
+        description: "Optional exact sandbox API base URL"
+        required: false
+        type: string
+      endpoint_path:
+        description: "Optional exact sandbox resource path"
+        required: false
+        type: string
 
 jobs:
   test-optum:
@@ -30,6 +48,8 @@ jobs:
         env:
           OPTUM_CLIENT_ID: ${{ secrets.CLIENT_ID }}
           OPTUM_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
-          OPTUM_API_BASE_URL: https://sandbox-apigw.optum.com/rcm/prior-authorization/v1
-          OPTUM_ENDPOINT_PATH: /healthcheck
+          OPTUM_TOKEN_URL: ${{ inputs.token_url }}
+          OPTUM_TOKEN_AUTH_MODE: ${{ inputs.token_auth_mode }}
+          OPTUM_API_BASE_URL: ${{ inputs.api_base_url }}
+          OPTUM_ENDPOINT_PATH: ${{ inputs.endpoint_path }}
         run: node scripts/optum_sandbox_explore.ts

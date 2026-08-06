@@ -78,7 +78,7 @@ describe('step 1: claim-remit matching', () => {
 // ---------------------------------------------------------------------------
 // STEP 2 — expected reimbursement
 // ---------------------------------------------------------------------------
-describe('step 2: expected reimbursement', () => {
+  describe('step 2: expected reimbursement', () => {
   it('fee_schedule: expected = contract line allowed_amount * units', () => {
     const line = claimLine({ units: 2 });
     const c = claim({ claimNumberPayer: 'ICN-9', lines: [line] });
@@ -126,6 +126,32 @@ describe('step 2: expected reimbursement', () => {
     assert.equal(out.pricing[0].expectedAmount, 90);
     assert.equal(out.pricing[0].expectedSource, 'medicare_proxy');
     assert.equal(out.pricing[0].noContract, true);
+  });
+
+  it('uses the configured locality and POS-specific Medicare amount', () => {
+    const input = baseInput({
+      claims: [claim({ claimNumberPayer: 'ICN-9', placeOfService: '11' })],
+      remitLines: [remitLine({ payerClaimNumber: 'ICN-9', paidAmount: 10 })],
+      medicareLocalityByClient: { [CLIENT]: '99' },
+      medicareRates: {
+        '99213||99|nonfacility': 93.21,
+        '99213||99|facility': 67.14,
+      },
+    });
+    assert.equal(runEngine(input).pricing[0].expectedAmount, 93.21);
+    input.claims[0].placeOfService = '22';
+    assert.equal(runEngine(input).pricing[0].expectedAmount, 67.14);
+  });
+
+  it('fails closed on imported Medicare rates when locality or POS is not configured', () => {
+    const input = baseInput({
+      claims: [claim({ claimNumberPayer: 'ICN-9', placeOfService: '99' })],
+      remitLines: [remitLine({ payerClaimNumber: 'ICN-9', paidAmount: 10 })],
+      medicareLocalityByClient: { [CLIENT]: '99' },
+      medicareRates: { '99213||99|nonfacility': 93.21 },
+    });
+    assert.equal(runEngine(input).pricing[0].expectedAmount, null);
+    assert.equal(runEngine(input).pricing[0].expectedSource, 'none');
   });
 
   it('modifier-specific contract rate wins over the generic rate', () => {
@@ -199,6 +225,17 @@ describe('step 3: variance detection', () => {
     assert.equal(out.claimLineUpdates[0].lineStatus, 'paid');
   });
 
+  it('does not infer zero patient responsibility from non-PR adjustments', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 80 });
+    input.remitLines[0].patientResponsibility = null;
+    input.remitLines[0].adjustments = [
+      { groupCode: 'CO', reasonCode: '45', amount: 45 },
+    ];
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 0);
+    assert.equal(out.claimLineUpdates[0].lineStatus, 'paid');
+  });
+
   it('evaluates every CAS adjustment while excluding patient responsibility', () => {
     const input = matchedScenario({ contractRate: 125, paid: 80 });
     input.remitLines[0].adjustments = [
@@ -229,6 +266,32 @@ describe('step 3: variance detection', () => {
     const out = runEngine(input);
     assert.equal(out.casesCreated.length, 0);
     assert.equal(out.claimLineUpdates[0].paidAmount, 125);
+  });
+
+  it('retains patient responsibility from an earlier remit when a supplement omits it', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 60 });
+    input.remitLines[0].patientResponsibility = 25;
+    input.remitLines[0].checkDate = '2026-06-20';
+    input.remitLines.push(remitLine({
+      remittanceId: 'remittance-2', payerClaimNumber: 'ICN-1', paidAmount: 10,
+      patientResponsibility: null, checkDate: '2026-06-26',
+    }));
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 1);
+    assert.equal(out.casesCreated[0].expectedAmount, 100);
+    assert.equal(out.casesCreated[0].paidAmount, 70);
+    assert.equal(out.casesCreated[0].recoveryOpportunity, 30);
+  });
+
+  it('does not add an already-processed remittance to cumulative cash again', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 80 });
+    input.claims[0].lines[0].paidAmount = 80;
+    input.remitLines[0].previouslyProcessed = true;
+    input.remitLines[0].patientResponsibility = 0;
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 1);
+    assert.equal(out.casesCreated[0].paidAmount, 80);
+    assert.equal(out.casesCreated[0].recoveryOpportunity, 45);
   });
 
   it('variance > $25 creates an underpayment case', () => {
@@ -285,6 +348,15 @@ describe('step 3: variance detection', () => {
     assert.equal(out.casesCreated.length, 1);
     assert.equal(out.casesCreated[0].caseType, 'authorization');
     assert.equal(out.casesCreated[0].denialReasonCode, 'CO-197');
+  });
+
+  it('caps a denial opportunity at the documented rate when patient responsibility is unknown', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 0, carc: '197', group: 'CO' });
+    input.remitLines[0].patientResponsibility = null;
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 1);
+    assert.equal(out.casesCreated[0].expectedAmount, 125);
+    assert.equal(out.casesCreated[0].recoveryOpportunity, 125);
   });
 
   it('CO-45 (contractual) with full payment does not create a case', () => {

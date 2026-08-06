@@ -17,6 +17,7 @@ import type { Session } from './auth.ts';
 import { hashPassword } from './auth.ts';
 import type { Scope } from './queries.ts';
 import { encryptSecret, isEncrypted, validatePassword } from '../security/crypto.ts';
+import { validateContractDraft } from '../contracts/validation.ts';
 
 const num = (v: unknown): number => (v == null ? 0 : Number(v));
 const r2 = (n: number) => Math.round(n * 100) / 100;
@@ -311,7 +312,10 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
     `SELECT client_id, client_name, tax_id, npi_group, specialty, state, address,
             timezone, nightly_run_time::text AS nightly_run_time, ingest_folder,
             status, subscription_status, features, baa_acknowledged_at,
-            recovery_alert_threshold, appeal_review_threshold, contract_effective_date
+            recovery_alert_threshold, appeal_review_threshold, contract_effective_date,
+            (SELECT cmc.medicare_locality FROM client_medicare_config cmc
+             WHERE cmc.tenant_id = client.tenant_id
+               AND cmc.client_id = client.client_id) AS medicare_locality
      FROM client WHERE client_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
     [clientId, s.tenantId]);
   if (!c.rows[0]) throw err('client not found', 404);
@@ -331,6 +335,7 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
 
   const contracts = await db.query(
     `SELECT ct.contract_id, ct.effective_date, ct.expiration_date, ct.fee_schedule_type,
+            ct.status, ct.validation_report, ct.approved_at,
             py.payer_name,
             (SELECT count(*)::int FROM contract_line l
              WHERE l.contract_id = ct.contract_id AND l.deleted_at IS NULL) AS lines
@@ -367,6 +372,7 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
       baaAcknowledgedAt: when(r.baa_acknowledged_at),
       alertThreshold: r.recovery_alert_threshold == null ? null : num(r.recovery_alert_threshold),
       reviewThreshold: r.appeal_review_threshold == null ? null : num(r.appeal_review_threshold),
+      medicareLocality: r.medicare_locality,
     },
     payers: payers.rows.map((p) => ({
       payerId: p.payer_id, name: p.payer_name, type: p.payer_type, code: p.payer_id_code,
@@ -380,7 +386,8 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
     contracts: contracts.rows.map((x) => ({
       contractId: x.contract_id, payerName: x.payer_name,
       effectiveDate: iso(x.effective_date), expirationDate: iso(x.expiration_date),
-      feeScheduleType: x.fee_schedule_type, lines: x.lines,
+      feeScheduleType: x.fee_schedule_type, lines: x.lines, status: x.status,
+      validationReport: x.validation_report ?? [], approvedAt: when(x.approved_at),
     })),
     documents: docs.rows.map((d) => ({
       documentId: d.document_id, type: d.document_type, fileName: d.file_name,
@@ -429,12 +436,32 @@ export async function updateClientSettings(
     params.push(JSON.stringify(input.address));
     sets.push(`address = $${params.length}::jsonb`);
   }
-  if (sets.length === 0) return { ok: true, updated: 0 };
-  await db.query(
-    `UPDATE client SET ${sets.join(', ')} WHERE client_id = $1 AND tenant_id = $2`, params);
+  if (sets.length > 0) {
+    await db.query(
+      `UPDATE client SET ${sets.join(', ')} WHERE client_id = $1 AND tenant_id = $2`, params);
+  }
+  let localityUpdated = 0;
+  if ('medicareLocality' in input) {
+    const locality = String(input.medicareLocality ?? '').trim();
+    if (locality) {
+      await db.query(
+        `INSERT INTO client_medicare_config (tenant_id, client_id, medicare_locality)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (client_id) DO UPDATE SET
+           medicare_locality = EXCLUDED.medicare_locality,
+           tenant_id = EXCLUDED.tenant_id`,
+        [s.tenantId, clientId, locality]);
+    } else {
+      await db.query(
+        `DELETE FROM client_medicare_config WHERE client_id = $1 AND tenant_id = $2`,
+        [clientId, s.tenantId]);
+    }
+    localityUpdated = 1;
+  }
+  if (sets.length === 0 && localityUpdated === 0) return { ok: true, updated: 0 };
   await adminAudit(db, sess, 'client_settings_updated', 'client', clientId,
     { fields: Object.keys(input) });
-  return { ok: true, updated: sets.length };
+  return { ok: true, updated: sets.length + localityUpdated };
 }
 
 export async function setClientFeature(
@@ -534,33 +561,132 @@ export async function createTenantPayer(
 }
 
 export async function createContract(
-  db: Queryable, sess: Session, s: Scope, clientId: UUID,
+  pool: PoolLike, sess: Session, s: Scope, clientId: UUID,
   input: { payerId: UUID; effectiveDate: string; expirationDate?: string | null;
            feeScheduleType: string;
            lines?: Array<{ procedureCode: string; modifier?: string | null;
                            allowedAmount?: number | null; percentOfMedicare?: number | null }> },
 ) {
   assertClientAccess(sess, s, clientId);
-  if (!input.payerId || !input.effectiveDate) throw err('payer and effective date required', 400);
-  const inserted = await db.query(
-    `INSERT INTO contract (tenant_id, client_id, payer_id, effective_date, expiration_date,
-                           fee_schedule_type)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING contract_id`,
-    [s.tenantId, clientId, input.payerId, input.effectiveDate,
-     input.expirationDate ?? null, input.feeScheduleType ?? 'fee_schedule']);
-  const contractId: UUID = inserted.rows[0].contract_id;
-  for (const l of input.lines ?? []) {
-    if (!l.procedureCode) continue;
-    await db.query(
-      `INSERT INTO contract_line (tenant_id, contract_id, procedure_code, modifier,
-                                  allowed_amount, percent_of_medicare)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [s.tenantId, contractId, l.procedureCode, l.modifier ?? null,
-       l.allowedAmount ?? null, l.percentOfMedicare ?? null]);
+  const validation = validateContractDraft({ ...input, lines: input.lines ?? [] });
+  if (!validation.valid) {
+    throw err(`contract validation failed: ${validation.issues
+      .filter((x) => x.severity === 'error').map((x) => `${x.code}${x.line ? ` line ${x.line}` : ''}: ${x.message}`)
+      .join('; ')}`, 400);
   }
-  await adminAudit(db, sess, 'contract_created', 'contract', contractId,
-    { clientId, lines: (input.lines ?? []).length });
-  return { ok: true, contractId };
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    await db.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [s.tenantId]);
+    const d = validation.normalized;
+    const inserted = await db.query(
+      `INSERT INTO contract (tenant_id, client_id, payer_id, effective_date, expiration_date,
+                             fee_schedule_type, status, validation_report)
+       VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7) RETURNING contract_id`,
+      [s.tenantId, clientId, d.payerId, d.effectiveDate,
+       d.expirationDate ?? null, d.feeScheduleType, JSON.stringify(validation.issues)]);
+    const contractId: UUID = inserted.rows[0].contract_id;
+    for (const l of d.lines) {
+      await db.query(
+        `INSERT INTO contract_line (tenant_id, contract_id, procedure_code, modifier,
+                                    allowed_amount, percent_of_medicare, effective_date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [s.tenantId, contractId, l.procedureCode, l.modifier ?? null,
+         l.allowedAmount ?? null, l.percentOfMedicare ?? null, l.effectiveDate ?? null]);
+    }
+    await adminAudit(db, sess, 'contract_created', 'contract', contractId,
+      { clientId, lines: d.lines.length, status: 'draft' });
+    await db.query('COMMIT');
+    return { ok: true, contractId, status: 'draft', validation: validation.issues };
+  } catch (cause) {
+    await db.query('ROLLBACK').catch(() => {});
+    throw cause;
+  } finally {
+    db.release();
+  }
+}
+
+export async function activateContract(
+  pool: PoolLike, sess: Session, s: Scope, clientId: UUID, contractId: UUID,
+) {
+  assertClientAccess(sess, s, clientId);
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    await db.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [s.tenantId]);
+    const contract = await db.query(
+      `SELECT contract_id, payer_id, effective_date, expiration_date, fee_schedule_type
+       FROM contract WHERE contract_id = $1 AND client_id = $2 AND tenant_id = $3
+         AND deleted_at IS NULL FOR UPDATE`, [contractId, clientId, s.tenantId]);
+    if (!contract.rows[0]) throw err('contract not found', 404);
+    const lines = await db.query(
+      `SELECT procedure_code, modifier, allowed_amount, percent_of_medicare, effective_date
+       FROM contract_line WHERE contract_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+      [contractId, s.tenantId]);
+    const c = contract.rows[0];
+    const validation = validateContractDraft({
+      payerId: c.payer_id, effectiveDate: iso(c.effective_date)!,
+      expirationDate: iso(c.expiration_date), feeScheduleType: c.fee_schedule_type,
+      lines: lines.rows.map((l) => ({
+        procedureCode: l.procedure_code, modifier: l.modifier,
+        allowedAmount: l.allowed_amount == null ? null : Number(l.allowed_amount),
+        percentOfMedicare: l.percent_of_medicare == null ? null : Number(l.percent_of_medicare),
+        effectiveDate: iso(l.effective_date),
+      })),
+    });
+    if (validation.normalized.feeScheduleType === 'percent_of_medicare') {
+      const client = await db.query(
+        `SELECT medicare_locality FROM client_medicare_config
+         WHERE client_id = $1 AND tenant_id = $2`,
+        [clientId, s.tenantId]);
+      const locality = client.rows[0]?.medicare_locality;
+      if (!locality) {
+        validation.issues.push({
+          severity: 'error', code: 'medicare_locality_required',
+          message: 'client Medicare locality must be configured from the current CMS ZIP-to-locality file before activation',
+        });
+      } else {
+        for (let index = 0; index < validation.normalized.lines.length; index++) {
+          const line = validation.normalized.lines[index];
+          const coverage = await db.query(
+            `SELECT count(DISTINCT m.service_setting)::int AS settings
+             FROM medicare_fee_schedule m
+             JOIN reference_dataset rd ON rd.dataset_id = m.dataset_id
+             WHERE m.procedure_code = $1 AND (m.modifier = $2 OR m.modifier IS NULL)
+               AND m.locality = $3 AND m.effective_year = EXTRACT(YEAR FROM $4::date)
+               AND rd.dataset_kind = 'medicare_pfs'`,
+            [line.procedureCode, line.modifier, locality, validation.normalized.effectiveDate]);
+          if (Number(coverage.rows[0]?.settings) < 2) {
+            validation.issues.push({
+              severity: 'error', code: 'medicare_rate_missing', line: index + 1,
+              message: `versioned CMS facility and nonfacility rates are required for ${line.procedureCode}${line.modifier ? `-${line.modifier}` : ''}, locality ${locality}`,
+            });
+          }
+        }
+      }
+    }
+    if (validation.issues.some((x) => x.severity === 'error')) {
+      await db.query(`UPDATE contract SET status = 'rejected', validation_report = $2
+                      WHERE contract_id = $1`, [contractId, JSON.stringify(validation.issues)]);
+      await adminAudit(db, sess, 'contract_rejected', 'contract', contractId,
+        { clientId, errors: validation.issues.filter((x) => x.severity === 'error') });
+      await db.query('COMMIT');
+      return { ok: false, contractId, status: 'rejected', validation: validation.issues };
+    }
+    await db.query(
+      `UPDATE contract SET status = 'active', validation_report = $2,
+                           approved_by = $3, approved_at = now()
+       WHERE contract_id = $1`, [contractId, JSON.stringify(validation.issues), sess.userId]);
+    await adminAudit(db, sess, 'contract_activated', 'contract', contractId,
+      { clientId, warnings: validation.issues.filter((x) => x.severity === 'warning') });
+    await db.query('COMMIT');
+    return { ok: true, contractId, status: 'active', validation: validation.issues };
+  } catch (cause) {
+    await db.query('ROLLBACK').catch(() => {});
+    throw cause;
+  } finally {
+    db.release();
+  }
 }
 
 // ============================================================================
