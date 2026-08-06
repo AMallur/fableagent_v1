@@ -46,8 +46,8 @@ jobs:
 
       - name: Test Optum authentication
         env:
-          OPTUM_CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          OPTUM_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          OPTUM_CLIENT_ID: ${{ secrets.OPTUM_CLIENT_ID }}
+          OPTUM_CLIENT_SECRET: ${{ secrets.OPTUM_CLIENT_SECRET }}
           OPTUM_TOKEN_URL: ${{ inputs.token_url }}
           OPTUM_TOKEN_AUTH_MODE: ${{ inputs.token_auth_mode }}
           OPTUM_API_BASE_URL: ${{ inputs.api_base_url }}
