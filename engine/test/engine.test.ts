@@ -350,6 +350,15 @@ describe('step 3: variance detection', () => {
     assert.equal(out.casesCreated[0].denialReasonCode, 'CO-197');
   });
 
+  it('caps a denial opportunity at the documented rate when patient responsibility is unknown', () => {
+    const input = matchedScenario({ contractRate: 125, paid: 0, carc: '197', group: 'CO' });
+    input.remitLines[0].patientResponsibility = null;
+    const out = runEngine(input);
+    assert.equal(out.casesCreated.length, 1);
+    assert.equal(out.casesCreated[0].expectedAmount, 125);
+    assert.equal(out.casesCreated[0].recoveryOpportunity, 125);
+  });
+
   it('CO-45 (contractual) with full payment does not create a case', () => {
     const input = matchedScenario({ contractRate: 125, paid: 125, carc: '45', group: 'CO' });
     const out = runEngine(input);

@@ -67,6 +67,11 @@ export function candidatesFromDenials(
     ) || false;
     const cls = classifyDenial(normalizedCode, { siblingLinePaid });
     const paid = remitLine.paidAmount ?? claimLine.paidAmount ?? 0;
+    // If line-level patient responsibility is unavailable, the precise payer
+    // liability is unknown. Still surface the denial, but cap its opportunity
+    // at the documented contract/reference expectation instead of inflating
+    // it to the billed charge.
+    const expectedBasis = route.expectedPayerAmount ?? pricing.expectedAmount;
 
     return {
       matched,
@@ -77,10 +82,10 @@ export function candidatesFromDenials(
       recommendedAction: cls.recommendedAction,
       supportingDocuments: cls.supportingDocuments,
       knownCode: cls.known,
-      expectedAmount: route.expectedPayerAmount,
+      expectedAmount: expectedBasis,
       paidAmount: paid,
       recoveryOpportunity: recoveryAmount(
-        route.expectedPayerAmount, remitLine.allowedAmount ?? claimLine.allowedAmount,
+        expectedBasis, remitLine.allowedAmount ?? claimLine.allowedAmount,
         claimLine.billedAmount, paid,
       ),
       deadlineDate: appealDeadline(input, matched),
