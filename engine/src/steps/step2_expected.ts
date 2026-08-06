@@ -53,12 +53,33 @@ function byEffectiveDateDesc(a: ContractLineInput, b: ContractLineInput): number
 
 function medicareRate(
   rates: Record<string, number>, procedureCode: string, modifiers: string[],
+  locality: string | undefined, placeOfService: string | null | undefined,
 ): number | null {
+  const setting = medicareServiceSetting(placeOfService);
+  if (locality && setting) {
+    for (const m of modifiers) {
+      const detailed = rates[`${procedureCode}|${m}|${locality}|${setting}`];
+      if (detailed != null) return detailed;
+    }
+    const genericDetailed = rates[`${procedureCode}||${locality}|${setting}`];
+    if (genericDetailed != null) return genericDetailed;
+  }
+  // Compatibility for manually seeded/test data only. Versioned imports are
+  // not exposed under these keys, so missing locality/POS fails closed.
   for (const m of modifiers) {
     const withMod = rates[`${procedureCode}|${m}`];
     if (withMod != null) return withMod;
   }
   return rates[`${procedureCode}|`] ?? null;
+}
+
+/** Pilot-safe CMS PFS setting map. POS 11 is the supported nonfacility office
+ * setting; the listed facility settings are hospital/ER/ASC/SNF sites. Other
+ * POS values fail closed until their payment-setting rule is configured. */
+function medicareServiceSetting(pos: string | null | undefined): 'facility' | 'nonfacility' | null {
+  if (pos === '11') return 'nonfacility';
+  if (pos && new Set(['19', '21', '22', '23', '24', '31']).has(pos)) return 'facility';
+  return null;
 }
 
 export function priceClaimLine(
@@ -75,7 +96,8 @@ export function priceClaimLine(
     );
     if (cl) {
       if (contract.feeScheduleType === 'percent_of_medicare' && cl.percentOfMedicare != null) {
-        const rate = medicareRate(input.medicareRates, line.procedureCode, line.modifiers);
+        const rate = medicareRate(input.medicareRates, line.procedureCode, line.modifiers,
+          input.medicareLocalityByClient[claim.clientId], claim.placeOfService);
         if (rate != null) {
           return {
             claimId: claim.claimId, claimLineId: line.claimLineId,
@@ -95,7 +117,8 @@ export function priceClaimLine(
     }
     // contract exists but no usable line rate: proxy-price, still flagged
     // no_contract=false (a contract IS on file; the fee schedule has a gap)
-    const proxy = medicareRate(input.medicareRates, line.procedureCode, line.modifiers);
+    const proxy = medicareRate(input.medicareRates, line.procedureCode, line.modifiers,
+      input.medicareLocalityByClient[claim.clientId], claim.placeOfService);
     return {
       claimId: claim.claimId, claimLineId: line.claimLineId,
       expectedAmount: proxy != null ? round2(proxy * units) : null,
@@ -105,7 +128,8 @@ export function priceClaimLine(
   }
 
   // no contract at all -> Medicare proxy, flagged no_contract
-  const proxy = medicareRate(input.medicareRates, line.procedureCode, line.modifiers);
+  const proxy = medicareRate(input.medicareRates, line.procedureCode, line.modifiers,
+    input.medicareLocalityByClient[claim.clientId], claim.placeOfService);
   return {
     claimId: claim.claimId, claimLineId: line.claimLineId,
     expectedAmount: proxy != null ? round2(proxy * units) : null,

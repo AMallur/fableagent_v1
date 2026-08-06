@@ -76,14 +76,15 @@ export function listConnectors(): Array<{ name: string; kind: string }> {
 
 registerConnector(new StubConnector('waystar', 'clearinghouse', 'Waystar'));
 registerConnector(new StubConnector('availity', 'clearinghouse', 'Availity'));
-registerConnector(new StubConnector('change_healthcare', 'clearinghouse', 'Change Healthcare'));
+registerConnector(new StubConnector('change_healthcare', 'clearinghouse', 'Optum / Change Healthcare'));
 registerConnector(new StubConnector('payer_portal', 'payer_portal', 'Payer portal'));
 registerConnector(new StubConnector('pm_writeback', 'pm_writeback', 'PM/EHR write-back'));
 
 const CLEARINGHOUSE_ALIASES: Record<string, string> = {
   waystar: 'waystar', availity: 'availity',
   change: 'change_healthcare', 'change healthcare': 'change_healthcare',
-  changehealthcare: 'change_healthcare',
+  changehealthcare: 'change_healthcare', optum: 'change_healthcare',
+  'optum medical network': 'change_healthcare',
 };
 
 // ---------------------------------------------------------------------------

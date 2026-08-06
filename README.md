@@ -3,6 +3,10 @@
 > Before using live PHI or enabling external delivery, complete the
 > [production release gates](docs/PRODUCTION_READINESS.md).
 
+For a first customer, use the [commercial shadow-pilot runbook](docs/PILOT_RUNBOOK.md),
+the [external reference-data contract](docs/REFERENCE_DATA.md), and the
+[AWS deployment](infra/aws/README.md).
+
 Claims processing, recovery detection, and appeal automation for the RCM
 platform. Runs against the schema in [../db](../db).
 

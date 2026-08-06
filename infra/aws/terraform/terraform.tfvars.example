@@ -1,0 +1,19 @@
+aws_region         = "us-east-1"
+project_name       = "fableagent"
+environment        = "pilot"
+app_image_uri      = "123456789012.dkr.ecr.us-east-1.amazonaws.com/fableagent-runtime@sha256:..."
+migration_image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/fableagent-migrate@sha256:..."
+certificate_arn    = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+
+# Existing Secrets Manager secrets. Expected JSON shapes are documented in
+# ../README.md; secret VALUES must never be checked into Terraform variables.
+runtime_db_password_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fableagent/runtime-db-..."
+session_secret_arn             = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fableagent/session-..."
+data_encryption_key_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fableagent/data-key-..."
+smtp_secret_arn                = ""
+alarm_topic_arn                = ""
+secret_kms_key_arns            = ["arn:aws:kms:us-east-1:123456789012:key/..."]
+
+# First apply: false. Run the one-shot migration task and verify it succeeded.
+# Second apply: true to start the app and scheduler.
+services_enabled = false

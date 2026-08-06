@@ -69,8 +69,10 @@ describe('full pipeline: ingest -> detect -> appeal -> queue', { skip: !url && '
                                 portal_url, appeal_address, timely_filing_limit_days, appeal_deadline_days)
              VALUES ($1, 'United Commercial', 'commercial', '87726',
                      'https://portal.example.com', 'PO Box 100, Hartford, CT 06101', 90, 180)`, [P]);
-    await q(`INSERT INTO contract (tenant_id, client_id, payer_id, effective_date, fee_schedule_type)
-             VALUES ($1, $2, $3, '2026-01-01', 'fee_schedule') RETURNING contract_id`, [T, C, P])
+    await q(`INSERT INTO contract (tenant_id, client_id, payer_id, effective_date, fee_schedule_type,
+                                   status, approved_at)
+             VALUES ($1, $2, $3, '2026-01-01', 'fee_schedule', 'active', now())
+             RETURNING contract_id`, [T, C, P])
       .then(({ rows }: any) => q(
         `INSERT INTO contract_line (tenant_id, contract_id, procedure_code, allowed_amount)
          VALUES ($1, $2, '99213', 125.00), ($1, $2, '99214', 185.00)`, [T, rows[0].contract_id]));

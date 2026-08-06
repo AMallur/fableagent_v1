@@ -123,7 +123,7 @@ engine/src/
 │   ├── letter.ts          # appeal letter generator, one body per category (pure)
 │   ├── corrected_claim.ts # CO-4/5/6 corrections with confidence scoring (pure)
 │   ├── assembly.ts        # document plan, ready/draft, auto-submit/review (pure)
-│   ├── storage.ts         # DocumentStore (filesystem impl; swap for S3 later)
+│   ├── storage.ts         # DocumentStore (filesystem, GCS, and S3 implementations)
 │   ├── context.ts         # Postgres -> AppealCaseContext[]
 │   ├── service.ts         # generateAppealPackets: packets + documents + links
 │   └── queue.ts           # submission queue + document/packet retrieval
@@ -189,7 +189,7 @@ transaction, and completes the job row with stats and the JSON summary in
 ## Tests
 
 ```sh
-npm test                                      # 105 unit tests, all pure logic
+npm test                                      # unit/regression tests (current count printed by runner)
 TEST_DATABASE_URL=postgres://... npm run test:integration   # 159 tests, real Postgres
 ```
 
@@ -237,6 +237,16 @@ ST/SE transaction sets per 835 file (one remittance per check), CLP/NM1/
 DTM/SVC/CAS/AMT/LQ for 835, HL/SBR/CLM/HI/REF/SV1/DTP for 837P. CSV
 remittance exports parse with header aliasing, quoted fields, US dates, and
 per-line error reporting.
+Database ingestion additionally requires complete ISA/IEA and GS/GE envelopes,
+the supported CMS 5010 implementation version, matching transaction controls,
+and recovery-critical segments. The fragment-level parsers remain tolerant for
+diagnostic use, but incomplete or unsupported files cannot be committed.
+
+**Reference data.** `reference-import` loads strict canonical CSV for CMS PFS,
+CMS NCCI PTP, and X12 CARC/RARC. Imports are versioned and SHA-256 tracked.
+Percent-of-Medicare contracts require explicit CMS locality plus versioned
+facility/nonfacility coverage before activation; no address or vendor-column
+guessing is performed.
 
 **Outbound (Phase-2 hooks).** `src/integration/connectors.ts` defines the
 OutboundConnector interface with a registry: Waystar/Availity/Change

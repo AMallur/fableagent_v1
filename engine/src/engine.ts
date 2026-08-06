@@ -104,7 +104,10 @@ function aggregateMatchedLines(
       (a.remitLine.checkDate ?? '').localeCompare(b.remitLine.checkDate ?? ''))
       .at(-1)!;
     const priorPaid = latest.claimLine.paidAmount ?? 0;
-    const newPaid = group.reduce((sum, m) => sum + (m.remitLine.paidAmount ?? 0), 0);
+    const newPaid = group.reduce(
+      (sum, m) => sum + (m.remitLine.previouslyProcessed ? 0 : (m.remitLine.paidAmount ?? 0)),
+      0,
+    );
     // Payment is cumulative, but adjustment and patient-liability context
     // comes from the latest adjudication so an older denial does not remain
     // active after a supplemental payment resolves it.
@@ -120,12 +123,12 @@ function aggregateMatchedLines(
           amount: 0,
         }]
         : []);
-    const latestPatientAmounts = latestEntries
-      .map((m) => m.remitLine.patientResponsibility)
-      .filter((v): v is number => v != null);
-    const patientResponsibility = latestPatientAmounts.length
-      ? roundMoney(latestPatientAmounts.reduce((sum, value) => sum + value, 0))
-      : latest.claimLine.patientResponsibility ?? null;
+    // Patient responsibility is an adjudication snapshot, not a cumulative
+    // cash amount. Prefer the newest remit that supplies line-level PR; a
+    // supplemental remit is allowed to omit PR without erasing an earlier
+    // value received in this run or persisted on the claim line.
+    const patientResponsibility = newestPatientResponsibility(group)
+      ?? latest.claimLine.patientResponsibility ?? null;
     return {
       ...latest,
       remitLine: {
@@ -136,6 +139,25 @@ function aggregateMatchedLines(
       },
     };
   });
+}
+
+function newestPatientResponsibility(
+  group: ReturnType<typeof runMatching>['matchedLines'],
+): number | null {
+  const byRemittance = new Map<string, typeof group>();
+  for (const matched of group) {
+    const id = matched.remitLine.remittanceId;
+    if (!byRemittance.has(id)) byRemittance.set(id, []);
+    byRemittance.get(id)!.push(matched);
+  }
+  const newestFirst = [...byRemittance.values()].sort((a, b) =>
+    (b[0].remitLine.checkDate ?? '').localeCompare(a[0].remitLine.checkDate ?? ''));
+  for (const entries of newestFirst) {
+    const amounts = entries.map((m) => m.remitLine.patientResponsibility)
+      .filter((v): v is number => v != null);
+    if (amounts.length) return roundMoney(amounts.reduce((sum, value) => sum + value, 0));
+  }
+  return null;
 }
 
 function roundMoney(value: number): number {

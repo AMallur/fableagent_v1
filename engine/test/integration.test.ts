@@ -83,8 +83,9 @@ describe('detection service against Postgres', { skip: !url && 'TEST_DATABASE_UR
              VALUES ($1, $2, $3, '1111111111', 'Dr. IT')`, [PROV, T, C]);
     await q(`INSERT INTO patient (patient_id, tenant_id, client_id, mrn, first_name, last_name, insurance_id_primary)
              VALUES ($1, $2, $3, 'IT-MRN', 'Ida', 'Test', 'MEM-IT-1')`, [PAT, T, C]);
-    await q(`INSERT INTO contract (contract_id, tenant_id, client_id, payer_id, effective_date, fee_schedule_type)
-             VALUES ($1, $2, $3, $4, '2026-01-01', 'fee_schedule')`, [CT, T, C, P]);
+    await q(`INSERT INTO contract (contract_id, tenant_id, client_id, payer_id, effective_date,
+                                   fee_schedule_type, status, approved_at)
+             VALUES ($1, $2, $3, $4, '2026-01-01', 'fee_schedule', 'active', now())`, [CT, T, C, P]);
     await q(`INSERT INTO contract_line (tenant_id, contract_id, procedure_code, allowed_amount)
              VALUES ($1, $2, '99213', 125.00)`, [T, CT]);
     await q(`INSERT INTO client_payer_config (tenant_id, client_id, payer_id, autopilot_enabled)

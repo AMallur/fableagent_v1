@@ -73,6 +73,7 @@ export interface ClaimInput {
   claimNumberInternal: string;
   claimNumberPayer?: string | null;
   dateOfServiceStart: ISODate;         // denormalized from encounter
+  placeOfService?: string | null;
   submissionDate?: ISODate | null;
   claimStatus: ClaimStatus;
   authorizationNumber?: string | null; // denormalized from encounter
@@ -101,6 +102,9 @@ export interface RemitLineInput {
   remarkCode?: string | null;          // RARC
   claimId?: UUID | null;               // pre-linked (already matched earlier)
   claimLineId?: UUID | null;
+  /** True when this exact remittance line was processed in an earlier run.
+   * Reprocessing may refresh a case, but must never add its cash twice. */
+  previouslyProcessed?: boolean;
 }
 
 export interface RemitAdjustmentInput {
@@ -173,8 +177,11 @@ export interface EngineInput {
   claims: ClaimInput[];
   remitLines: RemitLineInput[];
   contracts: ContractInput[];
-  /** key: `${procedureCode}|${modifier ?? ''}` (falls back to `${code}|`) */
+  /** Imported key: `${code}|${modifier}|${locality}|${facility|nonfacility}`.
+   * Legacy/test fixtures may provide `${code}|${modifier}`. */
   medicareRates: Record<string, number>;
+  /** Explicit CMS locality per client; never inferred from address text. */
+  medicareLocalityByClient: Record<UUID, string>;
   existingCases: ExistingCaseInput[];
   winRates: WinRateInput[];
   clientPayerConfigs: ClientPayerConfigInput[];
