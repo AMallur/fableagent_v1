@@ -19,10 +19,31 @@ CREATE TABLE reference_dataset (
   UNIQUE (dataset_kind, version, scope)
 );
 
--- CMS PFS rates are locality-specific. A client must be mapped explicitly;
--- the engine does not infer a locality from a ZIP code without the current
+-- CMS PFS rates are locality-specific. Keep this pilot configuration in its
+-- own tenant-scoped table: client is deliberately owned by the restricted
+-- pre-tenant catalog role after 0019 and must not be altered by runtime
+-- migrations. The engine does not infer locality from ZIP without the current
 -- CMS ZIP-to-locality crosswalk.
-ALTER TABLE client ADD COLUMN medicare_locality text;
+CREATE TABLE client_medicare_config (
+  client_id         uuid PRIMARY KEY,
+  tenant_id         uuid NOT NULL,
+  medicare_locality text NOT NULL CHECK (btrim(medicare_locality) <> ''),
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (tenant_id, client_id)
+    REFERENCES client (tenant_id, client_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_client_medicare_config_tenant
+  ON client_medicare_config (tenant_id);
+CREATE TRIGGER trg_client_medicare_config_updated_at
+  BEFORE UPDATE ON client_medicare_config
+  FOR EACH ROW EXECUTE FUNCTION app.set_updated_at();
+
+ALTER TABLE client_medicare_config ENABLE ROW LEVEL SECURITY;
+ALTER TABLE client_medicare_config FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON client_medicare_config FOR ALL
+  USING (tenant_id = app.current_tenant_id())
+  WITH CHECK (tenant_id = app.current_tenant_id());
 
 ALTER TABLE medicare_fee_schedule
   ADD COLUMN service_setting text NOT NULL DEFAULT 'nonfacility'
@@ -73,5 +94,7 @@ GRANT SELECT ON reference_dataset, remittance_code_reference, ncci_ptp_edit
 GRANT SELECT, INSERT, UPDATE, DELETE
   ON reference_dataset, remittance_code_reference, ncci_ptp_edit
   TO CURRENT_USER, rcm_service;
+GRANT SELECT, INSERT, UPDATE, DELETE ON client_medicare_config
+  TO CURRENT_USER, rcm_app, rcm_service;
 
 COMMIT;

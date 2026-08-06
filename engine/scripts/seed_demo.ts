@@ -117,17 +117,21 @@ await q(`INSERT INTO tenant (tenant_id, tenant_name, tenant_type, subscription_t
            subscription_tier = EXCLUDED.subscription_tier, enforce_mfa = EXCLUDED.enforce_mfa,
            status = 'active', deleted_at = NULL, updated_at = now()`, [T]);
 await q(`INSERT INTO client (client_id, tenant_id, client_name, tax_id, npi_group, specialty, state,
-                             address, recovery_alert_threshold, appeal_review_threshold, medicare_locality)
+                             address, recovery_alert_threshold, appeal_review_threshold)
          VALUES ($1, $2, 'Alpha Orthopedic Group', '74-1234567', '1234567890', 'orthopedics', 'TX',
                  '{"line1":"100 Main St, Suite 400","city":"Austin","state":"TX","zip":"78701"}',
-                 25000, 4000, 'DEMO')
+                 25000, 4000)
          ON CONFLICT (client_id) DO UPDATE SET
            client_name = EXCLUDED.client_name, tax_id = EXCLUDED.tax_id, npi_group = EXCLUDED.npi_group,
            specialty = EXCLUDED.specialty, state = EXCLUDED.state, address = EXCLUDED.address,
            recovery_alert_threshold = EXCLUDED.recovery_alert_threshold,
            appeal_review_threshold = EXCLUDED.appeal_review_threshold,
-           medicare_locality = EXCLUDED.medicare_locality,
            status = 'active', deleted_at = NULL, updated_at = now()`, [C, T]);
+await q(`INSERT INTO client_medicare_config (tenant_id, client_id, medicare_locality)
+         VALUES ($1, $2, 'DEMO')
+         ON CONFLICT (client_id) DO UPDATE SET
+           tenant_id = EXCLUDED.tenant_id,
+           medicare_locality = EXCLUDED.medicare_locality`, [T, C]);
 
 const userIds: string[] = [];
 for (const [email, first, last, role] of USERS) {

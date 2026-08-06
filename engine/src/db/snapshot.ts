@@ -189,9 +189,11 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
   }
 
   const localityRows = await db.query(
-    `SELECT c.client_id, c.medicare_locality
-     FROM client c WHERE c.tenant_id = $1 ${clientFilter}
-       AND c.medicare_locality IS NOT NULL`, params);
+    `SELECT c.client_id, cmc.medicare_locality
+     FROM client c
+     JOIN client_medicare_config cmc
+       ON cmc.tenant_id = c.tenant_id AND cmc.client_id = c.client_id
+     WHERE c.tenant_id = $1 ${clientFilter}`, params);
   const medicareLocalityByClient: Record<string, string> = {};
   for (const r of localityRows.rows) medicareLocalityByClient[r.client_id] = r.medicare_locality;
 

@@ -313,7 +313,9 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
             timezone, nightly_run_time::text AS nightly_run_time, ingest_folder,
             status, subscription_status, features, baa_acknowledged_at,
             recovery_alert_threshold, appeal_review_threshold, contract_effective_date,
-            medicare_locality
+            (SELECT cmc.medicare_locality FROM client_medicare_config cmc
+             WHERE cmc.tenant_id = client.tenant_id
+               AND cmc.client_id = client.client_id) AS medicare_locality
      FROM client WHERE client_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
     [clientId, s.tenantId]);
   if (!c.rows[0]) throw err('client not found', 404);
@@ -420,7 +422,7 @@ export async function updateClientSettings(
     name: 'client_name', taxId: 'tax_id', npiGroup: 'npi_group', specialty: 'specialty',
     state: 'state', timezone: 'timezone', nightlyRunTime: 'nightly_run_time',
     alertThreshold: 'recovery_alert_threshold', reviewThreshold: 'appeal_review_threshold',
-    ingestFolder: 'ingest_folder', medicareLocality: 'medicare_locality',
+    ingestFolder: 'ingest_folder',
   };
   const sets: string[] = [];
   const params: unknown[] = [clientId, s.tenantId];
@@ -434,12 +436,32 @@ export async function updateClientSettings(
     params.push(JSON.stringify(input.address));
     sets.push(`address = $${params.length}::jsonb`);
   }
-  if (sets.length === 0) return { ok: true, updated: 0 };
-  await db.query(
-    `UPDATE client SET ${sets.join(', ')} WHERE client_id = $1 AND tenant_id = $2`, params);
+  if (sets.length > 0) {
+    await db.query(
+      `UPDATE client SET ${sets.join(', ')} WHERE client_id = $1 AND tenant_id = $2`, params);
+  }
+  let localityUpdated = 0;
+  if ('medicareLocality' in input) {
+    const locality = String(input.medicareLocality ?? '').trim();
+    if (locality) {
+      await db.query(
+        `INSERT INTO client_medicare_config (tenant_id, client_id, medicare_locality)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (client_id) DO UPDATE SET
+           medicare_locality = EXCLUDED.medicare_locality,
+           tenant_id = EXCLUDED.tenant_id`,
+        [s.tenantId, clientId, locality]);
+    } else {
+      await db.query(
+        `DELETE FROM client_medicare_config WHERE client_id = $1 AND tenant_id = $2`,
+        [clientId, s.tenantId]);
+    }
+    localityUpdated = 1;
+  }
+  if (sets.length === 0 && localityUpdated === 0) return { ok: true, updated: 0 };
   await adminAudit(db, sess, 'client_settings_updated', 'client', clientId,
     { fields: Object.keys(input) });
-  return { ok: true, updated: sets.length };
+  return { ok: true, updated: sets.length + localityUpdated };
 }
 
 export async function setClientFeature(
@@ -614,7 +636,8 @@ export async function activateContract(
     });
     if (validation.normalized.feeScheduleType === 'percent_of_medicare') {
       const client = await db.query(
-        `SELECT medicare_locality FROM client WHERE client_id = $1 AND tenant_id = $2`,
+        `SELECT medicare_locality FROM client_medicare_config
+         WHERE client_id = $1 AND tenant_id = $2`,
         [clientId, s.tenantId]);
       const locality = client.rows[0]?.medicare_locality;
       if (!locality) {
