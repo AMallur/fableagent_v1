@@ -215,6 +215,12 @@ export function buildProfessionalClaimSubmission(
  * developer.optum.com/eligibilityandclaims/reference/claimstatus:
  * controlNumber, tradingPartnerServiceId, providers[].npi,
  * subscriber.memberId, encounter.beginningDateOfService.
+ *
+ * providers[0].taxId is required too — confirmed by a live sandbox 400
+ * ("Billing provider requires either etin or taxId", field
+ * providers[0].validBillingProvider) the first time this was tried without
+ * it. Sourced from the submission's billing.employerId, the same TIN this
+ * connector already sends on the original ClaimSubmissionRequest.
  */
 export function buildClaimStatusCheck(
   claimRequest: Record<string, unknown>, opts: { controlNumber: string },
@@ -228,7 +234,7 @@ export function buildClaimStatusCheck(
   return {
     controlNumber: opts.controlNumber,
     tradingPartnerServiceId: claimRequest.tradingPartnerServiceId,
-    providers: [{ providerType: 'BillingProvider', npi: billing?.npi }],
+    providers: [{ providerType: 'BillingProvider', npi: billing?.npi, taxId: billing?.employerId }],
     subscriber: {
       memberId: subscriber?.memberId,
       firstName: subscriber?.firstName,

@@ -112,7 +112,7 @@ describe('buildClaimStatusCheck', () => {
 
     assert.equal(check.controlNumber, '000000002');
     assert.equal(check.tradingPartnerServiceId, '9496');
-    assert.deepEqual(check.providers, [{ providerType: 'BillingProvider', npi: '1760854442' }]);
+    assert.deepEqual(check.providers, [{ providerType: 'BillingProvider', npi: '1760854442', taxId: '123456789' }]);
 
     const subscriber = check.subscriber as Record<string, unknown>;
     assert.equal(subscriber.memberId, 'MEM0001');
