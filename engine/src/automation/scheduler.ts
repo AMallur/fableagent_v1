@@ -6,6 +6,8 @@
 //   * nightly processing   at client.nightly_run_time
 //   * deadline monitor     at 07:00
 //   * digest emails        at 07:15 (daily users; weekly users on Monday)
+//   * delivery reconciliation at 09:00 (change_healthcare 'sent' deliveries
+//     not yet reconciled — see optum_reconciliation.ts)
 //   * weekly summary       Monday at 08:00
 // and drains the email outbox every tick. Each job is guarded against
 // double-running by an atomic PostgreSQL scheduler lease shared by replicas.
@@ -19,7 +21,7 @@ import type { PoolLike } from '../service.ts';
 import type { DocumentStore } from '../appeals/storage.ts';
 import { FileSystemDocumentStore } from '../appeals/storage.ts';
 import {
-  runDeadlineMonitor, runNightlyProcessing, runWeeklySummary,
+  runDeadlineMonitor, runDeliveryReconciliation, runNightlyProcessing, runWeeklySummary,
 } from './jobs.ts';
 import { deliverOutbox, sendDigests, LogTransport, type EmailTransport } from './notify.ts';
 import { sweepAllFolders } from '../integration/sweep.ts';
@@ -89,6 +91,7 @@ export interface TickReport {
   nightly: UUID[];       // client ids run
   monitors: UUID[];
   weeklies: UUID[];
+  deliveryReconciliations: UUID[];
   digestsSent: number;
   emailsDelivered: number;
   filesIngested: number;
@@ -103,8 +106,8 @@ export async function schedulerTick(
   const transport = deps.transport ?? new LogTransport();
   const log = deps.log ?? (() => {});
   const report: TickReport = {
-    nightly: [], monitors: [], weeklies: [], digestsSent: 0, emailsDelivered: 0,
-    filesIngested: 0,
+    nightly: [], monitors: [], weeklies: [], deliveryReconciliations: [],
+    digestsSent: 0, emailsDelivered: 0, filesIngested: 0,
   };
 
   // SFTP-drop sweep: every tick, so files land within a minute of arriving
@@ -142,6 +145,16 @@ export async function schedulerTick(
           });
         });
         if (ran) report.monitors.push(c.client_id);
+        }
+
+      // 9am clearinghouse delivery reconciliation — after nightly/deadline
+      // so anything submitted overnight has had time to reach the payer
+        if (clock.time >= '09:00') {
+        const ran = await runClaimed(pool, c.tenant_id, c.client_id, 'reconcile_deliveries', 20, async () => {
+          log(`delivery reconciliation: ${c.client_name}`);
+          await runDeliveryReconciliation(pool, { tenantId: c.tenant_id, clientId: c.client_id });
+        });
+        if (ran) report.deliveryReconciliations.push(c.client_id);
         }
 
       // Monday weekly summary

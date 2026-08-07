@@ -5,6 +5,7 @@
 //   node src/cli.ts detect        --tenant <uuid> [--client <uuid>] [--as-of D] [--dry-run]
 //   node src/cli.ts appeals       --tenant <uuid> [--client <uuid>] [--as-of D]
 //   node src/cli.ts queue         --tenant <uuid> [--client <uuid>]
+//   node src/cli.ts reconcile-deliveries --tenant <uuid> [--client <uuid>]
 //   node src/cli.ts ingest-835    --tenant <uuid> --client <uuid> --file <path>
 //   node src/cli.ts ingest-837    --tenant <uuid> --client <uuid> --file <path>
 //   node src/cli.ts reference-import --kind <kind> --version <version> --file <path>
@@ -21,8 +22,8 @@ import path from 'node:path';
 
 const [command, ...rest] = process.argv.slice(2);
 const COMMANDS = ['detect', 'appeals', 'queue', 'ingest-835', 'ingest-837',
-  'schedule', 'nightly', 'monitor', 'reconcile', 'weekly', 'sftp-server', 'create-tenant',
-  'reference-import'];
+  'schedule', 'nightly', 'monitor', 'reconcile', 'reconcile-deliveries', 'weekly',
+  'sftp-server', 'create-tenant', 'reference-import'];
 
 if (!command || !COMMANDS.includes(command)) {
   console.error(`usage: node src/cli.ts <${COMMANDS.join('|')}> --tenant <uuid> [options]`);
@@ -244,6 +245,15 @@ try {
     case 'reconcile': {
       const { runPaymentReconciliation } = await import('./automation/jobs.ts');
       const out = await runPaymentReconciliation(runtimePool, {
+        tenantId: values.tenant, clientId: values.client,
+      });
+      console.log(JSON.stringify(out, null, 2));
+      break;
+    }
+
+    case 'reconcile-deliveries': {
+      const { runDeliveryReconciliation } = await import('./automation/jobs.ts');
+      const out = await runDeliveryReconciliation(runtimePool, {
         tenantId: values.tenant, clientId: values.client,
       });
       console.log(JSON.stringify(out, null, 2));
