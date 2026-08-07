@@ -13,12 +13,15 @@
 //
 // Wired into the scheduler via runDeliveryReconciliation
 // (automation/jobs.ts), which schedulerTick runs once per client per day
-// at 09:00 local time (automation/scheduler.ts). That wiring has NOT yet
-// been exercised against the real sandbox claim-status endpoint — only
-// submission/validation have been live-tested so far — so treat the
-// classification logic as code-reviewed and unit-tested, not field-proven,
-// until a real sandbox run confirms the response shape matches what
-// buildClaimStatusCheck/lookupClaimStatusCategory expect.
+// at 09:00 local time (automation/scheduler.ts).
+//
+// Field-verified against the live Optum sandbox (not just unit-tested): a
+// real /medicalnetwork/claimstatus/v2/ call returned
+// claims[].claimStatus.statusCategoryCode = "F1" with
+// statusCategoryCodeValue "Finalized/Payment-The claim/line has been
+// paid." — an exact match, word for word, to the ECL 507 description in
+// x12_claim_status_codes.ts. Confirms both the response shape this module
+// parses and the code table it classifies against.
 // ============================================================================
 
 import type { UUID } from '../types.ts';
