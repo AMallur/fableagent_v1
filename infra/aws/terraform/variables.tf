@@ -84,3 +84,17 @@ variable "alarm_topic_arn" {
   default     = ""
   description = "Optional SNS topic ARN for operational alarms"
 }
+variable "deploy_paid_infrastructure" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Gates every resource that bills by the hour regardless of traffic: the NAT
+    gateway (+ its EIP and private-subnet default route), the RDS instance,
+    and the ALB (+ target group and listeners). Leave false for the first
+    apply and for any period with no paying customer — that apply creates
+    only free-until-used resources (VPC, S3, KMS, ECR-adjacent IAM, ECS
+    cluster/task definitions, CloudWatch log groups). Flip to true, apply,
+    then run the migration task and set services_enabled=true once you need
+    the app actually running.
+  EOT
+}

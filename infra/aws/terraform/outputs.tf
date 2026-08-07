@@ -1,5 +1,5 @@
 output "load_balancer_dns_name" {
-  value = aws_lb.app.dns_name
+  value = try(aws_lb.app[0].dns_name, null)
 }
 output "document_bucket" {
   value = aws_s3_bucket.documents.id
@@ -8,10 +8,10 @@ output "document_kms_key_arn" {
   value = aws_kms_key.phi.arn
 }
 output "rds_endpoint" {
-  value = aws_db_instance.postgres.address
+  value = try(aws_db_instance.postgres[0].address, null)
 }
 output "rds_admin_secret_arn" {
-  value     = aws_db_instance.postgres.master_user_secret[0].secret_arn
+  value     = try(aws_db_instance.postgres[0].master_user_secret[0].secret_arn, null)
   sensitive = true
 }
 output "ecs_cluster_arn" {
