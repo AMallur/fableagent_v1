@@ -92,18 +92,22 @@ export type ProfessionalClaimsPath =
   | '/medicalnetwork/professionalclaims/v3/validation'
   | '/medicalnetwork/professionalclaims/v3/submission';
 
+/** confirmed from developer.optum.com/eligibilityandclaims/reference/claimstatus */
+export const CLAIM_STATUS_PATH = '/medicalnetwork/claimstatus/v2/';
+
 /**
- * POSTs a professional-claims request with a bounded number of retries.
- * Only transient failures (network errors, 408/429/5xx) are retried, with
- * exponential backoff; a 4xx content rejection returns immediately with
- * ok: false so the caller can record it as a permanent failure rather than
- * loop forever on data the payer/clearinghouse will never accept as-is.
+ * Shared POST with a bounded number of retries. Only transient failures
+ * (network errors, 408/429/5xx) are retried, with exponential backoff; a
+ * 4xx content rejection returns immediately with ok: false so the caller
+ * can record it as a permanent failure rather than loop forever on data
+ * the payer/clearinghouse will never accept as-is.
  *
  * traceId is sent as x-chng-trace-id, letting Optum correlate retried
- * attempts of the same logical submission (pass the packet's idempotencyKey).
+ * attempts of the same logical request (pass the packet's idempotencyKey
+ * for submissions; any stable per-check id is fine for status lookups).
  */
-export async function submitProfessionalClaim(
-  path: ProfessionalClaimsPath,
+async function postOptum(
+  path: string,
   payload: Record<string, unknown>,
   opts: { traceId?: string; maxAttempts?: number; fetchImpl?: typeof fetch } = {},
 ): Promise<SubmitResult> {
@@ -143,6 +147,28 @@ export async function submitProfessionalClaim(
     if (attempt < maxAttempts) await sleep(2 ** attempt * 250); // 500ms, 1s, 2s, ...
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+export async function submitProfessionalClaim(
+  path: ProfessionalClaimsPath,
+  payload: Record<string, unknown>,
+  opts: { traceId?: string; maxAttempts?: number; fetchImpl?: typeof fetch } = {},
+): Promise<SubmitResult> {
+  return postOptum(path, payload, opts);
+}
+
+/**
+ * Checks a previously-submitted claim's adjudication status (276/277
+ * equivalent). Used for post-submission reconciliation — confirming a
+ * 'sent' outbound_delivery actually reached and was accepted/paid/denied
+ * by the payer, per the acknowledgement-reconciliation gate in
+ * docs/PRODUCTION_READINESS.md.
+ */
+export async function checkClaimStatus(
+  payload: Record<string, unknown>,
+  opts: { traceId?: string; maxAttempts?: number; fetchImpl?: typeof fetch } = {},
+): Promise<SubmitResult> {
+  return postOptum(CLAIM_STATUS_PATH, payload, opts);
 }
 
 /** test-only: the access-token cache is module-level state, so tests need a way to reset it */

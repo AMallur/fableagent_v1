@@ -18,6 +18,7 @@ import type { UUID } from '../types.ts';
 import type { PoolLike } from '../service.ts';
 import type { Queryable } from '../db/snapshot.ts';
 import { loadOptumConfig, submitProfessionalClaim } from './optum_client.ts';
+import { buildProfessionalClaimSubmission, loadClaimSubmissionBundle } from './optum_mapping.ts';
 
 export interface ConnectorContext {
   tenantId: UUID;
@@ -103,10 +104,23 @@ class ChangeHealthcareConnector implements OutboundConnector {
       };
     }
 
+    const claimRequest = payload.claimRequest as Record<string, unknown> | undefined;
+    if (!claimRequest) {
+      return {
+        status: 'failed',
+        detail: {
+          message: 'no claimRequest was built for this packet — see loadClaimSubmissionBundle/'
+            + 'buildProfessionalClaimSubmission in optum_mapping.ts for why (missing encounter '
+            + 'diagnosis codes or claim lines are the two known causes)',
+          permanent: true,
+        },
+      };
+    }
+
     const traceId = typeof payload.idempotencyKey === 'string' ? payload.idempotencyKey : undefined;
     try {
       const result = await submitProfessionalClaim(
-        '/medicalnetwork/professionalclaims/v3/submission', payload, { traceId },
+        '/medicalnetwork/professionalclaims/v3/submission', claimRequest, { traceId },
       );
       const body = result.body as { claimReference?: { correlationId?: string }; controlNumber?: string } | undefined;
       if (result.ok) {
@@ -206,7 +220,7 @@ export async function dispatchAppealSubmission(
     }
 
     const rows = await db.query(
-      `SELECT ap.packet_id, ap.case_id, ap.submission_method, rc.client_id,
+      `SELECT ap.packet_id, ap.case_id, ap.submission_method, rc.client_id, rc.claim_id,
               ci.clearinghouse_name, py.portal_url, py.payer_name,
               cl.claim_number_internal
        FROM appeal_packet ap
@@ -239,11 +253,30 @@ export async function dispatchAppealSubmission(
       caseId: p.case_id, packetId: p.packet_id,
       config: { portalUrl: p.portal_url, clearinghouse: p.clearinghouse_name },
     };
+
+    // change_healthcare submits a real 837P claim, not a generic envelope —
+    // build it here so the connector receives wire-ready data (see
+    // optum_mapping.ts for the field mapping and its documented gaps).
+    let claimRequest: Record<string, unknown> | undefined;
+    if (connectorName === 'change_healthcare') {
+      const bundle = await loadClaimSubmissionBundle(db, { tenantId: args.tenantId, claimId: p.claim_id });
+      if (bundle) {
+        try {
+          claimRequest = buildProfessionalClaimSubmission(
+            bundle, { controlNumber: p.packet_id.replaceAll('-', '').slice(0, 9) },
+          );
+        } catch {
+          claimRequest = undefined; // e.g. zero service lines/diagnoses — connector reports this as a permanent failure
+        }
+      }
+    }
+
     const payload = {
       type: 'appeal_packet', packetId: p.packet_id,
       idempotencyKey: `fableagent:appeal:${p.packet_id}`,
       claimNumber: p.claim_number_internal, payer: p.payer_name,
       method: p.submission_method,
+      ...(claimRequest ? { claimRequest } : {}),
     };
     const result = await connector.send(ctx, payload);
     const deliveryId = await recordDelivery(db, ctx, connector, payload, result);
