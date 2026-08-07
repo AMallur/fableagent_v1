@@ -5,3 +5,8 @@ var/
 .env
 .env.*
 !.env.example
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example

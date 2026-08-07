@@ -17,6 +17,8 @@
 import type { UUID } from '../types.ts';
 import type { PoolLike } from '../service.ts';
 import type { Queryable } from '../db/snapshot.ts';
+import { loadOptumConfig, submitProfessionalClaim } from './optum_client.ts';
+import { buildProfessionalClaimSubmission, loadClaimSubmissionBundle } from './optum_mapping.ts';
 
 export interface ConnectorContext {
   tenantId: UUID;
@@ -63,6 +65,85 @@ class StubConnector implements OutboundConnector {
   }
 }
 
+/**
+ * Real Optum / Change Healthcare connector: OAuth2 auth, bounded retry on
+ * transient failures only, and a real payer-side tracking reference.
+ *
+ * Stays in 'not_configured' whenever OPTUM_CLIENT_ID/SECRET are unset (same
+ * safe default as every other connector) AND whenever
+ * OPTUM_ALLOW_LIVE_SUBMISSION is not '1' — matching the pilot go/no-go gate
+ * in docs/PRODUCTION_READINESS.md, which requires manual submission until
+ * this connector's idempotency/ack/retry/reconciliation behavior has been
+ * certified in the target environment. Flipping that env var is a deploy-
+ * time decision, not something this code should default to.
+ */
+class ChangeHealthcareConnector implements OutboundConnector {
+  readonly name = 'change_healthcare';
+  readonly kind = 'clearinghouse' as const;
+
+  async send(_ctx: ConnectorContext, payload: Record<string, unknown>): Promise<ConnectorResult> {
+    if (!loadOptumConfig()) {
+      return {
+        status: 'not_configured',
+        detail: {
+          message: 'Optum / Change Healthcare connector is registered but OPTUM_CLIENT_ID/'
+            + 'OPTUM_CLIENT_SECRET are not set — the submission is recorded and can be '
+            + 'replayed once credentials are configured',
+        },
+      };
+    }
+    if (process.env.OPTUM_ALLOW_LIVE_SUBMISSION !== '1') {
+      return {
+        status: 'not_configured',
+        detail: {
+          message: 'Optum credentials are configured but OPTUM_ALLOW_LIVE_SUBMISSION is not '
+            + 'set to \'1\' — live clearinghouse submission stays disabled until the pilot '
+            + 'go/no-go gate in docs/PRODUCTION_READINESS.md is met',
+          credentialsConfigured: true,
+        },
+      };
+    }
+
+    const claimRequest = payload.claimRequest as Record<string, unknown> | undefined;
+    if (!claimRequest) {
+      return {
+        status: 'failed',
+        detail: {
+          message: 'no claimRequest was built for this packet — see loadClaimSubmissionBundle/'
+            + 'buildProfessionalClaimSubmission in optum_mapping.ts for why (missing encounter '
+            + 'diagnosis codes or claim lines are the two known causes)',
+          permanent: true,
+        },
+      };
+    }
+
+    const traceId = typeof payload.idempotencyKey === 'string' ? payload.idempotencyKey : undefined;
+    try {
+      const result = await submitProfessionalClaim(
+        '/medicalnetwork/professionalclaims/v3/submission', claimRequest, { traceId },
+      );
+      const body = result.body as { claimReference?: { correlationId?: string }; controlNumber?: string } | undefined;
+      if (result.ok) {
+        return {
+          status: 'sent',
+          reference: body?.claimReference?.correlationId ?? body?.controlNumber ?? traceId,
+          detail: { attempts: result.attempts, response: result.body },
+        };
+      }
+      return {
+        status: 'failed',
+        detail: { attempts: result.attempts, httpStatus: result.status, errors: result.body },
+      };
+    } catch (err) {
+      // network/auth exhaustion after retries — transient, safe to replay later
+      return {
+        status: 'failed',
+        detail: { message: err instanceof Error ? err.message : String(err), transient: true },
+      };
+    }
+  }
+}
+
 const REGISTRY = new Map<string, OutboundConnector>();
 export function registerConnector(connector: OutboundConnector): void {
   REGISTRY.set(connector.name, connector);
@@ -76,7 +157,7 @@ export function listConnectors(): Array<{ name: string; kind: string }> {
 
 registerConnector(new StubConnector('waystar', 'clearinghouse', 'Waystar'));
 registerConnector(new StubConnector('availity', 'clearinghouse', 'Availity'));
-registerConnector(new StubConnector('change_healthcare', 'clearinghouse', 'Optum / Change Healthcare'));
+registerConnector(new ChangeHealthcareConnector());
 registerConnector(new StubConnector('payer_portal', 'payer_portal', 'Payer portal'));
 registerConnector(new StubConnector('pm_writeback', 'pm_writeback', 'PM/EHR write-back'));
 
@@ -95,12 +176,16 @@ async function recordDelivery(
   pool: Queryable, ctx: ConnectorContext, connector: OutboundConnector,
   payload: Record<string, unknown>, result: ConnectorResult,
 ): Promise<UUID> {
+  const attempts = typeof (result.detail as { attempts?: unknown } | undefined)?.attempts === 'number'
+    ? (result.detail as { attempts: number }).attempts
+    : 1;
   const inserted = await pool.query(
     `INSERT INTO outbound_delivery
        (tenant_id, client_id, case_id, packet_id, connector, kind, status, detail, attempts)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1) RETURNING delivery_id`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING delivery_id`,
     [ctx.tenantId, ctx.clientId, ctx.caseId, ctx.packetId, connector.name, connector.kind,
-     result.status, JSON.stringify({ payload, result: result.detail ?? {}, reference: result.reference ?? null })]);
+     result.status, JSON.stringify({ payload, result: result.detail ?? {}, reference: result.reference ?? null }),
+     attempts]);
   if (ctx.caseId) {
     await pool.query(
       `INSERT INTO case_action (tenant_id, case_id, action_type, performed_by_system, notes)
@@ -135,7 +220,7 @@ export async function dispatchAppealSubmission(
     }
 
     const rows = await db.query(
-      `SELECT ap.packet_id, ap.case_id, ap.submission_method, rc.client_id,
+      `SELECT ap.packet_id, ap.case_id, ap.submission_method, rc.client_id, rc.claim_id,
               ci.clearinghouse_name, py.portal_url, py.payer_name,
               cl.claim_number_internal
        FROM appeal_packet ap
@@ -168,11 +253,30 @@ export async function dispatchAppealSubmission(
       caseId: p.case_id, packetId: p.packet_id,
       config: { portalUrl: p.portal_url, clearinghouse: p.clearinghouse_name },
     };
+
+    // change_healthcare submits a real 837P claim, not a generic envelope —
+    // build it here so the connector receives wire-ready data (see
+    // optum_mapping.ts for the field mapping and its documented gaps).
+    let claimRequest: Record<string, unknown> | undefined;
+    if (connectorName === 'change_healthcare') {
+      const bundle = await loadClaimSubmissionBundle(db, { tenantId: args.tenantId, claimId: p.claim_id });
+      if (bundle) {
+        try {
+          claimRequest = buildProfessionalClaimSubmission(
+            bundle, { controlNumber: p.packet_id.replaceAll('-', '').slice(0, 9) },
+          );
+        } catch {
+          claimRequest = undefined; // e.g. zero service lines/diagnoses — connector reports this as a permanent failure
+        }
+      }
+    }
+
     const payload = {
       type: 'appeal_packet', packetId: p.packet_id,
       idempotencyKey: `fableagent:appeal:${p.packet_id}`,
       claimNumber: p.claim_number_internal, payer: p.payer_name,
       method: p.submission_method,
+      ...(claimRequest ? { claimRequest } : {}),
     };
     const result = await connector.send(ctx, payload);
     const deliveryId = await recordDelivery(db, ctx, connector, payload, result);

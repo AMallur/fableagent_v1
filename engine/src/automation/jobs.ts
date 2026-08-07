@@ -17,6 +17,7 @@ import type { DocumentStore } from '../appeals/storage.ts';
 import { FileSystemDocumentStore } from '../appeals/storage.ts';
 import { createNotification, notifyRoles } from './notify.ts';
 import { processTrigger } from './rules.ts';
+import { reconcileChangeHealthcareDelivery } from '../integration/optum_reconciliation.ts';
 
 const OPEN_STATUSES = ['open', 'in_progress', 'submitted', 'pending_payer'];
 const r2 = (n: number) => Math.round(n * 100) / 100;
@@ -402,6 +403,55 @@ export async function runPaymentReconciliation(
       }
       return { ...out, recordsProcessed: out.matched };
     });
+}
+
+// ============================================================================
+// OUTBOUND-DELIVERY RECONCILIATION — the acknowledgement-reconciliation
+// half of the change_healthcare certification gate in
+// docs/PRODUCTION_READINESS.md gate 4. Re-checks every 'sent'
+// change_healthcare delivery that hasn't been reconciled yet against
+// Optum's claim-status API (see optum_reconciliation.ts for the
+// classification logic and its X12-code-table source).
+//
+// Bounded to a fixed batch per run (rather than "all of them") so one
+// job invocation can't run unboundedly long against however many
+// deliveries have accumulated — a delivery not yet picked up this run
+// gets picked up on the next scheduled tick.
+// ============================================================================
+
+export interface DeliveryReconciliationResult {
+  checked: number; accepted: number; rejected: number;
+  unclassified: number; skipped: number; recordsProcessed: number;
+}
+
+export async function runDeliveryReconciliation(
+  pool: PoolLike, params: { tenantId: UUID; clientId?: UUID; batchSize?: number },
+): Promise<DeliveryReconciliationResult & { jobId: UUID }> {
+  const batchSize = params.batchSize ?? 50;
+  return jobShell(pool, params.tenantId, params.clientId ?? null, 'reconcile_deliveries', async () => {
+    const rows = await pool.query(
+      `SELECT delivery_id FROM outbound_delivery
+       WHERE tenant_id = $1 AND connector = 'change_healthcare' AND status = 'sent'
+         AND ($2::uuid IS NULL OR client_id = $2)
+         AND NOT (detail ? 'reconciliation')
+       ORDER BY created_at
+       LIMIT $3`,
+      [params.tenantId, params.clientId ?? null, batchSize]);
+
+    const out: DeliveryReconciliationResult = {
+      checked: 0, accepted: 0, rejected: 0, unclassified: 0, skipped: 0, recordsProcessed: 0,
+    };
+    for (const r of rows.rows) {
+      const result = await reconcileChangeHealthcareDelivery(
+        pool, { tenantId: params.tenantId, deliveryId: r.delivery_id },
+      );
+      if (!result) continue;
+      out.checked += 1;
+      out[result.outcome] += 1;
+    }
+    out.recordsProcessed = out.checked;
+    return out;
+  });
 }
 
 // ============================================================================

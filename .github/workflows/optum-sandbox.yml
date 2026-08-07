@@ -20,6 +20,10 @@ on:
         description: "Optional exact sandbox resource path"
         required: false
         type: string
+      test_payload:
+        description: "Optional JSON body to POST to endpoint_path (sandbox test values only, no PHI)"
+        required: false
+        type: string
 
 jobs:
   test-optum:
@@ -46,10 +50,21 @@ jobs:
 
       - name: Test Optum authentication
         env:
-          OPTUM_CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          OPTUM_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          OPTUM_CLIENT_ID: ${{ secrets.OPTUM_CLIENT_ID }}
+          OPTUM_CLIENT_SECRET: ${{ secrets.OPTUM_CLIENT_SECRET }}
           OPTUM_TOKEN_URL: ${{ inputs.token_url }}
           OPTUM_TOKEN_AUTH_MODE: ${{ inputs.token_auth_mode }}
           OPTUM_API_BASE_URL: ${{ inputs.api_base_url }}
           OPTUM_ENDPOINT_PATH: ${{ inputs.endpoint_path }}
+          OPTUM_TEST_PAYLOAD: ${{ inputs.test_payload }}
         run: node scripts/optum_sandbox_explore.ts
+
+      - name: Print raw sandbox response
+        if: always()
+        run: |
+          for f in var/optum_sandbox/response_*.json; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            cat "$f"
+            echo
+          done
