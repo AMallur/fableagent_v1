@@ -9,13 +9,7 @@
 
 import { createHash } from 'node:crypto';
 
-const SENSITIVE_KEY = /(?:^|_)(?:
-  patient|patient_name|first_name|last_name|middle_name|name|dob|birth|gender|sex|
-  member|member_id|subscriber|subscriber_id|insurance_id|mrn|ssn|address|street|
-  city|zip|postal|phone|email|diagnosis|icd|raw_?835|raw_?837|x12|edi|payload|
-  authorization_number|auth_number|claim_request|claim_response|document_body|
-  password|secret|token|api_key|access_key|private_key|credential
-)(?:$|_)/ix;
+const SENSITIVE_KEY = /(?:^|_)(?:patient|patient_name|first_name|last_name|middle_name|dob|birth|gender|sex|member|member_id|subscriber|subscriber_id|insurance_id|mrn|ssn|address|street|city|zip|postal|phone|email|diagnosis|icd|raw_?835|raw_?837|x12|edi|payload|authorization_number|auth_number|claim_request|claim_response|document_body|password|secret|token|api_key|access_key|private_key|credential)(?:$|_)/i;
 
 const ALLOWLIST_KEY = new Set([
   'tenant_id', 'tenantId', 'client_id', 'clientId', 'payer_id', 'payerId',
@@ -24,7 +18,7 @@ const ALLOWLIST_KEY = new Set([
   'file_id', 'fileId', 'correlation_id', 'correlationId', 'trace_id', 'traceId',
   'status', 'kind', 'type', 'operation', 'attempts', 'count', 'duration_ms',
   'http_status', 'httpStatus', 'error_code', 'errorCode', 'service', 'component',
-  'environment', 'version', 'timestamp', 'level', 'message',
+  'environment', 'version', 'timestamp', 'level', 'message', 'payer_name', 'payerName',
 ]);
 
 export interface SafeLogEvent {
