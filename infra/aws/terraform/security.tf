@@ -63,7 +63,10 @@ resource "aws_s3_bucket_policy" "audit_logs" {
       { Sid       = "AWSCloudTrailWrite", Effect = "Allow",
         Principal = { Service = "cloudtrail.amazonaws.com" }, Action = "s3:PutObject",
         Resource  = "${aws_s3_bucket.audit_logs.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*",
-      Condition = { StringEquals = { "s3:x-amz-acl" = "bucket-owner-full-control" } } },
+        Condition = { StringEquals = {
+          "s3:x-amz-acl" = "bucket-owner-full-control",
+          "aws:SourceArn" = "arn:aws:cloudtrail:${var.aws_region}:${data.aws_caller_identity.current.account_id}:trail/${local.name}-trail"
+        } } },
       { Sid       = "AWSConfigAclCheck", Effect = "Allow",
         Principal = { Service = "config.amazonaws.com" }, Action = "s3:GetBucketAcl",
       Resource = aws_s3_bucket.audit_logs.arn },
@@ -81,7 +84,20 @@ resource "aws_cloudtrail" "main" {
   include_global_service_events = true
   is_multi_region_trail         = true
   enable_log_file_validation    = true
-  depends_on                    = [aws_s3_bucket_policy.audit_logs]
+
+  # Management events provide account/infra auditability. S3 data events add
+  # object-level Get/Put/Delete evidence for the PHI documents bucket; these
+  # are not enabled by default on a normal CloudTrail trail.
+  event_selector {
+    read_write_type           = "All"
+    include_management_events = true
+    data_resource {
+      type   = "AWS::S3::Object"
+      values = ["${aws_s3_bucket.documents.arn}/"]
+    }
+  }
+
+  depends_on = [aws_s3_bucket_policy.audit_logs]
 }
 
 resource "aws_guardduty_detector" "main" {
@@ -127,13 +143,8 @@ resource "aws_config_configuration_recorder_status" "main" {
   depends_on = [aws_config_delivery_channel.main]
 }
 
-# A small, deliberately-scoped starting set of managed rules directly
-# relevant to the PHI posture this stack already claims (encrypted storage,
-# no public buckets) — not a full compliance conformance pack. Layer on
-# aws_config_conformance_pack (e.g. the "Operational-Best-Practices-for-HIPAA-Security"
-# sample pack AWS publishes) once there's an actual compliance program with
-# someone assigned to review findings; enabling a large rule set before that
-# just produces noise nobody acts on.
+# Deliberately-scoped managed rules for controls this stack claims. Expand only
+# when there is an operational owner for findings/remediation.
 resource "aws_config_config_rule" "s3_encrypted" {
   name = "${local.name}-s3-bucket-server-side-encryption-enabled"
   source {
@@ -150,6 +161,14 @@ resource "aws_config_config_rule" "s3_public_read_prohibited" {
   }
   depends_on = [aws_config_configuration_recorder.main]
 }
+resource "aws_config_config_rule" "s3_public_write_prohibited" {
+  name = "${local.name}-s3-bucket-public-write-prohibited"
+  source {
+    owner             = "AWS"
+    source_identifier = "S3_BUCKET_PUBLIC_WRITE_PROHIBITED"
+  }
+  depends_on = [aws_config_configuration_recorder.main]
+}
 resource "aws_config_config_rule" "rds_encrypted" {
   name = "${local.name}-rds-storage-encrypted"
   source {
@@ -157,6 +176,30 @@ resource "aws_config_config_rule" "rds_encrypted" {
     source_identifier = "RDS_STORAGE_ENCRYPTED"
   }
   depends_on = [aws_config_configuration_recorder.main]
+}
+resource "aws_config_config_rule" "rds_not_public" {
+  name = "${local.name}-rds-instance-public-access-check"
+  source {
+    owner             = "AWS"
+    source_identifier = "RDS_INSTANCE_PUBLIC_ACCESS_CHECK"
+  }
+  depends_on = [aws_config_configuration_recorder.main]
+}
+resource "aws_config_config_rule" "rds_multi_az" {
+  name = "${local.name}-rds-multi-az-support"
+  source {
+    owner             = "AWS"
+    source_identifier = "RDS_MULTI_AZ_SUPPORT"
+  }
+  depends_on = [aws_config_configuration_recorder.main]
+}
+resource "aws_config_config_rule" "multi_region_cloudtrail" {
+  name = "${local.name}-multi-region-cloudtrail-enabled"
+  source {
+    owner             = "AWS"
+    source_identifier = "MULTI_REGION_CLOUD_TRAIL_ENABLED"
+  }
+  depends_on = [aws_config_configuration_recorder.main, aws_cloudtrail.main]
 }
 
 resource "aws_securityhub_account" "main" {}

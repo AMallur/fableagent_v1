@@ -17,6 +17,7 @@ import type { UUID } from '../types.ts';
 import type { PoolLike } from '../service.ts';
 import { releaseTenantConnection } from '../db/tenant_pool.ts';
 import type { Queryable } from '../db/snapshot.ts';
+import { sanitizeError } from '../security/logging.ts';
 import type { AppealCaseContext, DocumentPlan } from './types.ts';
 import { loadAppealContexts, type AppealScope } from './context.ts';
 import { buildDocumentPlan } from './assembly.ts';
@@ -79,7 +80,20 @@ export async function generateAppealPackets(
     const jobId: UUID = job.rows[0].job_id;
 
     try {
-      const contexts = await loadAppealContexts(client, params);
+      const loadedContexts = await loadAppealContexts(client, params);
+      const contexts: AppealCaseContext[] = [];
+
+      // New clients fail closed until the payer profile explicitly enables the
+      // appeals capability. Existing clients preserve pre-readiness behavior
+      // through app.client_payer_capability_enabled().
+      for (const ctx of loadedContexts) {
+        const gate = await client.query(
+          `SELECT app.client_payer_capability_enabled($1, $2, 'appeals') AS enabled`,
+          [ctx.clientId, ctx.payerId],
+        );
+        if (gate.rows[0]?.enabled === true) contexts.push(ctx);
+      }
+
       const packets: PacketOutcome[] = [];
 
       try {
@@ -118,7 +132,7 @@ export async function generateAppealPackets(
         `UPDATE system_job
          SET status = 'failed', completed_at = now(), errors_count = 1, log_output = $1
          WHERE job_id = $2`,
-        [String(err instanceof Error ? err.stack ?? err.message : err), jobId],
+        [JSON.stringify(sanitizeError(err)), jobId],
       ).catch(() => { /* keep the original error */ });
       throw err;
     }
