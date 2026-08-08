@@ -10,7 +10,7 @@ A production integration should therefore be a configuration-and-validation exer
 
 ## Client/payer configuration model
 
-Every new client defaults to `client.require_payer_activation = true`. Each `client_payer_config` starts in `draft` with detection and appeals disabled. Existing clients/configurations are grandfathered to preserve current behavior when migration `0024_client_payer_readiness.sql` is applied.
+Existing clients remain backward-compatible when migration `0024_client_payer_readiness.sql` is applied. The normal application `createClient()` path creates a client with its BAA acknowledgment in the initial insert; the database marks that client `require_payer_activation = true`. Dev/demo/legacy inserts that do not carry a BAA at creation remain nonblocking unless an operator explicitly enables the gate. Each new `client_payer_config` starts in `draft` with detection and appeals disabled.
 
 Lifecycle:
 
@@ -24,7 +24,7 @@ Each profile has independently gated capabilities:
 - appeal generation/workflow
 - electronic submission
 
-Electronic submission is deliberately the strongest gate. A payer can be fully usable for shadow detection and manual recovery while electronic submission remains disabled.
+The detection snapshot, appeal generation service, and electronic submission dispatcher all enforce the database capability gate. Electronic submission is deliberately the strongest gate: a payer can be usable for shadow detection and reviewed recovery while electronic transmission remains disabled.
 
 ## Standard payer implementation package
 
@@ -99,7 +99,7 @@ It does not claim that a configured external service is actually reachable or ce
 
 `engine/src/security/logging.ts` provides the canonical structured-log redaction layer. Operational logs should use internal UUIDs/correlation IDs instead of patient/member data. Raw X12, patient/member identifiers, diagnosis fields, authorization values, credentials, and long payloads are redacted or fingerprinted before serialization.
 
-This protects CloudWatch/stdout and database job logs only when callers use the helper; new code that emits operational logs should use this layer rather than interpolating request/EDI objects directly.
+Detection and appeal job failures now use this sanitizer before persisting error detail. New code that emits operational logs should use the same layer rather than interpolating request/EDI objects directly.
 
 ## AWS code-ready controls
 
