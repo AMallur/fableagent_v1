@@ -21,6 +21,7 @@ import { runEngine } from './engine.ts';
 import { loadSnapshot, type Queryable } from './db/snapshot.ts';
 import { persistResult, type PersistStats } from './db/persist.ts';
 import { releaseTenantConnection } from './db/tenant_pool.ts';
+import { sanitizeError } from './security/logging.ts';
 
 /** pg.Pool satisfies this. */
 export interface PoolLike extends Queryable {
@@ -109,7 +110,7 @@ export async function runDetectionJob(
           `UPDATE system_job
            SET status = 'failed', completed_at = now(), errors_count = 1, log_output = $1
            WHERE job_id = $2`,
-          [String(err instanceof Error ? err.stack ?? err.message : err), jobId],
+          [JSON.stringify(sanitizeError(err)), jobId],
         ).catch(() => { /* job bookkeeping must not mask the real error */ });
       }
       throw err;
