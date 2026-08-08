@@ -3,18 +3,32 @@
 -- Versioned client/payer implementation readiness and activation gates.
 --
 -- Existing clients/configs remain operational for backwards compatibility.
--- Newly-created clients default to requiring explicit payer activation, and
--- newly-created client_payer_config rows default to draft/disabled until they
--- have validation evidence and an operator activates them.
+-- Real clients created through the normal BAA-acknowledged application path
+-- require explicit payer activation. Dev/demo/legacy inserts without a BAA at
+-- creation remain nonblocking unless an operator explicitly enables the gate.
 -- ============================================================================
 
 BEGIN;
 
--- Existing clients keep the legacy behavior. New clients require payer
--- activation before the readiness layer considers a payer production-ready.
+-- Preserve existing behavior by default. The BEFORE INSERT trigger below
+-- enables activation automatically for the normal createClient() path, which
+-- supplies BAA acknowledgment in the initial INSERT. This also keeps the demo
+-- seed backward-compatible because it attaches its synthetic BAA afterward.
 ALTER TABLE client
   ADD COLUMN require_payer_activation boolean NOT NULL DEFAULT false;
-ALTER TABLE client ALTER COLUMN require_payer_activation SET DEFAULT true;
+
+CREATE OR REPLACE FUNCTION app.default_client_payer_activation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.baa_acknowledged_at IS NOT NULL THEN
+    NEW.require_payer_activation := true;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_client_default_payer_activation
+  BEFORE INSERT ON client
+  FOR EACH ROW EXECUTE FUNCTION app.default_client_payer_activation();
 
 -- Existing payer configurations are treated as grandfathered/active so this
 -- migration does not silently stop current demo or pilot processing.
@@ -38,8 +52,9 @@ SET validated_at = COALESCE(validated_at, created_at),
     activated_at = COALESCE(activated_at, created_at)
 WHERE status = 'active';
 
--- New configurations fail closed. An operator can validate and activate them
--- after the client-specific contract/EDI evidence has been checked.
+-- New configurations fail closed for clients that require activation. Legacy
+-- clients can continue using them because the central capability function
+-- bypasses these fields when require_payer_activation=false.
 ALTER TABLE client_payer_config ALTER COLUMN status SET DEFAULT 'draft';
 ALTER TABLE client_payer_config ALTER COLUMN detection_enabled SET DEFAULT false;
 ALTER TABLE client_payer_config ALTER COLUMN appeals_enabled SET DEFAULT false;
@@ -172,9 +187,9 @@ FROM client_payer_config cpc
 JOIN payer p ON p.payer_id = cpc.payer_id;
 
 -- Central capability gate used by services before enabling production actions.
--- Legacy clients (require_payer_activation=false) preserve prior behavior.
--- SECURITY DEFINER is constrained by the tenant session setting so it cannot
--- become a cross-tenant lookup escape hatch.
+-- Legacy/dev/demo clients (require_payer_activation=false) preserve prior
+-- behavior. SECURITY DEFINER is constrained by the tenant session setting so
+-- it cannot become a cross-tenant lookup escape hatch.
 CREATE OR REPLACE FUNCTION app.client_payer_capability_enabled(
   p_client uuid,
   p_payer uuid,
