@@ -33,6 +33,9 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
   const lookback = scope.claimLookbackDays ?? 400;
 
   // ---- unprocessed remittance lines (with parent remittance context) -------
+  // New clients fail closed until their client/payer profile has explicitly
+  // enabled detection. Legacy clients preserve pre-readiness behavior via the
+  // database capability function.
   const remit = await db.query(
     `SELECT rl.remittance_line_id, rl.remittance_id, r.payer_id, r.check_date,
             rl.payer_claim_number, rl.patient_member_id, rl.date_of_service,
@@ -43,7 +46,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
      FROM remittance_line rl
      JOIN remittance r ON r.remittance_id = rl.remittance_id
      WHERE rl.tenant_id = $1 ${scope.clientId ? 'AND r.client_id = $2' : ''}
-       AND rl.match_method IS NULL`,
+       AND rl.match_method IS NULL
+       AND app.client_payer_capability_enabled(r.client_id, r.payer_id, 'detection')`,
     params,
   );
 
@@ -66,7 +70,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
      WHERE cl.tenant_id = $1 ${clientFilter}
        AND cl.deleted_at IS NULL
        AND cl.claim_status <> 'closed'
-       AND cl.created_at > now() - make_interval(days => ${lookback})`,
+       AND cl.created_at > now() - make_interval(days => ${lookback})
+       AND app.client_payer_capability_enabled(cl.client_id, cl.payer_id, 'detection')`,
     params,
   );
   const claimIds = claims.rows.map((r) => r.claim_id);
@@ -138,7 +143,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
             ct.expiration_date, ct.fee_schedule_type
      FROM contract ct JOIN client c ON c.client_id = ct.client_id
      WHERE ct.tenant_id = $1 ${clientFilter} AND ct.deleted_at IS NULL
-       AND ct.status = 'active'`,
+       AND ct.status = 'active'
+       AND app.client_payer_capability_enabled(ct.client_id, ct.payer_id, 'detection')`,
     params,
   );
   const contractIds = contracts.rows.map((r) => r.contract_id);
