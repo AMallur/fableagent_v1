@@ -34,7 +34,10 @@ customer and trading partner:
 7. Run load, failover, backup/restore and disaster-recovery exercises in the
    target infrastructure.
 8. Complete the organizational HIPAA risk analysis, policies, workforce
-   training, incident response plan and access-review process.
+   training, incident response plan and access-review process. Drafts of
+   all of these live in `compliance/` — see `compliance/README.md` for what
+   still needs to be filled in, signed, and (for the BAA template)
+   attorney-reviewed before they're adopted rather than draft documents.
 9. If lookup-owner roles are provisioned by a separate database administrator,
    grant their migration membership with `INHERIT FALSE` and revoke it after
    migrations. The runtime login must not remain a member of
