@@ -54,9 +54,19 @@ Do not put secret values in `tfvars`: Terraform state retains variable values.
    comment at the top of `terraform/bootstrap/main.tf` for why.
 
 2. Copy `terraform/terraform.tfvars.example` to an untracked `.tfvars` file.
-   Keep `services_enabled = false` for the first apply.
+   Keep `services_enabled = false` and `deploy_paid_infrastructure = false`
+   for the first apply. With both false, `terraform apply` creates only
+   resources that cost nothing until used — VPC, subnets, S3, KMS, IAM, the
+   ECS cluster and task definitions, CloudWatch log groups — and skips every
+   resource that bills by the hour regardless of traffic: the NAT gateway,
+   the RDS instance, and the ALB. There is no live infrastructure to turn off
+   at this point; it was never created.
 3. Run `terraform plan` and `terraform apply` from the `terraform` directory.
-4. Run the migration task on the private subnets:
+4. When you're ready to actually run the app (a paying pilot customer,
+   or a final pre-launch rehearsal), set `deploy_paid_infrastructure = true`
+   and apply again — this creates the NAT gateway, RDS instance, and ALB and
+   starts their hourly billing. Then run the migration task on the private
+   subnets:
 
    ```sh
    aws ecs run-task \
@@ -70,7 +80,8 @@ Do not put secret values in `tfvars`: Terraform state retains variable values.
    CloudWatch log. The task creates/rotates the non-superuser runtime login,
    applies all migrations as that login, and revokes migration-only owner-role
    membership.
-6. Set `services_enabled = true`, apply again, point DNS at the load balancer,
+6. Set `services_enabled = true` (in addition to `deploy_paid_infrastructure
+   = true`), apply again, point DNS at the load balancer,
    and verify `/healthz`, login/MFA, a dry-run detection, and an S3 document
    round trip.
 

@@ -129,8 +129,8 @@ resource "aws_wafv2_web_acl" "app" {
 }
 
 resource "aws_wafv2_web_acl_association" "app" {
-  count        = var.enable_edge_waf ? 1 : 0
-  resource_arn = aws_lb.app.arn
+  count        = var.enable_edge_waf && var.deploy_paid_infrastructure ? 1 : 0
+  resource_arn = aws_lb.app[0].arn
   web_acl_arn  = aws_wafv2_web_acl.app[0].arn
 }
 
@@ -220,6 +220,7 @@ resource "aws_vpc_endpoint" "interface" {
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_targets" {
+  count               = var.deploy_paid_infrastructure ? 1 : 0
   alarm_name          = "${local.name}-alb-unhealthy-targets"
   namespace           = "AWS/ApplicationELB"
   metric_name         = "UnHealthyHostCount"
@@ -231,14 +232,15 @@ resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_targets" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    LoadBalancer = aws_lb.app.arn_suffix
-    TargetGroup  = aws_lb_target_group.app.arn_suffix
+    LoadBalancer = aws_lb.app[0].arn_suffix
+    TargetGroup  = aws_lb_target_group.app[0].arn_suffix
   }
 
   alarm_actions = local.alarm_arns
 }
 
 resource "aws_cloudwatch_metric_alarm" "alb_latency" {
+  count               = var.deploy_paid_infrastructure ? 1 : 0
   alarm_name          = "${local.name}-alb-target-latency"
   namespace           = "AWS/ApplicationELB"
   metric_name         = "TargetResponseTime"
@@ -250,13 +252,14 @@ resource "aws_cloudwatch_metric_alarm" "alb_latency" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    LoadBalancer = aws_lb.app.arn_suffix
+    LoadBalancer = aws_lb.app[0].arn_suffix
   }
 
   alarm_actions = local.alarm_arns
 }
 
 resource "aws_cloudwatch_metric_alarm" "db_freeable_memory" {
+  count               = var.deploy_paid_infrastructure ? 1 : 0
   alarm_name          = "${local.name}-db-freeable-memory"
   namespace           = "AWS/RDS"
   metric_name         = "FreeableMemory"
@@ -268,7 +271,7 @@ resource "aws_cloudwatch_metric_alarm" "db_freeable_memory" {
   treat_missing_data  = "missing"
 
   dimensions = {
-    DBInstanceIdentifier = aws_db_instance.postgres.id
+    DBInstanceIdentifier = aws_db_instance.postgres[0].id
   }
 
   alarm_actions = local.alarm_arns
