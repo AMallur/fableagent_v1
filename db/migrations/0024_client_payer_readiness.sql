@@ -14,9 +14,11 @@ BEGIN;
 -- enables activation automatically for the normal createClient() path, which
 -- supplies BAA acknowledgment in the initial INSERT. This also keeps the demo
 -- seed backward-compatible because it attaches its synthetic BAA afterward.
-ALTER TABLE client
-  ADD COLUMN require_payer_activation boolean NOT NULL DEFAULT false;
-
+--
+-- Migration 0019 deliberately transferred CLIENT ownership to the narrow
+-- rcm_catalog_lookup role. The migration runtime keeps non-inheriting SET ROLE
+-- membership specifically so later schema migrations can alter that table
+-- without restoring a permanent RLS-bypass path.
 CREATE OR REPLACE FUNCTION app.default_client_payer_activation()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -26,9 +28,13 @@ BEGIN
   RETURN NEW;
 END $$;
 
+SET LOCAL ROLE rcm_catalog_lookup;
+ALTER TABLE client
+  ADD COLUMN require_payer_activation boolean NOT NULL DEFAULT false;
 CREATE TRIGGER trg_client_default_payer_activation
   BEFORE INSERT ON client
   FOR EACH ROW EXECUTE FUNCTION app.default_client_payer_activation();
+RESET ROLE;
 
 -- Existing payer configurations are treated as grandfathered/active so this
 -- migration does not silently stop current demo or pilot processing.
