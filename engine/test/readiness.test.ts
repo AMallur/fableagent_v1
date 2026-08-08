@@ -5,6 +5,7 @@ import {
   evaluatePayerReadiness,
   type PayerReadinessFacts,
 } from '../src/integration/readiness.ts';
+import { coreValidationBlockers } from '../src/integration/readiness_admin.ts';
 
 const readyFacts = (overrides: Partial<PayerReadinessFacts> = {}): PayerReadinessFacts => ({
   requireActivation: true,
@@ -83,6 +84,21 @@ test('manual pricing never silently becomes autonomous pricing', () => {
   const out = evaluatePayerReadiness(readyFacts({ pricingMode: 'manual' }));
   assert.equal(out.detection.enabled, true);
   assert.ok(out.detection.warnings.some((v) => v.includes('shadow-only')));
+});
+
+test('core validation identifies every required detection prerequisite', () => {
+  const blockers = coreValidationBlockers(readyFacts({
+    payerMappingValidated: false,
+    edi835Validated: false,
+    referenceDataValidated: false,
+    contractPricingValidated: false,
+    hasActiveContract: false,
+  }));
+  assert.ok(blockers.some((v) => v.includes('payer_mapping')));
+  assert.ok(blockers.some((v) => v.includes('edi_835')));
+  assert.ok(blockers.some((v) => v.includes('reference_data')));
+  assert.ok(blockers.some((v) => v.includes('pricing')));
+  assert.ok(blockers.some((v) => v.includes('contract')));
 });
 
 test('status lifecycle prevents unsafe jumps', () => {
