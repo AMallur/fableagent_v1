@@ -57,6 +57,8 @@ CREATE INDEX idx_cpc_status
 CREATE INDEX idx_cpc_active_capabilities
   ON client_payer_config (client_id, payer_id)
   WHERE status = 'active';
+CREATE UNIQUE INDEX uq_cpc_full_identity
+  ON client_payer_config (tenant_id, client_id, payer_id, config_id);
 
 -- Client-specific aliases let EDI payer names/IDs map to a known payer without
 -- creating duplicate payer rows. This is configuration data, not global truth.
@@ -73,10 +75,11 @@ CREATE TABLE client_payer_alias (
   verified_by   uuid REFERENCES app_user (user_id),
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (client_id, alias_type, alias_value),
   FOREIGN KEY (tenant_id, client_id) REFERENCES client (tenant_id, client_id)
 );
 
+CREATE UNIQUE INDEX uq_client_payer_alias_ci
+  ON client_payer_alias (client_id, alias_type, lower(alias_value));
 CREATE INDEX idx_client_payer_alias_lookup
   ON client_payer_alias (client_id, alias_type, lower(alias_value));
 CREATE INDEX idx_client_payer_alias_payer
@@ -90,7 +93,7 @@ CREATE TABLE client_payer_validation (
   tenant_id        uuid        NOT NULL,
   client_id        uuid        NOT NULL,
   payer_id         uuid        NOT NULL REFERENCES payer (payer_id),
-  config_id        uuid        NOT NULL REFERENCES client_payer_config (config_id),
+  config_id        uuid        NOT NULL,
   validation_type  text        NOT NULL
     CHECK (validation_type IN (
       'edi_835', 'edi_837p', 'payer_mapping', 'contract_pricing',
@@ -108,7 +111,9 @@ CREATE TABLE client_payer_validation (
   performed_by     uuid REFERENCES app_user (user_id),
   performed_at     timestamptz NOT NULL DEFAULT now(),
   created_at       timestamptz NOT NULL DEFAULT now(),
-  FOREIGN KEY (tenant_id, client_id) REFERENCES client (tenant_id, client_id)
+  FOREIGN KEY (tenant_id, client_id) REFERENCES client (tenant_id, client_id),
+  FOREIGN KEY (tenant_id, client_id, payer_id, config_id)
+    REFERENCES client_payer_config (tenant_id, client_id, payer_id, config_id)
 );
 
 CREATE INDEX idx_client_payer_validation_config
@@ -116,9 +121,10 @@ CREATE INDEX idx_client_payer_validation_config
 CREATE INDEX idx_client_payer_validation_client
   ON client_payer_validation (client_id, payer_id, status);
 
--- A database view gives the application/admin UI one stable compatibility
--- matrix surface instead of reimplementing readiness joins in every screen.
-CREATE VIEW client_payer_compatibility AS
+-- A security-invoker view gives the application/admin UI one stable
+-- compatibility matrix surface while preserving the caller's RLS scope.
+CREATE VIEW client_payer_compatibility
+WITH (security_invoker = true) AS
 SELECT
   cpc.tenant_id,
   cpc.client_id,
@@ -153,7 +159,7 @@ SELECT
   EXISTS (
     SELECT 1 FROM client_payer_validation v
     WHERE v.config_id = cpc.config_id
-      AND v.validation_type = 'contract_pricing'
+      AND v.validation_type IN ('contract_pricing', 'historical_claims')
       AND v.status = 'passed'
   ) AS contract_pricing_validated,
   EXISTS (
@@ -167,6 +173,8 @@ JOIN payer p ON p.payer_id = cpc.payer_id;
 
 -- Central capability gate used by services before enabling production actions.
 -- Legacy clients (require_payer_activation=false) preserve prior behavior.
+-- SECURITY DEFINER is constrained by the tenant session setting so it cannot
+-- become a cross-tenant lookup escape hatch.
 CREATE OR REPLACE FUNCTION app.client_payer_capability_enabled(
   p_client uuid,
   p_payer uuid,
@@ -190,7 +198,8 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, app AS $$
     ), false)
   END
   FROM client c
-  WHERE c.client_id = p_client;
+  WHERE c.client_id = p_client
+    AND c.tenant_id = app.current_tenant_id();
 $$;
 
 -- RLS / auditing / grants.
