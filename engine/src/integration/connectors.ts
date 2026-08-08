@@ -222,7 +222,7 @@ export async function dispatchAppealSubmission(
     const rows = await db.query(
       `SELECT ap.packet_id, ap.case_id, ap.submission_method, rc.client_id, rc.claim_id,
               ci.clearinghouse_name, py.portal_url, py.payer_name,
-              cl.claim_number_internal
+              cl.claim_number_internal, cl.payer_id
        FROM appeal_packet ap
        JOIN recovery_case rc ON rc.case_id = ap.case_id
        JOIN claim cl ON cl.claim_id = rc.claim_id
@@ -253,6 +253,34 @@ export async function dispatchAppealSubmission(
       caseId: p.case_id, packetId: p.packet_id,
       config: { portalUrl: p.portal_url, clearinghouse: p.clearinghouse_name },
     };
+
+    // A configured connector is not enough: newly-onboarded clients must also
+    // have this exact client/payer profile activated for electronic submission.
+    // The gate is checked before building a wire payload or making any network
+    // call. Legacy clients preserve their previous behavior through the DB
+    // capability function's backwards-compatible bypass.
+    const capability = await db.query(
+      `SELECT app.client_payer_capability_enabled($1, $2, 'electronic_submission') AS enabled`,
+      [p.client_id, p.payer_id],
+    );
+    if (capability.rows[0]?.enabled !== true) {
+      const blocked: ConnectorResult = {
+        status: 'not_configured',
+        detail: {
+          message: 'electronic submission is not activated for this client/payer; '
+            + 'the packet remains ready for manual/reviewed handling',
+          readinessGate: 'client_payer_electronic_submission',
+        },
+      };
+      const blockedPayload = {
+        type: 'appeal_packet', packetId: p.packet_id,
+        idempotencyKey: `fableagent:appeal:${p.packet_id}`,
+        method: p.submission_method,
+      };
+      const deliveryId = await recordDelivery(db, ctx, connector, blockedPayload, blocked);
+      await db.query('COMMIT');
+      return { deliveryId, connector: connector.name, status: blocked.status };
+    }
 
     // change_healthcare submits a real 837P claim, not a generic envelope —
     // build it here so the connector receives wire-ready data (see
