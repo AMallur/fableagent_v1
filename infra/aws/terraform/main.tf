@@ -14,8 +14,8 @@ locals {
     { name = "AWS_REGION", value = var.aws_region },
     { name = "AWS_DOCUMENT_BUCKET", value = aws_s3_bucket.documents.id },
     { name = "AWS_DOCUMENT_KMS_KEY_ID", value = aws_kms_key.phi.arn },
-    { name = "DB_HOST", value = aws_db_instance.postgres.address },
-    { name = "DB_PORT", value = tostring(aws_db_instance.postgres.port) },
+    { name = "DB_HOST", value = try(aws_db_instance.postgres[0].address, "") },
+    { name = "DB_PORT", value = try(tostring(aws_db_instance.postgres[0].port), "5432") },
     { name = "DB_NAME", value = var.db_name },
     { name = "DB_USER", value = var.runtime_db_user },
     { name = "PGSSLMODE", value = "verify-full" },
@@ -63,11 +63,13 @@ resource "aws_subnet" "private" {
 }
 }
 resource "aws_eip" "nat" {
-  domain = "vpc"
+  count      = var.deploy_paid_infrastructure ? 1 : 0
+  domain     = "vpc"
   depends_on = [aws_internet_gateway.main]
 }
 resource "aws_nat_gateway" "main" {
-    allocation_id = aws_eip.nat.id
+    count         = var.deploy_paid_infrastructure ? 1 : 0
+    allocation_id = aws_eip.nat[0].id
   subnet_id     = aws_subnet.public[0].id
   depends_on    = [aws_internet_gateway.main]
 }
@@ -87,10 +89,15 @@ resource "aws_route_table_association" "public" {
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.main.id
 }
+# No default route while deploy_paid_infrastructure is false — the private
+# subnets stay reachable only via the free S3 gateway endpoint until the NAT
+# gateway is deployed (tasks aren't running yet anyway, gated separately by
+# services_enabled).
 resource "aws_route" "private" {
+    count = var.deploy_paid_infrastructure ? 1 : 0
     route_table_id = aws_route_table.private.id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id = aws_nat_gateway.main.id
+  nat_gateway_id = aws_nat_gateway.main[0].id
 }
 resource "aws_route_table_association" "private" {
     count = 2
@@ -256,6 +263,7 @@ resource "aws_db_parameter_group" "postgres" {
 }
 }
 resource "aws_db_instance" "postgres" {
+    count = var.deploy_paid_infrastructure ? 1 : 0
     identifier = local.name
   engine = "postgres"
   engine_version = "16"
@@ -321,7 +329,7 @@ resource "aws_iam_role_policy" "execution_secrets" {
     { Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = compact([
       var.runtime_db_password_secret_arn, var.session_secret_arn,
       var.data_encryption_key_secret_arn, var.smtp_secret_arn,
-      aws_db_instance.postgres.master_user_secret[0].secret_arn,
+      try(aws_db_instance.postgres[0].master_user_secret[0].secret_arn, ""),
     ]) },
     { Effect = "Allow", Action = ["kms:Decrypt"],
       Resource = concat(var.secret_kms_key_arns, [aws_kms_key.phi.arn]) },
@@ -341,6 +349,7 @@ resource "aws_iam_role_policy" "documents" {
 }
 
 resource "aws_lb" "app" {
+    count = var.deploy_paid_infrastructure ? 1 : 0
     name = substr(local.name, 0, 32)
   internal = false
   load_balancer_type = "application"
@@ -350,6 +359,7 @@ resource "aws_lb" "app" {
   drop_invalid_header_fields = true
 }
 resource "aws_lb_target_group" "app" {
+    count = var.deploy_paid_infrastructure ? 1 : 0
     name = substr("${local.name}-app", 0, 32)
   port = 8787
   protocol = "HTTP"
@@ -365,18 +375,20 @@ resource "aws_lb_target_group" "app" {
 }
 }
 resource "aws_lb_listener" "https" {
-    load_balancer_arn = aws_lb.app.arn
+    count = var.deploy_paid_infrastructure ? 1 : 0
+    load_balancer_arn = aws_lb.app[0].arn
   port = 443
   protocol = "HTTPS"
   ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn = var.certificate_arn
   default_action {
   type = "forward"
-  target_group_arn = aws_lb_target_group.app.arn
+  target_group_arn = aws_lb_target_group.app[0].arn
 }
 }
 resource "aws_lb_listener" "http" {
-    load_balancer_arn = aws_lb.app.arn
+    count = var.deploy_paid_infrastructure ? 1 : 0
+    load_balancer_arn = aws_lb.app[0].arn
   port = 80
   protocol = "HTTP"
   default_action {
@@ -433,12 +445,12 @@ resource "aws_ecs_task_definition" "migration" {
   container_definitions = jsonencode([{ name = "migration", image = var.migration_image_uri, essential = true,
     readonlyRootFilesystem = false,
     environment = [
-      { name = "DB_HOST", value = aws_db_instance.postgres.address }, { name = "DB_PORT", value = "5432" },
-      { name = "DB_NAME", value = var.db_name }, { name = "DB_ADMIN_USER", value = aws_db_instance.postgres.username },
+      { name = "DB_HOST", value = try(aws_db_instance.postgres[0].address, "") }, { name = "DB_PORT", value = "5432" },
+      { name = "DB_NAME", value = var.db_name }, { name = "DB_ADMIN_USER", value = try(aws_db_instance.postgres[0].username, "") },
       { name = "DB_RUNTIME_USER", value = var.runtime_db_user }, { name = "PGSSLMODE", value = "verify-full" },
     ],
     secrets = [
-      { name = "DB_ADMIN_PASSWORD", valueFrom = "${aws_db_instance.postgres.master_user_secret[0].secret_arn}:password::" },
+      { name = "DB_ADMIN_PASSWORD", valueFrom = "${try(aws_db_instance.postgres[0].master_user_secret[0].secret_arn, "")}:password::" },
       { name = "DB_RUNTIME_PASSWORD", valueFrom = "${var.runtime_db_password_secret_arn}:password::" },
     ],
     linuxParameters = { initProcessEnabled = true },
@@ -461,11 +473,14 @@ resource "aws_ecs_service" "app" {
   security_groups = [aws_security_group.tasks.id]
   assign_public_ip = false
 }
-  load_balancer {
-  target_group_arn = aws_lb_target_group.app.arn
-  container_name = "app"
-  container_port = 8787
-}
+  dynamic "load_balancer" {
+    for_each = var.deploy_paid_infrastructure ? [1] : []
+    content {
+      target_group_arn = aws_lb_target_group.app[0].arn
+      container_name    = "app"
+      container_port    = 8787
+    }
+  }
   depends_on = [aws_lb_listener.https]
 }
 resource "aws_ecs_service" "scheduler" {
@@ -503,6 +518,7 @@ resource "aws_appautoscaling_policy" "cpu" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
+    count = var.deploy_paid_infrastructure ? 1 : 0
     alarm_name = "${local.name}-alb-5xx"
   namespace = "AWS/ApplicationELB"
   metric_name = "HTTPCode_Target_5XX_Count"
@@ -511,11 +527,12 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
   evaluation_periods = 1
   threshold = 5
   comparison_operator = "GreaterThanOrEqualToThreshold"
-  dimensions = { LoadBalancer = aws_lb.app.arn_suffix
+  dimensions = { LoadBalancer = aws_lb.app[0].arn_suffix
 }
   alarm_actions = local.alarm_arns
 }
 resource "aws_cloudwatch_metric_alarm" "db_cpu" {
+    count = var.deploy_paid_infrastructure ? 1 : 0
     alarm_name = "${local.name}-db-cpu"
   namespace = "AWS/RDS"
   metric_name = "CPUUtilization"
@@ -524,11 +541,12 @@ resource "aws_cloudwatch_metric_alarm" "db_cpu" {
   evaluation_periods = 3
   threshold = 80
   comparison_operator = "GreaterThanThreshold"
-  dimensions = { DBInstanceIdentifier = aws_db_instance.postgres.id
+  dimensions = { DBInstanceIdentifier = aws_db_instance.postgres[0].id
 }
   alarm_actions = local.alarm_arns
 }
 resource "aws_cloudwatch_metric_alarm" "db_storage" {
+    count = var.deploy_paid_infrastructure ? 1 : 0
     alarm_name = "${local.name}-db-free-storage"
   namespace = "AWS/RDS"
   metric_name = "FreeStorageSpace"
@@ -537,7 +555,7 @@ resource "aws_cloudwatch_metric_alarm" "db_storage" {
   evaluation_periods = 1
   threshold = 10737418240
   comparison_operator = "LessThanThreshold"
-  dimensions = { DBInstanceIdentifier = aws_db_instance.postgres.id
+  dimensions = { DBInstanceIdentifier = aws_db_instance.postgres[0].id
 }
   alarm_actions = local.alarm_arns
 }

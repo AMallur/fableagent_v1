@@ -17,3 +17,8 @@ secret_kms_key_arns            = ["arn:aws:kms:us-east-1:123456789012:key/..."]
 # First apply: false. Run the one-shot migration task and verify it succeeded.
 # Second apply: true to start the app and scheduler.
 services_enabled = false
+
+# false until you actually need the app running (a paying pilot customer, or
+# a final pre-launch rehearsal). Gates every hourly-billed resource: NAT
+# gateway, RDS, ALB. With this false, terraform apply costs ~$0.
+deploy_paid_infrastructure = false
