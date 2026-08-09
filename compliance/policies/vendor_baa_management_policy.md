@@ -6,6 +6,13 @@
 **Owner:** HIPAA Security Officer. **Review cycle:** before onboarding any
 new vendor that can access ePHI, and annually thereafter.
 
+**Relationship to the Vendor/Subprocessor Register:** this document is the
+governing policy. The actual per-vendor tracked register (service owner,
+contract, BAA status, data categories, subprocessors, review dates) lives in
+`technical_standards/08_Vendor_Subprocessor_Register_and_BAA_Tracker.md` —
+that register, not the table in §2 below, is the operational source of
+truth; update it whenever a vendor is added, changed, or offboarded.
+
 ## 1. Policy
 
 1. **No subprocessor touches ePHI without an executed BAA first.** This

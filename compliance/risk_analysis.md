@@ -11,6 +11,13 @@ information held by the covered entity or business associate."
 vendor, or infrastructure change. Track revisions in the changelog at the
 bottom of this document.
 
+**Relationship to the Risk Register:** this document is the narrative
+methodology and point-in-time assessment. The living, individually-tracked
+risk items with IDs, owners, and status are maintained in
+`technical_standards/05_Risk_Register_and_Remediation_Tracker.md` — update
+that register as risks are opened/closed, and revise this narrative
+assessment on the review cycle stated above or after material change.
+
 **Methodology:** This assessment follows the structure of the HHS Office for
 Civil Rights' Security Risk Assessment (SRA) Tool methodology: identify where
 ePHI is created, received, maintained, or transmitted; identify reasonably

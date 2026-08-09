@@ -35,9 +35,12 @@ customer and trading partner:
    target infrastructure.
 8. Complete the organizational HIPAA risk analysis, policies, workforce
    training, incident response plan and access-review process. Drafts of
-   all of these live in `compliance/` — see `compliance/README.md` for what
-   still needs to be filled in, signed, and (for the BAA template)
-   attorney-reviewed before they're adopted rather than draft documents.
+   all of these — plus a deeper technical/operational layer (tenant
+   isolation, secrets management, audit events, AI/LLM PHI-use
+   restrictions, and more) in `compliance/technical_standards/` — live in
+   `compliance/` — see `compliance/README.md` for what still needs to be
+   filled in, signed, and (for the BAA template) attorney-reviewed before
+   they're adopted rather than draft documents.
 9. If lookup-owner roles are provisioned by a separate database administrator,
    grant their migration membership with `INHERIT FALSE` and revoke it after
    migrations. The runtime login must not remain a member of
