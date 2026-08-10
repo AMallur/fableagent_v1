@@ -21,7 +21,7 @@
     "benchmark:pilot": "node scripts/run_pilot_benchmark.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1104.0",
+    "@aws-sdk/client-s3": "^3.1105.0",
     "@google-cloud/storage": "^7.21.0",
     "@node-saml/node-saml": "^5.1.0",
     "nodemailer": "^9.0.3",
