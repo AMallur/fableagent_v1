@@ -97,7 +97,7 @@ jobs:
         working-directory: engine
         run: npm audit --omit=dev --audit-level=high
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
 
       - name: Validate AWS Terraform
         working-directory: infra/aws/terraform
