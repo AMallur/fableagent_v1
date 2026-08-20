@@ -42,6 +42,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
             rl.procedure_code, rl.billed_amount, rl.allowed_amount, rl.paid_amount,
             rl.patient_responsibility, rl.adjustment_group_code,
             rl.adjustment_reason_code, rl.adjustments, rl.remark_code,
+            rl.claim_status_code, rl.is_reversal, rl.adjudicated_procedure_code,
+            rl.paid_units, rl.original_units, rl.payer_recoded,
             rl.claim_id, rl.claim_line_id, rl.matched_at
      FROM remittance_line rl
      JOIN remittance r ON r.remittance_id = rl.remittance_id
@@ -281,6 +283,12 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
       adjustmentGroupCode: r.adjustment_group_code,
       adjustmentReasonCode: r.adjustment_reason_code,
       remarkCode: r.remark_code,
+      claimStatusCode: r.claim_status_code,
+      isReversal: r.is_reversal === true,
+      adjudicatedProcedureCode: r.adjudicated_procedure_code,
+      payerRecoded: r.payer_recoded === true,
+      paidUnits: num(r.paid_units),
+      originalUnits: num(r.original_units),
       claimId: r.claim_id,
       claimLineId: r.claim_line_id,
       previouslyProcessed: r.matched_at != null,

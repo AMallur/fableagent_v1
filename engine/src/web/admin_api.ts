@@ -312,6 +312,7 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
     `SELECT client_id, client_name, tax_id, npi_group, specialty, state, address,
             timezone, nightly_run_time::text AS nightly_run_time, ingest_folder,
             status, subscription_status, features, baa_acknowledged_at,
+            era_balance_policy, era_balance_tolerance,
             recovery_alert_threshold, appeal_review_threshold, contract_effective_date,
             (SELECT cmc.medicare_locality FROM client_medicare_config cmc
              WHERE cmc.tenant_id = client.tenant_id
@@ -373,6 +374,8 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
       alertThreshold: r.recovery_alert_threshold == null ? null : num(r.recovery_alert_threshold),
       reviewThreshold: r.appeal_review_threshold == null ? null : num(r.appeal_review_threshold),
       medicareLocality: r.medicare_locality,
+      eraBalancePolicy: r.era_balance_policy,
+      eraBalanceTolerance: num(r.era_balance_tolerance),
     },
     payers: payers.rows.map((p) => ({
       payerId: p.payer_id, name: p.payer_name, type: p.payer_type, code: p.payer_id_code,
@@ -423,7 +426,25 @@ export async function updateClientSettings(
     state: 'state', timezone: 'timezone', nightlyRunTime: 'nightly_run_time',
     alertThreshold: 'recovery_alert_threshold', reviewThreshold: 'appeal_review_threshold',
     ingestFolder: 'ingest_folder',
+    eraBalancePolicy: 'era_balance_policy', eraBalanceTolerance: 'era_balance_tolerance',
   };
+  // Validated here rather than left to the column CHECK so a bad value is a
+  // 400 the operator can read, not a database error.
+  if ('eraBalancePolicy' in input
+      && !['strict', 'warn'].includes(String(input.eraBalancePolicy))) {
+    throw err("eraBalancePolicy must be 'strict' or 'warn'", 400);
+  }
+  if ('eraBalanceTolerance' in input) {
+    // The column is NOT NULL; a cleared form field means "no tolerance",
+    // which is zero, not null.
+    if (input.eraBalanceTolerance === '' || input.eraBalanceTolerance == null) {
+      input = { ...input, eraBalanceTolerance: 0 };
+    }
+    const tolerance = Number(input.eraBalanceTolerance);
+    if (!Number.isFinite(tolerance) || tolerance < 0 || tolerance > 100) {
+      throw err('eraBalanceTolerance must be between 0 and 100 dollars', 400);
+    }
+  }
   const sets: string[] = [];
   const params: unknown[] = [clientId, s.tenantId];
   for (const [key, col] of Object.entries(fields)) {

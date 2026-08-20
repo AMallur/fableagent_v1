@@ -33,9 +33,11 @@ async function tx<T>(pool: PoolLike, tenantId: UUID, work: (db: Queryable) => Pr
   }
 }
 
-async function ownCase(db: Queryable, s: Scope, caseId: UUID): Promise<{ claim_id: UUID; client_id: UUID }> {
+async function ownCase(
+  db: Queryable, s: Scope, caseId: UUID,
+): Promise<{ claim_id: UUID; claim_line_id: UUID | null; client_id: UUID }> {
   const rows = await db.query(
-    `SELECT claim_id, client_id FROM recovery_case
+    `SELECT claim_id, claim_line_id, client_id FROM recovery_case
      WHERE case_id = $1 AND tenant_id = $2 AND client_id = ANY($3) AND deleted_at IS NULL`,
     [caseId, s.tenantId, s.clientIds],
   );
@@ -423,13 +425,16 @@ export async function manualMatch(
   if (!(input.amount > 0)) throw Object.assign(new Error('amount must be positive'), { status: 400 });
   return tx(pool, s.tenantId, async (db) => {
     const c = await ownCase(db, s, input.caseId);
+    // A human matched this payment, so the attribution basis is their
+    // judgement rather than the reconciler's arithmetic. Recording which one
+    // produced a recovery line is what makes an invoice auditable.
     await db.query(
       `INSERT INTO payment_event
-         (tenant_id, case_id, remittance_id, claim_id, amount_recovered, payment_date,
-          matched_automatically, verified_by_user_id, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8)`,
-      [s.tenantId, input.caseId, input.remittanceId ?? null, c.claim_id,
-       input.amount, input.date, sess.userId, input.notes ?? null],
+         (tenant_id, case_id, claim_line_id, remittance_id, claim_id, amount_recovered,
+          payment_date, matched_automatically, verified_by_user_id, attribution_basis, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8, 'manual', $9)`,
+      [s.tenantId, input.caseId, c.claim_line_id ?? null, input.remittanceId ?? null,
+       c.claim_id, input.amount, input.date, sess.userId, input.notes ?? null],
     );
     if (input.markWon) {
       await db.query(

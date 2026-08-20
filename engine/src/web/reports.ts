@@ -283,6 +283,9 @@ export async function reconciliation(db: Queryable, s: Scope, periodDays = 30) {
   const matched = await db.query(
     `SELECT pe.payment_event_id, pe.case_id, pe.amount_recovered, pe.payment_date,
             pe.matched_automatically, pe.notes,
+            pe.attribution_basis, pe.attribution_scope, pe.pre_appeal_paid,
+            pe.gross_post_appeal_paid, pe.unallocated_paid, pe.reversals_netted,
+            pe.recoupments_netted,
             TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS verified_by,
             cl.claim_number_internal, py.payer_name,
             pat.first_name || ' ' || pat.last_name AS patient_name,
@@ -320,8 +323,57 @@ export async function reconciliation(db: Queryable, s: Scope, periodDays = 30) {
     matched: r.matched,
   }));
 
+  const outOfBalance = await db.query(
+    `SELECT r.remittance_id, r.check_number, r.check_date, r.total_paid,
+            r.balance_variance, r.claim_payment_total, r.provider_adjustment_total,
+            r.balance_detail, py.payer_name
+     FROM remittance r JOIN payer py ON py.payer_id = r.payer_id
+     WHERE r.tenant_id = $1 AND r.client_id = ANY($2)
+       AND r.balance_status = 'out_of_balance'
+       AND r.check_date >= CURRENT_DATE - $3::int
+     ORDER BY r.check_date DESC LIMIT 100`,
+    [s.tenantId, s.clientIds, periodDays]);
+
+  const takebacks = await db.query(
+    `SELECT pa.provider_adjustment_id, pa.reason_code, pa.category, pa.reference_id,
+            pa.amount, pa.claim_id, r.check_number, r.check_date, py.payer_name,
+            cl.claim_number_internal
+     FROM remittance_provider_adjustment pa
+     JOIN remittance r ON r.remittance_id = pa.remittance_id
+     JOIN payer py ON py.payer_id = r.payer_id
+     LEFT JOIN claim cl ON cl.claim_id = pa.claim_id
+     WHERE pa.tenant_id = $1 AND r.client_id = ANY($2)
+       AND pa.category IN ('recoupment', 'forwarding_balance', 'refund', 'penalty')
+       AND r.check_date >= CURRENT_DATE - $3::int
+     ORDER BY r.check_date DESC, pa.amount DESC LIMIT 100`,
+    [s.tenantId, s.clientIds, periodDays]);
+
   return {
     postAppealRemits: rows,
+    // Checks whose own arithmetic does not add up. Only reachable when the
+    // client's balance policy is 'warn' — under 'strict' they never loaded.
+    outOfBalanceChecks: outOfBalance.rows.map((r) => ({
+      remittanceId: r.remittance_id, checkNumber: r.check_number,
+      checkDate: iso(r.check_date), payerName: r.payer_name,
+      totalPaid: num(r.total_paid), variance: num(r.balance_variance),
+      claimPaymentTotal: num(r.claim_payment_total),
+      providerAdjustmentTotal: num(r.provider_adjustment_total),
+      detail: Array.isArray(r.balance_detail)
+        ? r.balance_detail.map((f: any) => String(f.message ?? ''))
+        : [],
+    })),
+    // Provider-level takebacks: cash the payer kept, which never appears on
+    // any claim and so is invisible to claim-level reconciliation.
+    providerTakebacks: takebacks.rows.map((r) => ({
+      providerAdjustmentId: r.provider_adjustment_id,
+      reasonCode: r.reason_code, category: r.category,
+      referenceId: r.reference_id, amount: num(r.amount),
+      checkNumber: r.check_number, checkDate: iso(r.check_date),
+      payerName: r.payer_name,
+      claimNumber: r.claim_number_internal ?? null,
+      matchedToClaim: r.claim_id != null,
+    })),
+    providerTakebackTotal: r2(takebacks.rows.reduce((x, r) => x + num(r.amount), 0)),
     autoMatched: matched.rows.filter((m) => m.matched_automatically).map(mapEvent),
     manualMatched: matched.rows.filter((m) => !m.matched_automatically).map(mapEvent),
     unmatched: rows.filter((r) => !r.matched && r.paid > 0),
@@ -342,6 +394,17 @@ export async function reconciliation(db: Queryable, s: Scope, periodDays = 30) {
       claimNumber: m.claim_number_internal, patientName: m.patient_name,
       payerName: m.payer_name, category: m.category,
       verifiedBy: m.verified_by || null, notes: m.notes,
+      // The arithmetic behind the figure, so a biller (or a customer auditing
+      // an invoice) can see how it was reached rather than take it on trust.
+      attribution: {
+        basis: m.attribution_basis,
+        scope: m.attribution_scope,
+        preAppealPaid: num(m.pre_appeal_paid),
+        grossPostAppealPaid: num(m.gross_post_appeal_paid),
+        unallocatedPaid: num(m.unallocated_paid),
+        reversalsNetted: num(m.reversals_netted),
+        recoupmentsNetted: num(m.recoupments_netted),
+      },
     };
   }
 }

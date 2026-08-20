@@ -12,6 +12,7 @@ import type {
   SkippedCase,
 } from '../types.ts';
 import { moneyGt, round2 } from '../config.ts';
+import type { MatchedLine } from './step1_matching.ts';
 import type { VarianceFlag } from './step3_variance.ts';
 
 const ANOMALY_MIN_LINES = 5;
@@ -37,6 +38,8 @@ export function summarize(
     varianceFlags: VarianceFlag[];
     /** contract-priced lines that were checked, per payer (denominator) */
     pricedLinesByPayer: Map<string, number>;
+    /** newly seen reversal entries (CLP02 = 22) matched to a claim line */
+    reversedLines: MatchedLine[];
   },
 ): RunSummary {
   const { created, updated } = args;
@@ -87,6 +90,35 @@ export function summarize(
     }
   }
 
+  // Reversals: cash the payer took back. They never become recovery cases, so
+  // without an explicit report they would be invisible in a run that otherwise
+  // only counts money owed to the client.
+  const reversedByPayer = new Map<string, { lines: number; amount: number }>();
+  let reversedAmount = 0;
+  const reversedClaimLineIds: string[] = [];
+  for (const m of args.reversedLines) {
+    const amount = Math.abs(m.remitLine.paidAmount ?? 0);
+    reversedAmount = round2(reversedAmount + amount);
+    reversedClaimLineIds.push(m.claimLine.claimLineId);
+    const agg = reversedByPayer.get(m.claim.payerId) ?? { lines: 0, amount: 0 };
+    agg.lines += 1;
+    agg.amount = round2(agg.amount + amount);
+    reversedByPayer.set(m.claim.payerId, agg);
+  }
+  for (const [payerId, agg] of reversedByPayer) {
+    const payer = input.payers.find((p) => p.payerId === payerId);
+    anomalies.push({
+      type: 'payment_reversed',
+      payerId,
+      payerName: payer?.payerName ?? payerId,
+      detail: `${agg.lines} previously paid service line${agg.lines === 1 ? '' : 's'} reversed `
+        + `(CLP02 = 22) totalling $${agg.amount.toFixed(2)} — confirm the replacement `
+        + 'adjudication arrived and reconcile the cash',
+      reversedLines: agg.lines,
+      reversedAmount: agg.amount,
+    });
+  }
+
   // per-client alert when identified recovery exceeds the client's threshold
   const alerts: AlertNotification[] = [];
   const totalByClient = new Map<string, number>();
@@ -116,5 +148,10 @@ export function summarize(
     totalRecoveryOpportunity: total,
     byCategory, byPayer, byPriority,
     anomalies, alerts,
+    reversals: {
+      lines: args.reversedLines.length,
+      amount: reversedAmount,
+      claimLineIds: reversedClaimLineIds,
+    },
   };
 }

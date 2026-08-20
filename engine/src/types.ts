@@ -100,6 +100,20 @@ export interface RemitLineInput {
   adjustmentGroupCode?: string | null; // CO / PR / OA / PI
   adjustmentReasonCode?: string | null;// CARC, e.g. '45'
   remarkCode?: string | null;          // RARC
+  /** CLP02 claim status: 1 processed primary, 4 denied, 22 reversal, ... */
+  claimStatusCode?: string | null;
+  /** CLP02 = 22 — reverses a previously reported payment. Its amounts are
+   * negative, they net against prior cash, and they must never be read as a
+   * fresh adjudication or turned into a recovery case. */
+  isReversal?: boolean;
+  /** SVC01 — the code the payer adjudicated, when it differs from the code we
+   * submitted (which stays in procedureCode so matching still works). */
+  adjudicatedProcedureCode?: string | null;
+  payerRecoded?: boolean;
+  /** SVC05 — units the payer paid. */
+  paidUnits?: number | null;
+  /** SVC07 — units originally submitted, when the payer reported them. */
+  originalUnits?: number | null;
   claimId?: UUID | null;               // pre-linked (already matched earlier)
   claimLineId?: UUID | null;
   /** True when this exact remittance line was processed in an earlier run.
@@ -260,13 +274,17 @@ export interface SkippedCase {
 }
 
 export interface Anomaly {
-  type: 'systemic_underpayment';
+  type: 'systemic_underpayment' | 'payment_reversed';
   payerId: UUID;
   payerName: string;
   detail: string;
-  linesChecked: number;
-  linesUnderpaid: number;
-  totalVariance: number;
+  /** systemic_underpayment only */
+  linesChecked?: number;
+  linesUnderpaid?: number;
+  totalVariance?: number;
+  /** payment_reversed only */
+  reversedLines?: number;
+  reversedAmount?: number;
 }
 
 export interface AlertNotification {
@@ -289,6 +307,14 @@ export interface RunSummary {
   byPriority: Record<string, { count: number; amount: number }>;
   anomalies: Anomaly[];
   alerts: AlertNotification[];
+  /** Payer reversals seen in this run. Reversals take cash back, so they are
+   * reported explicitly rather than being absorbed into the paid totals. */
+  reversals: {
+    lines: number;
+    /** Total reversed cash as a positive number. */
+    amount: number;
+    claimLineIds: UUID[];
+  };
 }
 
 export interface EngineResult {

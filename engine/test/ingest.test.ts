@@ -117,10 +117,12 @@ describe('835 parser', () => {
     assert.equal(l1.paidAmount, 80);
     assert.equal(l1.allowedAmount, 125);
     assert.equal(l1.dateOfService, '2026-06-01');
-    assert.deepEqual(l1.adjustments, [{ groupCode: 'CO', reasonCode: '45', amount: 170 }]);
+    assert.deepEqual(l1.adjustments,
+      [{ groupCode: 'CO', reasonCode: '45', amount: 170, quantity: null }]);
 
     const l2 = era.claims[1].lines[0];
-    assert.deepEqual(l2.adjustments, [{ groupCode: 'CO', reasonCode: '197', amount: 250 }]);
+    assert.deepEqual(l2.adjustments,
+      [{ groupCode: 'CO', reasonCode: '197', amount: 250, quantity: null }]);
   });
 
   it('preserves every adjustment across repeating and multiple CAS segments', () => {
@@ -133,9 +135,9 @@ describe('835 parser', () => {
       'SE*5*0001~',
     ].join('\n'));
     assert.deepEqual(parsed.claims[0].lines[0].adjustments, [
-      { groupCode: 'CO', reasonCode: '45', amount: 100 },
-      { groupCode: 'CO', reasonCode: '97', amount: 25 },
-      { groupCode: 'PR', reasonCode: '2', amount: 45 },
+      { groupCode: 'CO', reasonCode: '45', amount: 100, quantity: null },
+      { groupCode: 'CO', reasonCode: '97', amount: 25, quantity: null },
+      { groupCode: 'PR', reasonCode: '2', amount: 45, quantity: null },
     ]);
   });
 });
@@ -192,7 +194,8 @@ export const FIXTURE_835_MULTI = [
   'NM1*QC*1*DOE*JANE****MI*MEM-1~',
   'SVC*HC:99213*200.00*100.00**1~',
   'DTM*472*20260620~',
-  'SE*8*0001~',
+  'CAS*CO*45*100~',
+  'SE*9*0001~',
   'ST*835*0002~',
   'BPR*I*0.00*C*ACH***01*1*DA*1*1**01*1*DA*1*20260702~',
   'TRN*1*CHK-M-2*1~',
@@ -201,7 +204,7 @@ export const FIXTURE_835_MULTI = [
   'NM1*QC*1*ROE*RIK****MI*MEM-2~',
   'SVC*HC:99214*300.00*0.00**1~',
   'CAS*CO*197*300~',
-  'SE*9*0002~',
+  'SE*10*0002~',
   'GE*2*1~',
   'IEA*1*000000001~',
 ].join('\n');
@@ -237,7 +240,7 @@ describe('835 multi-transaction files', () => {
     assert.equal(remits[1].traceNumber, 'CHK-M-2');
     assert.equal(remits[1].payerName, 'MERIDIAN BLUE');
     assert.deepEqual(remits[1].claims[0].lines[0].adjustments,
-      [{ groupCode: 'CO', reasonCode: '197', amount: 300 }]);
+      [{ groupCode: 'CO', reasonCode: '197', amount: 300, quantity: null }]);
   });
 
   it('single-transaction files still parse as one', () => {

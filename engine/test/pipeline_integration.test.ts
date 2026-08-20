@@ -35,7 +35,8 @@ describe('full pipeline: ingest -> detect -> appeal -> queue', { skip: !url && '
       await q(`SET session_replication_role = replica`);
       for (const table of [
         'appeal_packet_document', 'appeal_packet', 'corrected_claim', 'case_action',
-        'payment_event', 'recovery_case', 'document', 'remittance_line', 'remittance',
+        'payment_event', 'recovery_case', 'document', 'remittance_line',
+        'remittance_provider_adjustment', 'remittance',
         'claim_line', 'claim', 'encounter', 'patient', 'client_payer_config',
         'contract_line', 'contract', 'provider', 'system_job', 'audit_log', 'client',
       ]) {
