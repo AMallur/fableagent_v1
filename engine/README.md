@@ -68,7 +68,8 @@ guards preventing double runs across restarts:
 - **Payment reconciliation** (inside nightly, also standalone) — for
   submitted appeals with post-appeal remittances: gap closed → case `won`;
   partial → `payment_event` + timeline note, case stays open; assignee
-  notified either way.
+  notified either way. See **Recovery attribution** below for what counts as
+  recovered.
 - **Weekly summary** (Monday 08:00 client time) — per-client email to admins:
   cases opened / appeals submitted / dollars recovered last week, cases
   expiring this week, top-5 action items.
@@ -190,7 +191,7 @@ transaction, and completes the job row with stats and the JSON summary in
 
 ```sh
 npm test                                      # unit/regression tests (current count printed by runner)
-TEST_DATABASE_URL=postgres://... npm run test:integration   # 159 tests, real Postgres
+TEST_DATABASE_URL=postgres://... npm run test:integration   # integration, real Postgres
 ```
 
 The web, automation, API, and admin suites run against the seeded demo tenant
@@ -234,19 +235,54 @@ identical to the UI; API PHI reads land in the PHI access log.
 
 **X12 parsing** is real EDI: ISA/GS envelope separator detection, multiple
 ST/SE transaction sets per 835 file (one remittance per check), CLP/NM1/
-DTM/SVC/CAS/AMT/LQ for 835, HL/SBR/CLM/HI/REF/SV1/DTP for 837P. CSV
+DTM/SVC/CAS/AMT/LQ/PLB for 835, HL/SBR/CLM/HI/REF/SV1/DTP for 837P. CSV
 remittance exports parse with header aliasing, quoted fields, US dates, and
 per-line error reporting.
-Database ingestion additionally requires complete ISA/IEA and GS/GE envelopes,
-the supported CMS 5010 implementation version, matching transaction controls,
-and recovery-critical segments. The fragment-level parsers remain tolerant for
-diagnostic use, but incomplete or unsupported files cannot be committed.
 
-**Reference data.** `reference-import` loads strict canonical CSV for CMS PFS,
-CMS NCCI PTP, and X12 CARC/RARC. Imports are versioned and SHA-256 tracked.
-Percent-of-Medicare contracts require explicit CMS locality plus versioned
-facility/nonfacility coverage before activation; no address or vendor-column
-guessing is performed.
+**835 financial integrity.** Three things in an ERA move money that a
+claim-only reading of the file never sees, and all three are handled:
+
+- **PLB — provider-level adjustments.** Recoupments (`WO`), forwarding
+  balances (`FB`), interest (`L3`/`L6`), capitation, penalties and refunds
+  never appear on a CLP claim. They land in `remittance_provider_adjustment`,
+  categorized, and linked back to the claim the payer recouped by the ICN in
+  PLB03-2 when we can find it. A payer takeback is a visible fact, not a
+  silent shortfall in the deposit.
+- **Reversals (`CLP02 = 22`).** A reversal undoes an earlier adjudication
+  and carries negative amounts. It is stored (`is_reversal`), its cash nets
+  against what was already posted, and it never becomes a recovery case or
+  flips a claim's status — a reverse-and-reissue pair is judged on the
+  replacement, not on the reversal.
+- **Payer re-coding and unit reduction.** SVC01 is what the payer
+  *adjudicated*; SVC06 is what we *submitted*. The submitted code is what
+  identifies our claim line, so that is what matching and pricing use, with
+  the adjudicated code kept alongside and `payer_recoded` set when they
+  differ. SVC07 (submitted units) is preferred over SVC05 (paid units) for
+  the same reason — otherwise a payer cutting 3 units to 1 makes the shortfall
+  disappear. CAS quantities are preserved too.
+
+**835 balancing** (`src/ingest/balance835.ts`, pure) enforces the three X12
+balancing rules on every file before anything is written:
+
+| Rule | Check |
+|---|---|
+| service line | `SVC02 − Σ(line CAS) = SVC03` |
+| claim | `CLP03 − Σ(claim CAS + all line CAS) = CLP04` |
+| transaction | `Σ CLP04 − Σ PLB = BPR02` |
+
+A file that fails is **rejected and nothing is written** — the whole file, not
+just the offending check, because half of a check that does not add up is
+worse than none of it; the failed `system_job` row carries the arithmetic.
+`CLP05` disagreeing with the PR adjustments is a warning rather than an error
+(patient liability never moves provider cash, but variance detection should
+fail closed for that claim).
+
+Per client, under Client Administration → Organization profile:
+`era_balance_policy` (`strict` rejects, `warn` loads and marks the remittance
+`out_of_balance`) and `era_balance_tolerance` (per-check dollars, default 0).
+Relax only for a trading partner whose rounding quirk you have documented.
+The manual-upload preview uses the same tolerance the commit will, so a file
+is never previewed clean and then rejected.
 
 **Outbound (Phase-2 hooks).** `src/integration/connectors.ts` defines the
 OutboundConnector interface with a registry: Waystar/Availity/Change
@@ -358,11 +394,16 @@ trace numbers and already-loaded claim control numbers are skipped.
 
 **Step 1 — matching.** Payer claim number (835 CLP07) first; fallback is
 patient member ID + DOS + procedure + billed amount. Within a claim, the line
-resolves by procedure code, preferring an exact billed-amount match. Unmatched
-lines are stamped `match_method='unmatched'` — the manual-review queue is a
-partial index away. Claim status from remit: `denied` (nothing paid + hard
-denial code), `paid` (anything paid; Step 3 refines to `underpaid`), else
-`accepted`.
+resolves by procedure code (the *submitted* one — see payer re-coding above),
+preferring an exact billed-amount match. Unmatched lines are stamped
+`match_method='unmatched'` — the manual-review queue is a partial index away.
+Claim status from remit: `denied` (nothing paid + hard denial code), `paid`
+(anything paid; Step 3 refines to `underpaid`), else `accepted`. Reversal
+entries are excluded from status determination: reading their negative amounts
+as a fresh result would flip a legitimately paid claim, and the claim-status
+vocabulary has no term for "the payer took the money back," so a
+reversal-only remit leaves the status alone and is surfaced in the run
+summary instead.
 
 **Step 2 — pricing.** Contract selected for client+payer effective at DOS
 (latest wins); contract line by procedure + modifier (exact modifier beats
@@ -375,7 +416,10 @@ is not flagged `no_contract`.
 **Step 3 — variance.** `variance = expected - paid`. Any positive variance
 marks the line `underpaid`; a case candidate needs > $25 **or** > 5% of
 expected. Lines with denial codes route to classification instead — never
-double-counted.
+double-counted. Reversal entries are skipped entirely: their amounts are
+negative and already netted into cumulative cash, so scoring them as an
+adjudication would manufacture a full-billed-amount "underpayment" out of an
+accounting entry.
 
 **Step 4 — classification.** Codes normalize to `CO-45` form from any of
 `45`+group, `CO45`, `co-45`. The contractual codes (CO-45, CO-131) carry
@@ -403,11 +447,47 @@ never auto-actioned; client+payer autopilot on → `auto_action=true`, else
 manual queue.
 
 **Step 7 — summary.** Totals and category/payer/priority breakdowns over
-created+updated cases. Anomaly: a payer paying below contract on ≥ 80% of at
-least 5 contract-priced lines flags `systemic_underpayment`. Clients whose
+created+updated cases. Anomalies: a payer paying below contract on ≥ 80% of at
+least 5 contract-priced lines flags `systemic_underpayment`; reversed service
+lines flag `payment_reversed` per payer, and `summary.reversals` carries the
+count, dollars and claim lines — a run that only counts money owed to the
+client would otherwise render a takeback invisible. Clients whose
 identified recovery exceeds `client.recovery_alert_threshold` get an alert
 entry in the summary (delivery itself belongs to a `send_alerts` job — the
 engine only identifies).
+
+## Recovery attribution
+
+A recovered dollar is one the appeal actually produced. That is not the same
+as "cash arrived after we submitted," and the difference is what an invoice
+has to survive being audited against the customer's own remittances.
+
+`reconcilePaymentsInner` attributes on four rules:
+
+1. **Line scope.** A case is opened on a claim *line*, so attribution is
+   line-scoped. Payment landing on a sibling line of the same claim is not
+   this case's recovery. The one deliberate widening: remittance detail the
+   payer never resolved to a service line (a header-only ERA row) is
+   attributed for want of anything better and reported separately as
+   `unallocated_paid` — the part of an invoice line a customer is most likely
+   to question, and the part an operator can go and resolve properly.
+2. **Reversals net.** A reverse-and-reissue pair re-pays the original amount
+   plus the correction; only the net movement is recovery. Billing the gross
+   reissue would charge the customer for money they already had.
+3. **Recoupments net.** A PLB takeback referencing the claim after the appeal
+   went out is cash moving the other way and comes off the total.
+4. **Only what this reconciler attributed can be reversed.** When a payer
+   takes money back, the clawback is capped at the recovery this arithmetic
+   itself credited (`attribution_basis = 'incremental_net'`). A payment a
+   biller verified and matched by hand is never undone by a robot — the
+   operator is notified and the case timeline records the takeback instead.
+   A negative delta with no reversal and no recoupment behind it is a
+   bookkeeping difference, not a takeback, and is left alone.
+
+Every component is stored on `payment_event` — `pre_appeal_paid`,
+`gross_post_appeal_paid`, `unallocated_paid`, `reversals_netted`,
+`recoupments_netted`, `attribution_basis`, `attribution_scope` — so a
+recovery line can be defended figure by figure rather than asserted.
 
 ## Money
 

@@ -26,7 +26,8 @@ import * as compliance from './compliance_api.ts';
 import * as pub from './public_api.ts';
 import { API_ENDPOINTS, buildOpenApi, docsHtml } from './api_docs.ts';
 import {
-  detectFileKind, ingestFileByKind, ingestParsed835, ingestParsed837, previewIngestFile,
+  detectFileKind, ingestFileByKind, ingestParsed835, ingestParsed837, loadBalancePolicy,
+  previewIngestFile,
 } from '../ingest/service.ts';
 import {
   ConnectorUnavailableError, dispatchAppealSubmission, dispatchCaseWriteback,
@@ -818,7 +819,10 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     admin.assertClientAccess(ctx.session!, ctx.scope!, ctx.params[0]);
     const fileName = ctx.url.searchParams.get('filename') ?? 'upload';
     const content = (await readBody(ctx.req)).toString('utf8');
-    json(ctx, 200, previewIngestFile(fileName, content));
+    // Preview under the same balance tolerance the commit will use, so the
+    // operator is never shown a file as clean that ingestion then rejects.
+    const { tolerance } = await loadBalancePolicy(pool, ctx.scope!.tenantId, ctx.params[0]);
+    json(ctx, 200, previewIngestFile(fileName, content, tolerance));
   });
 
   // outbound deliveries (integration visibility)

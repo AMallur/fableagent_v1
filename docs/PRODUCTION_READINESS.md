@@ -9,6 +9,9 @@ attempt was recorded, and console-only email output is not marked delivered.
 - Unit tests and the full PostgreSQL integration suite pass.
 - The dedicated RLS suite passes using a non-superuser runtime login.
 - Migrations and their `schema_migrations` records commit atomically.
+- Every ingested 835 satisfies the X12 balancing rules (service line, claim,
+  and check totals including provider-level adjustments) under the client's
+  configured policy. `strict` is the default and rejects a file that does not.
 - The runtime Docker image builds successfully.
 - `npm audit --omit=dev --audit-level=high` reports no high or critical issue.
 - CodeQL completes successfully.
@@ -29,6 +32,12 @@ customer and trading partner:
    reconcile acknowledgements before autonomous delivery is enabled.
 5. Validate each supported payer contract model against adjudicated examples.
    Unsupported contract constructs remain manual-review cases.
+5a. Agree the recovery-attribution basis in writing with the customer before
+   any fee is charged against recovered dollars. The reconciler attributes
+   line-scoped, post-appeal cash net of reversals and PLB recoupments, records
+   every component on `payment_event`, and never reverses a recovery a person
+   matched by hand. That is a defensible basis, not a substitute for the
+   customer having agreed to it.
 6. Require certified coding review for every corrected claim and modifier
    change. The rules engine is decision support, not clinical documentation.
 7. Run load, failover, backup/restore and disaster-recovery exercises in the

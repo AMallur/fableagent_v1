@@ -87,7 +87,7 @@ for (const table of [
   // before appeal_packet.
   'outbound_delivery', 'appeal_packet_document', 'case_action', 'appeal_packet',
   'document', 'payment_event', 'corrected_claim', 'recovery_case',
-  'remittance_line', 'remittance',
+  'remittance_line', 'remittance_provider_adjustment', 'remittance',
   'claim_line', 'claim', 'encounter', 'patient', 'client_payer_config',
   'contract_line', 'contract', 'provider', 'system_job',
 ]) await q(`DELETE FROM ${table} WHERE tenant_id = $1`, [T]);

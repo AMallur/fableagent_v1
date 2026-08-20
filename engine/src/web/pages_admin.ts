@@ -245,7 +245,20 @@ export const CLIENT_ADMIN_BODY = `
       <label>Nightly run time<input data-f="nightlyRunTime" type="time"></label>
       <label>Alert threshold $<input data-f="alertThreshold" type="number"></label>
       <label>Review threshold $<input data-f="reviewThreshold" type="number"></label>
+      <label>Out-of-balance 835 handling
+        <select data-f="eraBalancePolicy">
+          <option value="strict">Reject the file (strict)</option>
+          <option value="warn">Load it and warn</option>
+        </select>
+      </label>
+      <label>835 balance tolerance $<input data-f="eraBalanceTolerance" type="number"
+        step="0.01" min="0" max="100"></label>
     </div>
+    <div class="sub" style="margin-top:-4px;margin-bottom:8px">An 835 must satisfy the X12
+      balancing rules (service line, claim, and check totals including provider-level
+      adjustments). Strict rejects a file that does not, because every downstream dollar
+      depends on it. Relax only for a trading partner whose rounding quirk you have
+      documented.</div>
     <button class="btn primary" id="save-profile">Save profile</button>
     <div id="sub-panel" style="margin-top:14px"></div>
   </div>
@@ -506,8 +519,23 @@ $('#edi-preview').addEventListener('click', async () => {
     s.claims + ' claim(s), ' + s.lines + ' line(s)' +
     (s.transactions ? ' in ' + s.transactions + ' transaction(s)' : '') +
     (s.payers && s.payers.length ? ' · payer: ' + s.payers.map(esc).join(', ') : '') +
-    ' · billed ' + usd(s.totalBilled) + ' · paid ' + usd(s.totalPaid) + '</div>' +
+    ' · billed ' + usd(s.totalBilled) + ' · paid ' + usd(s.totalPaid) +
+    (s.reversals ? ' · <b>' + s.reversals + ' reversal(s)</b>' : '') +
+    (s.recodedLines ? ' · ' + s.recodedLines + ' line(s) re-coded by the payer' : '') +
+    '</div>' +
+    (s.providerAdjustments && s.providerAdjustments.length
+      ? '<div class="sub" style="margin-top:6px"><b>Provider-level adjustments (PLB): ' +
+        usd(s.providerAdjustmentTotal) + '</b><br>' +
+        s.providerAdjustments.map((a) => esc(a.reasonCode) + ' (' + esc(a.category) + ') ' +
+          usd(a.amount) + (a.referenceId ? ' ref ' + esc(a.referenceId) : '')).join('<br>') +
+        '</div>' : '') +
+    (s.checks && s.checks.some((c) => c.balanced === false)
+      ? '<div class="deadline-red">' + s.checks.filter((c) => c.balanced === false).map((c) =>
+        'check ' + esc(c.checkNumber || '(no trace number)') + ' is out of balance by ' +
+        usd(c.balanceVariance)).join('<br>') + '</div>' : '') +
     (p.errors.length ? '<div class="deadline-red">' + p.errors.map(esc).join('<br>') + '</div>' : '') +
+    (p.warnings && p.warnings.length
+      ? '<div class="sub">' + p.warnings.map(esc).join('<br>') + '</div>' : '') +
     (s.sample.length ? '<table class="data"><tbody><tr>' +
       Object.keys(s.sample[0]).map((k) => '<th>' + esc(k) + '</th>').join('') + '</tr>' +
       s.sample.map((row) => '<tr>' + Object.values(row).map((v) =>

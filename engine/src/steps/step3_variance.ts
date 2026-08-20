@@ -53,6 +53,15 @@ export function runVarianceDetection(
     const priced = pricing.get(claimLine.claimLineId);
     if (!priced) continue;
 
+    // A reversal is the payer undoing an earlier adjudication, not a new one.
+    // Its amounts are negative and have already been netted into cumulative
+    // cash upstream; treating it as an adjudication here would manufacture a
+    // full-billed-amount "underpayment" out of an accounting entry.
+    if (remitLine.isReversal) {
+      seenLine.add(claimLine.claimLineId);
+      continue;
+    }
+
     const paid = remitLine.paidAmount ?? claimLine.paidAmount ?? 0;
     const expected = priced.expectedAmount;
     const patientResponsibility = patientResponsibilityFor(remitLine);

@@ -39,9 +39,14 @@ facts or missing documentation.
 5. Enter the contract as structured lines, resolve every validation error,
    have the customer contract owner compare a sample to the signed document,
    then activate it. Draft/rejected contracts never price claims.
-6. Preview each EDI file. Structural/version errors stop ingestion. Preserve
-   the source files and hashes outside FableAgent under the agreed retention
-   policy.
+6. Preview each EDI file. Structural/version errors stop ingestion, and so
+   does an 835 that does not satisfy the X12 balancing rules — take an
+   out-of-balance check back to the trading partner rather than relaxing the
+   policy, and set a per-client tolerance only for a rounding quirk you have
+   documented. Confirm with the customer what any provider-level adjustments
+   (PLB recoupments, forwarding balances, interest) in the sample represent
+   before treating the check totals as understood. Preserve the source files
+   and hashes outside FableAgent under the agreed retention policy.
 7. Run `npm run benchmark:pilot` as a technical smoke test. It is synthetic
    and must never be shown as customer recovery evidence.
 
