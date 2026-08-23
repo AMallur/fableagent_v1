@@ -76,10 +76,12 @@ function markdown(
     + `| Coverage | ${pct(metrics.coverage)} |\n`
     + `| Unresolved rate | ${pct(metrics.unresolvedRate)} |\n`
     + `| Predicted adjudicated dollars | $${metrics.predictedAdjudicatedDollars.toFixed(2)} |\n`
-    + `| Validated dollars | $${metrics.validatedDollars.toFixed(2)} |\n`
+    + `| Validated true-positive dollars | $${metrics.validatedDollars.toFixed(2)} |\n`
+    + `| Matched validated dollars | $${metrics.matchedValidatedDollars.toFixed(2)} |\n`
     + `| Missed validated dollars | $${metrics.missedDollars.toFixed(2)} |\n`
     + `| Dollar precision | ${pct(metrics.dollarPrecision)} |\n`
     + `| Dollar recall | ${pct(metrics.dollarRecall)} |\n\n`
+    + `Matched validated dollars use min(predicted, validated) per true positive so dollar metrics remain bounded and penalize both overstatement and underestimation.\n\n`
     + gateSection
     + (metrics.recall == null
       ? `Recall and dollar recall are intentionally not reported because complete ground truth was not declared.\n`
