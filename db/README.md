@@ -43,12 +43,16 @@ db/
     ├── 0025_era_financial_integrity.sql  # PLB provider adjustments, 835 balancing state,
     │                                     #   reversal/adjudication detail, recovery
     │                                     #   attribution columns, client balance policy
-    └── 0026_pricing_cob_and_commercial_terms.sql
+    ├── 0026_pricing_cob_and_commercial_terms.sql
                                           # payer payment reduction, contract lesser-of,
                                           #   modifier payment rules, claim payer sequence
                                           #   + prior-payer paid, pricing_plan +
                                           #   invoice_line + issued-invoice immutability,
                                           #   subscription/feature enforcement functions
+    └── 0027_usage_ledger_ncci_and_attribution_policy.sql
+                                          # append-only usage_event billing ledger,
+                                          #   payer bundling-edit source + client NCCI
+                                          #   policy, per-client attribution policy
 ```
 
 The detection engine that consumes this schema lives in [../engine](../engine).
@@ -162,6 +166,9 @@ are skipped.
 | — | `modifier_payment_rule` (0026) | Modifiers change the percentage payable (51 at 50%, 50 at 150%, 80 at 16%). Pricing every modified line at 100% made it look half underpaid. Shared defaults with tenant/payer overrides, composed multiplicatively in `apply_order` |
 | — | `pricing_plan` + `invoice_line` (0026) | Recovery is sold on contingency, so the terms are effective-dated data rather than a code constant, and an invoice names every `payment_event` it charges for. A unique index on `payment_event_id` means a recovery can be billed only once |
 | — | `invoice` immutable past `draft` (0026) | A trigger refuses to change the figures on an issued bill or delete it; corrections are a void and reissue. Regenerating a month used to silently rewrite an invoice that had already gone out |
+| — | `usage_event` (0027) | Freezing the invoice totals stopped the bill changing; it did not stop the evidence changing. The ledger is written once per billable fact with the figures as they stood, is append-only in the database (only `invoice_id` may ever move), and is what invoices are built from — so an issued bill can be reconstructed after the operational tables have moved on |
+| — | `client` attribution policy (0027) | Which post-appeal dollars count as recovery is a commercial term, not an engineering constant: basis, window, floor, unallocated handling and clawback rule are per client, each defaulting to the previous hardcoded behavior |
+| — | `payer.bundling_edit_source` + `client.ncci_bundling_policy` (0027) | The CMS NCCI tables have been importable since 0022 and nothing read them. These two say how to read them for this payer and what to do when CMS says a bundle can never be unbundled |
 
 ### Other conventions
 

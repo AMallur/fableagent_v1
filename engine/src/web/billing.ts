@@ -23,6 +23,7 @@ import type { Scope } from './queries.ts';
 import {
   adminAudit, assertClientAccess, err, requireAnyAdmin, requireTenantAdmin,
 } from './admin_api.ts';
+import { clientLedger, invoiceLedger, syncUsageLedger } from './usage_ledger.ts';
 
 const r2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100;
 const num = (v: unknown): number => (v == null ? 0 : Number(v));
@@ -182,31 +183,40 @@ export async function createPricingPlan(
 // ---------------------------------------------------------------------------
 
 /**
- * Recoveries in the period that have never been billed. 'verified' bills only
- * what a person confirmed; 'attributed' also bills the reconciler's own
- * incremental_net attribution. Negative events (a payer clawing money back)
- * are included so a takeback reduces the next bill rather than being kept.
+ * Recoveries in the period that have never been billed, read from the
+ * append-only ledger rather than from payment_event.
+ *
+ * The amount comes from the ledger, frozen as it stood when the fact was
+ * recorded, so a later correction to the operational row cannot silently
+ * change what a customer was charged. Verification is the one thing still read
+ * live: whether a person has confirmed a payment is a condition on billing it,
+ * not a billable fact, and it can legitimately become true after the ledger
+ * row was written.
+ *
+ * Negative events (a payer clawing money back) are included so a takeback
+ * reduces the next bill rather than being quietly kept.
  */
 async function billableRecoveries(
   db: Queryable, tenantId: UUID, clientId: UUID,
   periodStart: string, periodEnd: string, basis: 'attributed' | 'verified',
+  /** Rows already claimed by THIS invoice count as available: they are what
+   * it is being rebuilt from. Without it, previewing or regenerating a month
+   * that already has a draft would report nothing billable. */
+  forInvoiceId?: UUID | null,
 ) {
   const verifiedOnly = basis === 'verified';
   const rows = await db.query(
-    `SELECT pe.payment_event_id, pe.case_id, pe.claim_id, pe.amount_recovered,
-            pe.payment_date, pe.attribution_basis,
-            cl.claim_number_internal, py.payer_name
-     FROM payment_event pe
-     JOIN recovery_case rc ON rc.case_id = pe.case_id
-     JOIN claim cl ON cl.claim_id = pe.claim_id
-     JOIN payer py ON py.payer_id = cl.payer_id
-     WHERE pe.tenant_id = $1 AND rc.client_id = $2
-       AND pe.payment_date >= $3::date AND pe.payment_date <= $4::date
+    `SELECT ue.usage_event_id, ue.payment_event_id, ue.case_id, ue.claim_id,
+            ue.amount AS amount_recovered, ue.occurred_at AS payment_date,
+            ue.attribution_basis, ue.detail
+     FROM usage_event ue
+     LEFT JOIN payment_event pe ON pe.payment_event_id = ue.payment_event_id
+     WHERE ue.tenant_id = $1 AND ue.client_id = $2
+       AND ue.occurred_at >= $3::date AND ue.occurred_at <= $4::date
+       AND (ue.invoice_id IS NULL OR ue.invoice_id = $6::uuid)
        AND ($5::boolean IS NOT TRUE OR pe.verified_by_user_id IS NOT NULL)
-       AND NOT EXISTS (
-         SELECT 1 FROM invoice_line il WHERE il.payment_event_id = pe.payment_event_id)
-     ORDER BY pe.payment_date, pe.created_at`,
-    [tenantId, clientId, periodStart, periodEnd, verifiedOnly]);
+     ORDER BY ue.occurred_at, ue.recorded_at`,
+    [tenantId, clientId, periodStart, periodEnd, verifiedOnly, forInvoiceId ?? null]);
   return rows.rows;
 }
 
@@ -215,7 +225,16 @@ export async function previewInvoice(
 ) {
   requireAnyAdmin(sess);
   assertClientAccess(sess, s, clientId);
-  return computeInvoice(db, s.tenantId, clientId, month);
+  // A preview has to say what generating would produce. If a draft for this
+  // month already holds ledger rows, they are still this month's recoveries,
+  // so the preview counts them rather than reporting an empty bill.
+  if (!/^\d{4}-\d{2}$/.test(month)) throw err('month must be YYYY-MM', 400);
+  const draft = await db.query(
+    `SELECT invoice_id FROM invoice
+     WHERE client_id = $1 AND period_start = $2::date AND status = 'draft'`,
+    [clientId, `${month}-01`]);
+  return computeInvoice(
+    db, s.tenantId, clientId, month, draft.rows[0]?.invoice_id ?? null);
 }
 
 interface ComputedInvoice {
@@ -237,14 +256,16 @@ interface ComputedInvoice {
   /** Anything an operator needs to know before sending this out. */
   warnings: string[];
   lines: Array<{
-    paymentEventId: UUID; caseId: UUID; claimId: UUID; claimNumber: string;
-    payerName: string; paymentDate: string | null; amountRecovered: number;
+    usageEventId: UUID; paymentEventId: UUID | null; caseId: UUID; claimId: UUID;
+    claimNumber: string | null; payerName: string | null;
+    paymentDate: string | null; amountRecovered: number;
     fee: number; attributionBasis: string | null;
   }>;
 }
 
 async function computeInvoice(
   db: Queryable, tenantId: UUID, clientId: UUID, month: string,
+  forInvoiceId?: UUID | null,
 ): Promise<ComputedInvoice> {
   if (!/^\d{4}-\d{2}$/.test(month)) throw err('month must be YYYY-MM', 400);
   const periodStart = `${month}-01`;
@@ -269,9 +290,13 @@ async function computeInvoice(
           AND pe.payment_date <= $3::date) AS recovered`,
     [clientId, periodStart, periodEnd]);
 
+  // Bring the ledger up to date before reading it, so a payment reconciled or
+  // matched by hand since the last run is billable now rather than next month.
+  await syncUsageLedger(db, tenantId, clientId);
+
   const basis = plan?.contingencyBasis ?? 'attributed';
   const events = await billableRecoveries(
-    db, tenantId, clientId, periodStart, periodEnd, basis);
+    db, tenantId, clientId, periodStart, periodEnd, basis, forInvoiceId);
   const attributedRecovery = r2(events.reduce((sum, e) => sum + num(e.amount_recovered), 0));
 
   const contingencyPercent = plan?.contingencyPercent ?? 0;
@@ -319,11 +344,12 @@ async function computeInvoice(
     baseFee, caseFeeTotal, contingencyPercent, contingencyFee,
     minimumApplied, maximumApplied, amountDue, warnings,
     lines: events.map((e) => ({
+      usageEventId: e.usage_event_id,
       paymentEventId: e.payment_event_id,
       caseId: e.case_id,
       claimId: e.claim_id,
-      claimNumber: e.claim_number_internal,
-      payerName: e.payer_name,
+      claimNumber: e.detail?.claimNumber ?? null,
+      payerName: e.detail?.payerName ?? null,
       paymentDate: iso(e.payment_date),
       amountRecovered: r2(num(e.amount_recovered)),
       fee: r2(Math.max(0, num(e.amount_recovered)) * (contingencyPercent / 100)),
@@ -342,19 +368,27 @@ export async function generateInvoice(
 ) {
   requireAnyAdmin(sess);
   assertClientAccess(sess, s, clientId);
-  const computed = await computeInvoice(db, s.tenantId, clientId, month);
+  if (!/^\d{4}-\d{2}$/.test(month)) throw err('month must be YYYY-MM', 400);
+  const periodStart = `${month}-01`;
 
   // A voided invoice is history, not an obstacle: the period is re-invoiceable
   // and its released recoveries are billable again.
   const existing = await db.query(
     `SELECT invoice_id, status FROM invoice
      WHERE client_id = $1 AND period_start = $2::date AND status <> 'void'`,
-    [clientId, computed.periodStart]);
+    [clientId, periodStart]);
   if (existing.rows[0] && existing.rows[0].status !== 'draft') {
     throw err(
       `invoice for ${month} has already been ${existing.rows[0].status}; `
       + 'issue a credit note instead of regenerating it', 409);
   }
+
+  // Rows this draft already holds are still billable BY THIS DRAFT — they are
+  // what it is being rebuilt from. Treating them as billed would exclude
+  // exactly the recoveries the invoice is for and rebuild it as an empty bill.
+  // Rows held by any other invoice stay held and cannot be pulled in.
+  const draftId: UUID | null = existing.rows[0]?.invoice_id ?? null;
+  const computed = await computeInvoice(db, s.tenantId, clientId, month, draftId);
 
   const invoiceId: UUID = existing.rows[0]?.invoice_id ?? (await db.query(
     `INSERT INTO invoice (tenant_id, client_id, period_start, period_end, plan, status)
@@ -377,19 +411,33 @@ export async function generateInvoice(
      computed.contingencyPercent, computed.contingencyFee,
      computed.minimumApplied, computed.maximumApplied, computed.amountDue]);
 
-  // Rebuild the draft's lines from scratch; the unique index on
-  // payment_event_id guarantees nothing already billed can be pulled in.
+  // Rebuild the draft's lines from scratch. Releasing everything it held
+  // first means a recovery that is no longer billable — its event superseded,
+  // its period moved — is let go rather than left claimed by an invoice that
+  // no longer charges for it.
   await db.query(`DELETE FROM invoice_line WHERE invoice_id = $1`, [invoiceId]);
+  await db.query(
+    `UPDATE usage_event SET invoice_id = NULL WHERE invoice_id = $1 AND tenant_id = $2`,
+    [invoiceId, s.tenantId]);
+
   for (const line of computed.lines) {
+    // Claim the ledger row for this invoice. The database refuses to move a
+    // row that another invoice already holds, so two overlapping generations
+    // cannot bill the same recovery twice.
+    await db.query(
+      `UPDATE usage_event SET invoice_id = $1
+       WHERE usage_event_id = $2 AND tenant_id = $3 AND invoice_id IS NULL`,
+      [invoiceId, line.usageEventId, s.tenantId]);
     await db.query(
       `INSERT INTO invoice_line
-         (tenant_id, invoice_id, payment_event_id, case_id, claim_id, claim_number,
-          payer_name, payment_date, amount_recovered, contingency_percent, fee,
-          attribution_basis)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::date,$9,$10,$11,$12)`,
-      [s.tenantId, invoiceId, line.paymentEventId, line.caseId, line.claimId,
-       line.claimNumber, line.payerName, line.paymentDate, line.amountRecovered,
-       computed.contingencyPercent, line.fee, line.attributionBasis]);
+         (tenant_id, invoice_id, usage_event_id, payment_event_id, case_id, claim_id,
+          claim_number, payer_name, payment_date, amount_recovered,
+          contingency_percent, fee, attribution_basis)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10,$11,$12,$13)`,
+      [s.tenantId, invoiceId, line.usageEventId, line.paymentEventId, line.caseId,
+       line.claimId, line.claimNumber, line.payerName, line.paymentDate,
+       line.amountRecovered, computed.contingencyPercent, line.fee,
+       line.attributionBasis]);
   }
 
   await adminAudit(db, sess, 'invoice_generated', 'invoice', invoiceId, {
@@ -445,9 +493,45 @@ export async function voidInvoice(
   await db.query(
     `UPDATE invoice SET status = 'void', voided_at = now(), voided_reason = $2
      WHERE invoice_id = $1`, [invoiceId, reason.trim()]);
+  // The invoice row keeps its frozen totals as the record of what was charged;
+  // its LINES go, and the ledger rows they held are released so a corrected
+  // invoice can bill the same recoveries. The ledger itself is untouched —
+  // nothing that happened stops having happened because a bill was wrong.
   await db.query(`DELETE FROM invoice_line WHERE invoice_id = $1`, [invoiceId]);
+  await db.query(
+    `UPDATE usage_event SET invoice_id = NULL WHERE invoice_id = $1 AND tenant_id = $2`,
+    [invoiceId, s.tenantId]);
   await adminAudit(db, sess, 'invoice_voided', 'invoice', invoiceId, { reason: reason.trim() });
   return { ok: true as const, invoiceId };
+}
+
+/**
+ * A client's billable history straight from the ledger — including what has
+ * not been invoiced yet. This is what an operator opens when a customer asks
+ * why a bill is what it is, and it answers from the frozen record rather than
+ * by recomputing today's view of the same events.
+ */
+export async function clientUsageLedger(
+  db: Queryable, sess: Session, s: Scope, clientId: UUID,
+  opts: { from?: string; to?: string; unbilledOnly?: boolean; limit?: number } = {},
+) {
+  requireAnyAdmin(sess);
+  assertClientAccess(sess, s, clientId);
+  for (const [name, value] of [['from', opts.from], ['to', opts.to]] as const) {
+    if (value && !DATE.test(value)) throw err(`${name} must be YYYY-MM-DD`, 400);
+  }
+  await syncUsageLedger(db, s.tenantId, clientId);
+  const rows = await clientLedger(db, s.tenantId, clientId, opts);
+  const billed = rows.filter((r) => r.invoiceId != null);
+  const unbilled = rows.filter((r) => r.invoiceId == null);
+  return {
+    clientId,
+    events: rows,
+    totals: {
+      billed: r2(billed.reduce((t, r) => t + r.amount, 0)),
+      unbilled: r2(unbilled.reduce((t, r) => t + r.amount, 0)),
+    },
+  };
 }
 
 export async function invoiceDetail(
@@ -464,10 +548,12 @@ export async function invoiceDetail(
   if (!inv.rows[0]) throw err('invoice not found', 404);
   assertClientAccess(sess, s, inv.rows[0].client_id);
   const lines = await db.query(
-    `SELECT payment_event_id, case_id, claim_number, payer_name, payment_date,
-            amount_recovered, contingency_percent, fee, attribution_basis
+    `SELECT usage_event_id, payment_event_id, case_id, claim_number, payer_name,
+            payment_date, amount_recovered, contingency_percent, fee, attribution_basis
      FROM invoice_line WHERE invoice_id = $1 ORDER BY payment_date, claim_number`,
     [invoiceId]);
+  // The append-only evidence behind the bill, as it stood when it was billed.
+  const ledger = await invoiceLedger(db, s.tenantId, invoiceId);
   const i = inv.rows[0];
   return {
     invoiceId: i.invoice_id,
@@ -485,7 +571,9 @@ export async function invoiceDetail(
     minimumApplied: i.minimum_applied, maximumApplied: i.maximum_applied,
     amountDue: r2(num(i.amount_due)),
     issuedAt: i.issued_at, voidedAt: i.voided_at, voidedReason: i.voided_reason,
+    ledger,
     lines: lines.rows.map((l) => ({
+      usageEventId: l.usage_event_id,
       paymentEventId: l.payment_event_id, caseId: l.case_id,
       claimNumber: l.claim_number, payerName: l.payer_name,
       paymentDate: iso(l.payment_date),

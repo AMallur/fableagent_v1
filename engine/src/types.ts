@@ -6,6 +6,12 @@
 // and persists the result; tests build snapshots in memory.
 // ============================================================================
 
+// Re-exported from the NCCI step so EngineInput can name these without this
+// module owning the shape of CMS reference data. Type-only, so there is no
+// runtime cycle despite ncci.ts importing back from here.
+import type { NcciDatasetInput, NcciEditInput } from './steps/ncci.ts';
+export type { NcciDatasetInput, NcciEditInput };
+
 export type UUID = string;
 export type ISODate = string; // 'YYYY-MM-DD'
 
@@ -36,6 +42,19 @@ export type ExpectedSource = 'contract' | 'medicare_proxy' | 'none';
 /** Where a claim sits in the patient's coverage order (837 SBR01). */
 export type PayerSequence = 'primary' | 'secondary' | 'tertiary' | 'unknown';
 
+/** Professional vs institutional billing. Also decides which of the two CMS
+ * NCCI PTP tables adjudicates the claim. */
+export type ClaimType = 'professional' | 'facility';
+
+/** The two CMS NCCI PTP tables. */
+export type NcciServiceSetting = 'practitioner' | 'outpatient_hospital';
+
+/** Whether a payer adjudicates bundling against the published CMS NCCI tables
+ * or against edits of its own. It decides what the ABSENCE of a CMS edit
+ * means: a contradiction of the payer's own policy, or a demand for the
+ * rationale under the contract. */
+export type BundlingEditSource = 'ncci' | 'proprietary';
+
 // ---------------------------------------------------------------------------
 // Input snapshot
 // ---------------------------------------------------------------------------
@@ -50,6 +69,8 @@ export interface PayerInput {
    * allows, so it applies to expected payer liability rather than to the
    * allowed amount. */
   paymentReductionPercent?: number | null;
+  /** Default 'ncci'. */
+  bundlingEditSource?: BundlingEditSource | null;
 }
 
 export interface PatientInput {
@@ -83,6 +104,8 @@ export interface ClaimInput {
   patientId: UUID;
   claimNumberInternal: string;
   claimNumberPayer?: string | null;
+  /** Professional or facility. Decides which CMS NCCI PTP table applies. */
+  claimType?: ClaimType;
   dateOfServiceStart: ISODate;         // denormalized from encounter
   placeOfService?: string | null;
   submissionDate?: ISODate | null;
@@ -205,6 +228,10 @@ export interface ClientPayerConfigInput {
   minCaseThreshold?: number | null;
 }
 
+/** 'advisory' still opens the case and states plainly that an unbundling
+ * appeal cannot win; 'suppress_unappealable' does not open it at all. */
+export type NcciBundlingPolicy = 'advisory' | 'suppress_unappealable';
+
 export interface EngineConfig {
   /** deterministic "today" for deadline math */
   asOf: ISODate;
@@ -234,6 +261,16 @@ export interface EngineInput {
   medicareRates: Record<string, number>;
   /** Explicit CMS locality per client; never inferred from address text. */
   medicareLocalityByClient: Record<UUID, string>;
+  /** CMS NCCI procedure-to-procedure edits relevant to this run's procedure
+   * codes. Loaded narrowly on purpose: the full CMS tables run to millions of
+   * pairs and there is no reason to hold them in memory. */
+  ncciEdits?: NcciEditInput[];
+  /** Which NCCI tables are loaded, so "CMS publishes no edit for this pair"
+   * can be told apart from "we have not imported the file". */
+  ncciDatasets?: NcciDatasetInput[];
+  /** Per client: what to do with a bundling denial CMS says can never be
+   * unbundled. Default 'advisory'. */
+  ncciBundlingPolicyByClient?: Record<UUID, NcciBundlingPolicy>;
   existingCases: ExistingCaseInput[];
   winRates: WinRateInput[];
   clientPayerConfigs: ClientPayerConfigInput[];
@@ -301,13 +338,16 @@ export interface CaseOutput {
   deadlineDate: ISODate | null;
   expired: boolean;
   autoAction: boolean;
+  /** A finding the biller needs in front of them, written to the case notes:
+   * today, what the CMS NCCI tables say about a bundling denial. */
+  evidenceNote?: string;
 }
 
 export interface SkippedCase {
   claimId: UUID;
   claimLineId: UUID | null;
   caseType: CaseType;
-  reason: 'below_threshold' | 'no_recovery_amount';
+  reason: 'below_threshold' | 'no_recovery_amount' | 'ncci_not_separately_payable';
   recoveryOpportunity: number;
 }
 

@@ -313,6 +313,8 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
             timezone, nightly_run_time::text AS nightly_run_time, ingest_folder,
             status, subscription_status, features, baa_acknowledged_at,
             era_balance_policy, era_balance_tolerance,
+            ncci_bundling_policy, attribution_basis, attribution_window_days,
+            attribution_min_amount, attribution_include_unallocated, clawback_policy,
             recovery_alert_threshold, appeal_review_threshold, contract_effective_date,
             (SELECT cmc.medicare_locality FROM client_medicare_config cmc
              WHERE cmc.tenant_id = client.tenant_id
@@ -325,7 +327,7 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
   const payers = await db.query(
     `SELECT py.payer_id, py.payer_name, py.payer_type, py.payer_id_code,
             py.timely_filing_limit_days, py.appeal_deadline_days, py.portal_url,
-            py.payment_reduction_percent,
+            py.payment_reduction_percent, py.bundling_edit_source,
             py.tenant_id AS payer_tenant_id,
             cpc.autopilot_enabled, cpc.review_threshold, cpc.min_case_threshold
      FROM payer py
@@ -377,6 +379,15 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
       medicareLocality: r.medicare_locality,
       eraBalancePolicy: r.era_balance_policy,
       eraBalanceTolerance: num(r.era_balance_tolerance),
+      ncciBundlingPolicy: r.ncci_bundling_policy,
+      // How a recovered dollar is counted for this client — a commercial term,
+      // so it is configuration rather than an engineering constant.
+      attributionBasis: r.attribution_basis,
+      attributionWindowDays: r.attribution_window_days == null
+        ? null : Number(r.attribution_window_days),
+      attributionMinAmount: num(r.attribution_min_amount),
+      attributionIncludeUnallocated: r.attribution_include_unallocated !== false,
+      clawbackPolicy: r.clawback_policy,
     },
     payers: payers.rows.map((p) => ({
       payerId: p.payer_id, name: p.payer_name, type: p.payer_type, code: p.payer_id_code,
@@ -385,6 +396,9 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
       // Sequestration and equivalents: withheld from the payment after
       // adjudication, so it is not an underpayment.
       paymentReductionPercent: num(p.payment_reduction_percent),
+      // Whether this payer adjudicates bundling on the CMS NCCI tables or its
+      // own edits — it decides what the absence of a CMS edit proves.
+      bundlingEditSource: p.bundling_edit_source ?? 'ncci',
       editable: p.payer_tenant_id != null,   // shared master payers are read-only
       autopilot: p.autopilot_enabled ?? false,
       reviewThreshold: p.review_threshold == null ? null : num(p.review_threshold),
@@ -432,6 +446,12 @@ export async function updateClientSettings(
     alertThreshold: 'recovery_alert_threshold', reviewThreshold: 'appeal_review_threshold',
     ingestFolder: 'ingest_folder',
     eraBalancePolicy: 'era_balance_policy', eraBalanceTolerance: 'era_balance_tolerance',
+    ncciBundlingPolicy: 'ncci_bundling_policy',
+    attributionBasis: 'attribution_basis',
+    attributionWindowDays: 'attribution_window_days',
+    attributionMinAmount: 'attribution_min_amount',
+    attributionIncludeUnallocated: 'attribution_include_unallocated',
+    clawbackPolicy: 'clawback_policy',
   };
   // Validated here rather than left to the column CHECK so a bad value is a
   // 400 the operator can read, not a database error.
@@ -450,6 +470,50 @@ export async function updateClientSettings(
       throw err('eraBalanceTolerance must be between 0 and 100 dollars', 400);
     }
   }
+  // These four change what a recovered dollar means and therefore what a
+  // customer is invoiced, so a typo has to be a readable 400 rather than a
+  // constraint violation — or worse, a silently accepted null.
+  const enums: Array<[string, string[]]> = [
+    ['ncciBundlingPolicy', ['advisory', 'suppress_unappealable']],
+    ['attributionBasis', ['incremental_net', 'gross_post_appeal']],
+    ['clawbackPolicy', ['auto', 'flag_only']],
+  ];
+  for (const [key, allowed] of enums) {
+    if (key in input && !allowed.includes(String(input[key]))) {
+      throw err(`${key} must be one of ${allowed.join(', ')}`, 400);
+    }
+  }
+  if ('attributionWindowDays' in input) {
+    // Cleared means "no window", which is null — not zero, which would
+    // attribute nothing at all.
+    if (input.attributionWindowDays === '' || input.attributionWindowDays == null) {
+      input = { ...input, attributionWindowDays: null };
+    } else {
+      const days = Number(input.attributionWindowDays);
+      if (!Number.isInteger(days) || days < 1 || days > 3650) {
+        throw err('attributionWindowDays must be a whole number of days from 1 to 3650, '
+          + 'or blank for no window', 400);
+      }
+    }
+  }
+  if ('attributionMinAmount' in input) {
+    if (input.attributionMinAmount === '' || input.attributionMinAmount == null) {
+      input = { ...input, attributionMinAmount: 0 };
+    }
+    const min = Number(input.attributionMinAmount);
+    if (!Number.isFinite(min) || min < 0) {
+      throw err('attributionMinAmount must be zero or a positive dollar amount', 400);
+    }
+  }
+  if ('attributionIncludeUnallocated' in input) {
+    input = {
+      ...input,
+      attributionIncludeUnallocated:
+        input.attributionIncludeUnallocated === true
+        || input.attributionIncludeUnallocated === 'true',
+    };
+  }
+
   const sets: string[] = [];
   const params: unknown[] = [clientId, s.tenantId];
   for (const [key, col] of Object.entries(fields)) {
@@ -529,9 +593,14 @@ export async function upsertPayerConfig(
   input: { payerId: UUID; autopilot?: boolean; reviewThreshold?: number | null;
            minCaseThreshold?: number | null;
            timelyFilingDays?: number | null; appealDeadlineDays?: number | null;
-           portalUrl?: string | null; paymentReductionPercent?: number | null },
+           portalUrl?: string | null; paymentReductionPercent?: number | null;
+           bundlingEditSource?: 'ncci' | 'proprietary' | null },
 ) {
   assertClientAccess(sess, s, clientId);
+  if (input.bundlingEditSource != null
+      && !['ncci', 'proprietary'].includes(String(input.bundlingEditSource))) {
+    throw err("bundlingEditSource must be 'ncci' or 'proprietary'", 400);
+  }
   if (input.paymentReductionPercent != null) {
     const pct = Number(input.paymentReductionPercent);
     if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
@@ -551,23 +620,26 @@ export async function upsertPayerConfig(
 
   // payer-level fields are editable only on tenant-owned payers
   if (input.timelyFilingDays !== undefined || input.appealDeadlineDays !== undefined
-      || input.portalUrl !== undefined || input.paymentReductionPercent !== undefined) {
+      || input.portalUrl !== undefined || input.paymentReductionPercent !== undefined
+      || input.bundlingEditSource !== undefined) {
     const updated = await db.query(
       `UPDATE payer SET
          timely_filing_limit_days = COALESCE($2, timely_filing_limit_days),
          appeal_deadline_days = COALESCE($3, appeal_deadline_days),
          portal_url = COALESCE($4, portal_url),
-         payment_reduction_percent = COALESCE($6, payment_reduction_percent)
+         payment_reduction_percent = COALESCE($6, payment_reduction_percent),
+         bundling_edit_source = COALESCE($7, bundling_edit_source)
        WHERE payer_id = $1 AND tenant_id = $5 RETURNING payer_id`,
       [input.payerId, input.timelyFilingDays ?? null, input.appealDeadlineDays ?? null,
-       input.portalUrl ?? null, s.tenantId, input.paymentReductionPercent ?? null]);
+       input.portalUrl ?? null, s.tenantId, input.paymentReductionPercent ?? null,
+       input.bundlingEditSource ?? null]);
     if (!updated.rows[0]) {
       const shared = await db.query(
         `SELECT 1 FROM payer WHERE payer_id = $1 AND tenant_id IS NULL`, [input.payerId]);
       if (shared.rows[0]) {
         throw err(
-          'this payer is a shared master record — filing, deadline, portal and '
-          + 'payment-reduction fields are read-only', 409);
+          'this payer is a shared master record — filing, deadline, portal, '
+          + 'payment-reduction and bundling-edit fields are read-only', 409);
       }
     }
   }

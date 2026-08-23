@@ -11,6 +11,9 @@
 //   * prior win rate for this denial category + payer
 //   * whether the supporting documents are on file
 //   * whether a similar case (category + payer) was previously won
+//   * for bundling denials, what the CMS NCCI edit tables say about the pair —
+//     an indicator-0 edit means no modifier can ever unbundle it, so the score
+//     has to fall far enough that the case sorts below work that can be won
 //
 // priority_level:
 //   critical: deadline within 14 days or recovery > $5000
@@ -141,6 +144,7 @@ export function scoreCandidates(
         + deadlineAdjustment(days)
         + winRateAdjustment(input, c)
         + documentsAdjustment(c)
+        + (c.ncci?.scoreAdjustment ?? 0)
         + (c.knownCode ? 0 : -15),
       ),
       0, 100,

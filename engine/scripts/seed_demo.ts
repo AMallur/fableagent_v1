@@ -81,7 +81,9 @@ await q(`SELECT set_config('app.allow_invoice_purge', 'on', false)`);
 for (const table of [
   'api_rate_window', 'api_request_log', 'api_key', 'scheduler_lease',
   'onboarding_step', 'client_integration', 'sso_config', 'data_export_request',
-  'invoice_line', 'invoice',
+  // usage_event is billing history and references invoice; it goes first so
+  // the invoice rows that claimed it can follow.
+  'invoice_line', 'usage_event', 'invoice',
   'rule_execution', 'automation_rule', 'notification_preference', 'notification',
   'email_outbox', 'dashboard_snapshot',
   // outbound_delivery/appeal_packet_document/case_action/payment_event/

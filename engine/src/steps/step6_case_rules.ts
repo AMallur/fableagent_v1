@@ -9,6 +9,8 @@
 //                                                      never prioritized
 //   * client+payer on autopilot                     -> auto_action=true,
 //                                                      else manual queue
+//   * bundling denial CMS says can never be unbundled, and the client asked
+//     for those to be suppressed          -> skip, logged with the reason
 // ============================================================================
 
 import type { CaseOutput, EngineInput, SkippedCase } from '../types.ts';
@@ -49,6 +51,19 @@ export function applyCaseRules(
     );
     const threshold = cpc?.minCaseThreshold ?? input.config.minCaseThreshold;
 
+    // A pair CMS marks modifier-indicator 0 is never separately payable: no
+    // modifier overrides it and the appeal cannot be won on unbundling. A
+    // client who has said so wants it off the worklist entirely rather than
+    // sitting there looking like recoverable money.
+    if (c.suppressed) {
+      skipped.push({
+        claimId: claim.claimId, claimLineId: lineKey, caseType: c.caseType,
+        reason: 'ncci_not_separately_payable',
+        recoveryOpportunity: c.recoveryOpportunity,
+      });
+      continue;
+    }
+
     // rule 2: below threshold -> no case, log it
     if (!moneyGt(c.recoveryOpportunity, 0)) {
       skipped.push({
@@ -84,6 +99,7 @@ export function applyCaseRules(
       deadlineDate: c.deadlineDate,
       expired: c.expired,
       autoAction: !c.expired && (cpc?.autopilotEnabled ?? false),  // rule 4
+      evidenceNote: c.ncci?.explanation,
     };
 
     // rule 1: existing open case -> update, don't duplicate

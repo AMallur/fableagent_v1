@@ -101,7 +101,8 @@ export async function persistResult(
        `Case auto-created by detection engine${jobNote}: `
        + `${c.caseType}${c.denialReasonCode ? ` [${c.denialReasonCode}]` : ''}, `
        + `recovery opportunity $${c.recoveryOpportunity.toFixed(2)}, `
-       + `score ${c.appealabilityScore}/100${c.expired ? ', DEADLINE EXPIRED' : ''}`],
+       + `score ${c.appealabilityScore}/100${c.expired ? ', DEADLINE EXPIRED' : ''}`
+       + (c.evidenceNote ? `. ${c.evidenceNote}` : '')],
     );
     stats.casesInserted += 1;
     stats.createdCaseIds.push(inserted.rows[0].case_id);
@@ -127,7 +128,8 @@ export async function persistResult(
       [tenantId, c.existingCaseId,
        `Case refreshed by detection engine${jobNote}: `
        + `recovery opportunity now $${c.recoveryOpportunity.toFixed(2)}, `
-       + `score ${c.appealabilityScore}/100`],
+       + `score ${c.appealabilityScore}/100`
+       + (c.evidenceNote ? `. ${c.evidenceNote}` : '')],
     );
     stats.casesUpdated += 1;
     if (c.existingCaseId) stats.updatedCaseIds.push(c.existingCaseId);

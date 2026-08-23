@@ -44,7 +44,24 @@ customer and trading partner:
    line-scoped, post-appeal cash net of reversals and PLB recoupments, records
    every component on `payment_event`, and never reverses a recovery a person
    matched by hand. That is a defensible basis, not a substitute for the
-   customer having agreed to it.
+   customer having agreed to it. Where the agreement says something different,
+   set it rather than living with the default: `client.attribution_basis`,
+   `attribution_window_days`, `attribution_min_amount`,
+   `attribution_include_unallocated` and `clawback_policy` are the five
+   decisions a contract can legitimately state, each defaulting to the
+   conservative reading. Invoices are built from the append-only `usage_event`
+   ledger, so a bill stays reconstructible after the operational data moves on
+   — do not bypass it by billing off `payment_event` directly.
+5c. Import the current quarterly CMS NCCI PTP files before relying on bundling
+   recommendations (`node src/cli.ts reference-import --kind ncci_ptp
+   --service-setting practitioner|outpatient_hospital`). Without them the
+   platform says so and declines to conclude anything, which is correct but
+   means every CO-97 falls back to manual verification. Re-import each quarter:
+   only the newest dataset per setting is consulted, and a table older than the
+   date of service cannot rule out an edit. Set
+   `payer.bundling_edit_source = 'proprietary'` for payers that do not
+   adjudicate on NCCI, or the platform will tell billers a denial contradicts
+   a policy that payer never adopted.
 6. Require certified coding review for every corrected claim and modifier
    change. The rules engine is decision support, not clinical documentation.
 7. Run load, failover, backup/restore and disaster-recovery exercises in the

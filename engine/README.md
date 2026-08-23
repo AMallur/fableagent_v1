@@ -473,9 +473,41 @@ below the expected amount. `OA-23` and `CO-253` carry it for the same reason —
 essentially every line of every secondary claim, and `CO-253` is statutory
 sequestration, which is not appealable. CO-97 reclassifies from coding to bundling when a
 sibling line on the same claim was paid (the "included in primary procedure"
-context). Unmapped codes produce a low-likelihood manual-review candidate
-rather than being dropped. Deadline = remit check date + payer
+context), and a bundling denial is then checked against the **CMS NCCI edit
+tables** — see below. Unmapped codes produce a low-likelihood manual-review
+candidate rather than being dropped. Deadline = remit check date + payer
 `appeal_deadline_days` (default 90).
+
+**NCCI procedure-to-procedure edits.** A bundling denial is the one denial
+where the payer's own rulebook is public, so the platform reads it rather than
+telling a biller to go and check. The denied line is the column-two code; a
+paid sibling on the same claim is the column-one candidate; `claim.claim_type`
+picks the practitioner or outpatient-hospital table. Six findings, and only two
+of them are "append modifier 59 and appeal":
+
+| Finding | What it means | Effect |
+|---|---|---|
+| `never_separately_payable` | Edit in force, **modifier indicator 0**: no modifier can override it, ever | Likelihood `low`, score −35, and the recommendation says plainly not to appeal for unbundling. A `59` on the line does not change this — billing one against an indicator-0 pair is itself a coding problem |
+| `override_billed_and_ignored` | Indicator 1 and we billed `59`/`XE`/`XP`/`XS`/`XU` (or another CMS PTP-associated modifier); the payer bundled anyway | Likelihood `high`, score +20 |
+| `override_available` | Indicator 1, no bypass modifier billed | Unchanged (`medium`): the edit was applied correctly on what was submitted; the route is a corrected claim where the record supports a distinct service |
+| `edit_not_in_force` | Indicator 9, or an edit whose effective/deletion dates do not cover the date of service | Likelihood `high`, score +15 |
+| `no_edit_published` | CMS publishes nothing for the pair | `high` against a payer that adjudicates on NCCI (it contradicts their own policy); `medium` against one set to `payer.bundling_edit_source = 'proprietary'`, where the play is to demand the edit rationale under the contract |
+| `no_reference_data` / `reference_predates_service` | No NCCI table imported, or the loaded quarter starts after the service | Nothing is concluded and the score does not move. "CMS publishes no edit" and "we have not loaded the file" are different statements and are never reported as the same one |
+
+The finding is written to the case timeline as evidence, not just folded into a
+score. Load the quarterly CMS file with
+`node src/cli.ts reference-import --kind ncci_ptp --service-setting practitioner`;
+until then bundling denials behave exactly as they did before. Only the newest
+imported dataset per setting is consulted — the CMS files are cumulative
+quarterly replacements, and mixing two would revive withdrawn edits. Edits are
+loaded narrowly per run (only pairs whose both sides appear on the run's
+claims), because the published tables run to millions of rows.
+
+Per client, `client.ncci_bundling_policy` decides what to do with an
+indicator-0 finding: `advisory` (default) still opens the case carrying the
+warning; `suppress_unappealable` does not open it at all and logs a
+`ncci_not_separately_payable` skip with the amount, so the money is still
+visible without sitting on a worklist as though it were recoverable.
 
 **Step 5 — scoring.** Category base score with the spec's context rules
 (auth denial with an auth number on the encounter scores 85; duplicate denial
@@ -524,16 +556,66 @@ has to survive being audited against the customer's own remittances.
    went out is cash moving the other way and comes off the total.
 4. **Only what this reconciler attributed can be reversed.** When a payer
    takes money back, the clawback is capped at the recovery this arithmetic
-   itself credited (`attribution_basis = 'incremental_net'`). A payment a
-   biller verified and matched by hand is never undone by a robot — the
-   operator is notified and the case timeline records the takeback instead.
-   A negative delta with no reversal and no recoupment behind it is a
-   bookkeeping difference, not a takeback, and is left alone.
+   itself credited. A payment a biller verified and matched by hand is never
+   undone by a robot — the operator is notified and the case timeline records
+   the takeback instead. A negative delta with no reversal and no recoupment
+   behind it is a bookkeeping difference, not a takeback, and is left alone.
 
 Every component is stored on `payment_event` — `pre_appeal_paid`,
 `gross_post_appeal_paid`, `unallocated_paid`, `reversals_netted`,
 `recoupments_netted`, `attribution_basis`, `attribution_scope` — so a
 recovery line can be defended figure by figure rather than asserted.
+
+### Attribution policy
+
+Which post-appeal dollars count is a **commercial term, not an engineering
+constant**, so the five decisions above that a contract can legitimately state
+differently are per-client configuration on `client`. Every default is the
+behavior described above, so no existing client's numbers move:
+
+| Setting | Default | What changing it does |
+|---|---|---|
+| `attribution_basis` | `incremental_net` | `gross_post_appeal` credits every dollar paid after submission instead of the net movement. It over-credits a reverse-and-reissue by construction — opt in only where the contract says so. Recoupments net under both: a PLB takeback is not payment. |
+| `attribution_window_days` | `NULL` (no limit) | Payment arriving more than N days after submission stops counting as the appeal's doing. Reversals are **never** windowed out — a late takeback still removes money we credited. |
+| `attribution_min_amount` | `0` | Movement below this is treated as noise (rounding, a few cents of interest) and does not open a billable event. Never suppresses a takeback. |
+| `attribution_include_unallocated` | `true` | Turning it off stops attributing remittance detail the payer never resolved to a service line. The amount is reported either way. |
+| `clawback_policy` | `auto` | `flag_only` records and escalates a takeback but leaves the credited figure for a person — some contracts require that, because reversing a recovery moves an invoice that has already gone out. It escalates once, not nightly. |
+
+Set them per client in **Settings → Organization profile**, or over the API
+with `PATCH /api/admin/clients/:id`. A bad value is a readable 400, not a
+constraint violation.
+
+## Usage ledger
+
+Invoices used to be computed from `payment_event` at the moment they were
+generated. That table is live and operational — reconciliation revises it, a
+clawback lands on it, an operator corrects a bad match — so the evidence behind
+a bill that had already gone out could move underneath it. Freezing the invoice
+totals stopped the bill changing; it did not make the bill **reproducible**.
+
+`usage_event` is the append-only record of billable facts: one row per
+`payment_event`, written once with the amount as it stood, carrying enough in
+`detail` (claim number, payer, gross, unallocated, reversals, recoupments) to
+re-derive the figure without the operational tables at all. A database trigger
+refuses every update except `invoice_id`, and refuses deletion outright.
+
+- **The sync is a scan-and-append**, not a write on every path that touches
+  `payment_event`. Reconciliation, a manual match, a backfill and a correction
+  all land as payment events; making each of them remember to write the ledger
+  too is how ledgers end up incomplete. One idempotent pass, guarded by a
+  unique index, cannot miss and cannot double. It runs at the end of
+  reconciliation and again before an invoice is computed.
+- **A correction is a new row.** A takeback is a negative
+  `recovery_clawed_back` event, never an amendment of the original.
+- **An invoice claims its rows.** The database refuses to move a row another
+  invoice already holds, so two overlapping generations cannot bill the same
+  recovery twice. Voiding an invoice releases its rows to be billed again and
+  leaves the events themselves untouched — nothing that happened stops having
+  happened because a bill was wrong.
+
+`GET /api/admin/invoices/:id` returns the ledger behind the bill alongside its
+lines; `GET /api/admin/clients/:id/billing/ledger` shows a client's whole
+billable history, billed and not yet billed.
 
 ## Commercial terms
 
@@ -545,11 +627,12 @@ else's cash, so three things have to hold, and the schema enforces all three:
   platform attributed and can defend line by line (see **Recovery attribution**
   above), never on an estimate. A plan set to the `verified` basis charges only
   on recovery a person confirmed.
-- **Each recovery is billed once.** `invoice_line` carries one row per
-  `payment_event` with a unique index on it, so a re-run, an overlapping
-  period, or a regenerated month cannot bill the same dollar twice. A negative
-  event — a payer clawing money back — reduces the basis rather than being
-  quietly kept.
+- **Each recovery is billed once.** Invoices are built from the append-only
+  **usage ledger** (below): `invoice_line` carries one row per `usage_event`,
+  each of which may be claimed by exactly one invoice, so a re-run, an
+  overlapping period, or a regenerated month cannot bill the same dollar
+  twice. A negative event — a payer clawing money back — reduces the basis
+  rather than being quietly kept.
 - **An issued invoice does not change.** A database trigger refuses to alter
   the figures on anything past `draft`, or to delete it; corrections are made
   by voiding and reissuing, which releases that invoice's recoveries to be

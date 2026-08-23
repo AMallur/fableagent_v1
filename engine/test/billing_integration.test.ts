@@ -35,7 +35,8 @@ describe('commercial terms', { skip: !url && 'TEST_DATABASE_URL not set' }, () =
       await c.query(`SELECT set_config('app.allow_invoice_purge', 'on', false)`);
       await c.query(`SET session_replication_role = replica`);
       for (const t of [
-        'invoice_line', 'invoice', 'pricing_plan', 'payment_event', 'appeal_packet',
+        'invoice_line', 'usage_event', 'invoice', 'pricing_plan', 'payment_event',
+        'appeal_packet',
         'case_action', 'recovery_case', 'claim_line', 'claim', 'encounter', 'patient',
         'provider', 'audit_log', 'app_user', 'client',
       ]) await c.query(`DELETE FROM ${t} WHERE tenant_id = $1`, [T]);

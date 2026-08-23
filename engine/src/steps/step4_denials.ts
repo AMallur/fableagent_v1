@@ -13,6 +13,7 @@ import type {
 } from '../types.ts';
 import { addDays, round2 } from '../config.ts';
 import { classifyDenial } from '../taxonomy.ts';
+import { evaluateNcci, type NcciAssessment } from './ncci.ts';
 import type { MatchedLine } from './step1_matching.ts';
 import type { DenialRoute, VarianceFlag } from './step3_variance.ts';
 
@@ -30,6 +31,12 @@ export interface CaseCandidate {
   recoveryOpportunity: number;
   deadlineDate: string | null;
   noContract: boolean;
+  /** Present on bundling denials: what the CMS edit tables actually say about
+   * this pair, and therefore whether an unbundling appeal has anywhere to go. */
+  ncci?: NcciAssessment;
+  /** Set when the client asked for unappealable bundling denials to be
+   * suppressed and this is one. Step 6 drops it instead of opening a case. */
+  suppressed?: boolean;
 }
 
 function payerById(input: EngineInput, payerId: string): PayerInput | undefined {
@@ -67,6 +74,14 @@ export function candidatesFromDenials(
     ) || false;
     const cls = classifyDenial(normalizedCode, { siblingLinePaid });
     const paid = remitLine.paidAmount ?? claimLine.paidAmount ?? 0;
+
+    // A bundling denial is the one denial where the payer's own rulebook is
+    // public. Consult it before telling a biller to go and appeal.
+    const ncci = cls.category === 'bundling'
+      ? evaluateNcci(input, claim, claimLine) : undefined;
+    const policy = input.ncciBundlingPolicyByClient?.[claim.clientId] ?? 'advisory';
+    const suppressed = ncci?.finding === 'never_separately_payable'
+      && policy === 'suppress_unappealable';
     // If line-level patient responsibility is unavailable, the precise payer
     // liability is unknown. Still surface the denial, but cap its opportunity
     // at the documented contract/reference expectation instead of inflating
@@ -78,8 +93,8 @@ export function candidatesFromDenials(
       caseType: cls.caseType,
       denialReasonCode: normalizedCode,
       denialCategory: cls.category,
-      baseLikelihood: cls.baseLikelihood,
-      recommendedAction: cls.recommendedAction,
+      baseLikelihood: ncci?.likelihood ?? cls.baseLikelihood,
+      recommendedAction: ncci?.recommendedAction ?? cls.recommendedAction,
       supportingDocuments: cls.supportingDocuments,
       knownCode: cls.known,
       expectedAmount: expectedBasis,
@@ -90,6 +105,8 @@ export function candidatesFromDenials(
       ),
       deadlineDate: appealDeadline(input, matched),
       noContract: pricing.noContract,
+      ncci,
+      suppressed,
     };
   });
 }

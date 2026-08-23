@@ -769,6 +769,17 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     json(ctx, 200, await billing.previewInvoice(
       pool, ctx.session!, ctx.scope!, ctx.params[0], String(body.month ?? '')));
   });
+  // The append-only record behind the bills, billed and not yet billed.
+  authed('GET', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/billing\/ledger$/, async (ctx) => {
+    const u = new URL(ctx.req.url ?? '', 'http://local');
+    json(ctx, 200, await billing.clientUsageLedger(
+      pool, ctx.session!, ctx.scope!, ctx.params[0], {
+        from: u.searchParams.get('from') ?? undefined,
+        to: u.searchParams.get('to') ?? undefined,
+        unbilledOnly: u.searchParams.get('unbilledOnly') === 'true',
+        limit: Number(u.searchParams.get('limit')) || undefined,
+      }));
+  });
   authed('GET', /^\/api\/admin\/invoices\/([0-9a-f-]{36})$/, async (ctx) =>
     json(ctx, 200, await billing.invoiceDetail(pool, ctx.session!, ctx.scope!, ctx.params[0])));
   authed('POST', /^\/api\/admin\/invoices\/([0-9a-f-]{36})\/issue$/, async (ctx) =>
