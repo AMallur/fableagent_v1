@@ -112,12 +112,14 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
 
       - name: Generate dependency security evidence
+        if: always()
         working-directory: engine
         run: |
-          npm audit --omit=dev --audit-level=high --json > dependency-audit.json
+          npm audit --omit=dev --json > dependency-audit.json || true
           npm sbom --sbom-format=cyclonedx > sbom.cdx.json
 
       - name: Upload dependency security evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dependency-security-evidence-${{ github.sha }}
