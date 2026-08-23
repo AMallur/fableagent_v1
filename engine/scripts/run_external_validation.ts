@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import {
@@ -18,18 +19,23 @@ if (!inputPath) {
 }
 
 const raw = await readFile(resolve(inputPath), 'utf8');
+const reviewInputSha256 = createHash('sha256').update(raw).digest('hex');
 const input = JSON.parse(raw) as ValidationInput;
 const metrics = calculateValidationMetrics(input);
 await mkdir(outputDir, { recursive: true });
 
 const metricsPath = resolve(outputDir, 'metrics.json');
 const reportPath = resolve(outputDir, 'report.md');
-await writeFile(metricsPath, `${JSON.stringify(metrics, null, 2)}\n`);
-await writeFile(reportPath, markdown(metrics));
+await writeFile(metricsPath, `${JSON.stringify({ reviewInputSha256, metrics }, null, 2)}\n`);
+await writeFile(reportPath, markdown(metrics, reviewInputSha256));
 console.log(`External validation metrics: ${metricsPath}`);
 console.log(`External validation report: ${reportPath}`);
+console.log(`Review input SHA-256: ${reviewInputSha256}`);
 
-function markdown(metrics: ReturnType<typeof calculateValidationMetrics>): string {
+function markdown(
+  metrics: ReturnType<typeof calculateValidationMetrics>,
+  reviewInputSha256: string,
+): string {
   const pct = (n: number | null) => n == null ? 'not estimable' : `${(n * 100).toFixed(2)}%`;
   const ci = (value: typeof metrics.precision95) => value == null
     ? 'not estimable'
@@ -37,13 +43,22 @@ function markdown(metrics: ReturnType<typeof calculateValidationMetrics>): strin
   return `# External validation metrics\n\n`
     + `> This report is only as independent as the underlying customer/reviewer evidence. `
     + `Generating this file does not create third-party validation.\n\n`
+    + `## Evidence identity\n\n`
+    + `- Study: ${metrics.studyId}\n`
+    + `- Dataset: ${metrics.datasetId}\n`
+    + `- Dataset manifest SHA-256: ${metrics.datasetManifestSha256}\n`
+    + `- Review input SHA-256: ${reviewInputSha256}\n`
+    + `- Engine commit: ${metrics.engineCommit}\n`
+    + `- Protocol version: ${metrics.protocolVersion}\n`
+    + `- Complete ground truth declared: ${metrics.groundTruthComplete ? 'yes' : 'no'}\n\n`
     + `| Metric | Result |\n|---|---:|\n`
     + `| Findings | ${metrics.findings} |\n`
     + `| Adjudicated findings | ${metrics.adjudicated} |\n`
-    + `| Valid findings | ${metrics.valid} |\n`
-    + `| Invalid findings | ${metrics.invalid} |\n`
+    + `| True positives | ${metrics.truePositives} |\n`
+    + `| Invalid findings | ${metrics.invalidFindings} |\n`
     + `| Excluded findings | ${metrics.excluded} |\n`
     + `| Unresolved findings | ${metrics.unresolved} |\n`
+    + `| Independently found misses | ${metrics.missed} |\n`
     + `| Precision | ${pct(metrics.precision)} |\n`
     + `| Precision 95% CI | ${ci(metrics.precision95)} |\n`
     + `| Recall | ${pct(metrics.recall)} |\n`
