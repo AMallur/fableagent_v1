@@ -99,6 +99,35 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Smoke external assurance tooling
+        working-directory: engine
+        run: |
+          npm run validation:external -- --input ../docs/examples/external_validation.example.json --output-dir var/external_validation_example
+          mkdir -p var/assurance_smoke
+          npm run evidence:manifest -- \
+            --bundle-id "ci-${GITHUB_SHA}" \
+            --engine-commit "${GITHUB_SHA}" \
+            --protocol-version external-validation-v1 \
+            --output var/assurance_smoke/evidence-manifest.json \
+            --files \
+              ../docs/examples/external_validation.example.json \
+              ../docs/examples/external_validation.schema.json \
+              var/external_validation_example/metrics.json \
+              var/external_validation_example/report.md \
+              var/pilot_benchmark/benchmark.json \
+              var/pilot_benchmark/benchmark.md
+
+      - name: Upload assurance tooling smoke evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: assurance-tooling-smoke-${{ github.sha }}
+          path: |
+            engine/var/external_validation_example/metrics.json
+            engine/var/external_validation_example/report.md
+            engine/var/assurance_smoke/evidence-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Integration tests
         working-directory: engine
         run: npm run test:integration
