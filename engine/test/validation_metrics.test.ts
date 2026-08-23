@@ -118,7 +118,7 @@ describe('external validation metrics', () => {
       groundTruthComplete: true,
       findings: [reviewed({ disposition: 'excluded', validatedAmount: 0, exclusionReason: null })],
       missedFindings: [],
-    }), /excluded finding requires exclusionReason/);
+    }), /exclusionReason must be non-empty/);
 
     const extraField = {
       ...metadata,
