@@ -12,15 +12,21 @@ cd engine
 npm run benchmark:pilot
 ```
 
-It writes `var/pilot_benchmark/report.json` and `report.md`. The command exits
-nonzero if its expected flags or dollars drift. This is regression evidence,
-not clinical validation, customer evidence, or recovered revenue.
+It writes `var/pilot_benchmark/benchmark.json` and `benchmark.md`. The command
+exits nonzero if its expected flags or dollars drift. This is regression
+evidence, not clinical validation, customer evidence, or recovered revenue.
+The pull-request CI also runs this benchmark and uploads the two files as a
+commit-bound synthetic benchmark artifact.
 
 ## Real-world external validation
 
 Use `docs/EXTERNAL_VALIDATION_PROTOCOL.md` before reviewing real-world results.
 The study scope, denominator, exclusions, reviewers, metrics, and any pass/fail
 thresholds should be fixed before results are unblinded.
+
+Start from the de-identified example and formal schema in
+`docs/examples/external_validation.example.json` and
+`docs/examples/external_validation.schema.json`.
 
 A machine-readable review file can be scored with:
 
@@ -31,9 +37,16 @@ npm run validation:external -- --input validation.json --output-dir var/external
 
 The validator reports precision, 95% confidence intervals, coverage, unresolved
 rate, count/dollar accuracy measures, and recall only when the input explicitly
-declares that a complete ground-truth review was performed. The tool cannot
-create independent validation by itself; the customer/reviewer evidence is the
-source of truth.
+declares that a complete ground-truth review was performed. It also evaluates
+any pre-registered acceptance gates included in the input. A recall-based gate
+fails when complete ground truth is absent rather than inferring a favorable
+result. The metric input rejects undeclared fields so the calculation file can
+stay minimal and free of unnecessary identifying data.
+
+The tool cannot create independent validation by itself; the customer/reviewer
+evidence is the source of truth. The generated report includes the study ID,
+dataset ID, dataset-manifest SHA-256, exact engine commit, protocol version, and
+SHA-256 of the review input used to calculate the metrics.
 
 ## Immutable evidence bundle
 
