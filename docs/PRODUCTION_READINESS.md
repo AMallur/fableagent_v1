@@ -5,9 +5,11 @@ not configured. A packet is not marked submitted merely because a connector
 attempt was recorded, and console-only email output is not marked delivered.
 
 Use `COMMERCIAL_ASSURANCE_MATRIX.md` as the evidence index,
-`SECURITY_THREAT_MODEL.md` for the current security boundary and residual
-risks, `OPERATIONAL_RESILIENCE_RUNBOOK.md` for target-environment exercises,
-and `RELEASE_EVIDENCE_TEMPLATE.md` for every customer-facing release.
+`OPERATIONAL_ACCEPTANCE_GATES.md` to determine what may be claimed or enabled
+at each commercial stage, `SECURITY_THREAT_MODEL.md` for the current security
+boundary and residual risks, `OPERATIONAL_RESILIENCE_RUNBOOK.md` for
+target-environment exercises, and `RELEASE_EVIDENCE_TEMPLATE.md` for every
+customer-facing release.
 
 ## Automated release gates
 
@@ -17,6 +19,8 @@ and `RELEASE_EVIDENCE_TEMPLATE.md` for every customer-facing release.
 - The runtime Docker image builds successfully.
 - `npm audit --omit=dev --audit-level=high` reports no high or critical issue.
 - CodeQL completes successfully.
+- CI generates and retains a production-dependency audit report and CycloneDX
+  software bill of materials (SBOM) tied to the tested commit.
 - Pilot evidence-manifest and external-validation metric regression tests pass
   as part of `npm test`.
 
