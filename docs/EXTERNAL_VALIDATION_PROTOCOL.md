@@ -78,8 +78,11 @@ Use a frozen denominator and report both case counts and dollars.
 - Recall = true positives / (true positives + independently found missed opportunities), only with complete ground truth.
 - Coverage = matched-and-priced eligible claim lines / eligible claim lines received.
 - Unresolved rate = unresolved FableAgent findings / all FableAgent findings.
-- Dollar precision = independently validated true-positive dollars / predicted dollars across adjudicated FableAgent findings.
-- Dollar recall = independently validated true-positive dollars / (validated true-positive dollars + validated missed-opportunity dollars), only with complete ground truth.
+- Matched validated dollars = `min(predicted amount, independently validated amount)` for each true-positive finding, summed across true positives.
+- Dollar precision = matched validated dollars / predicted dollars across adjudicated FableAgent findings.
+- Dollar recall = matched validated dollars / (validated true-positive dollars + validated missed-opportunity dollars), only with complete ground truth.
+
+The matched-dollar definition deliberately keeps dollar precision and dollar recall between 0% and 100%. False positives and overprediction reduce dollar precision; underprediction and missed opportunities reduce dollar recall. Do not substitute raw validated/predicted ratios that can exceed 100% and be mistaken for precision.
 
 Publish 95% confidence intervals for count-based precision and recall when sample size permits. Always include raw numerators/denominators next to percentages.
 
