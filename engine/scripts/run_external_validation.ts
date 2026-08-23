@@ -1,0 +1,61 @@
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import {
+  calculateValidationMetrics,
+  type ValidationInput,
+} from '../src/pilot/validation_metrics.ts';
+
+function arg(name: string): string | null {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] ?? null : null;
+}
+
+const inputPath = arg('--input');
+const outputDir = resolve(arg('--output-dir') ?? 'var/external_validation');
+if (!inputPath) {
+  console.error('Usage: node scripts/run_external_validation.ts --input <validation.json> [--output-dir <dir>]');
+  process.exit(2);
+}
+
+const raw = await readFile(resolve(inputPath), 'utf8');
+const input = JSON.parse(raw) as ValidationInput;
+const metrics = calculateValidationMetrics(input);
+await mkdir(outputDir, { recursive: true });
+
+const metricsPath = resolve(outputDir, 'metrics.json');
+const reportPath = resolve(outputDir, 'report.md');
+await writeFile(metricsPath, `${JSON.stringify(metrics, null, 2)}\n`);
+await writeFile(reportPath, markdown(metrics));
+console.log(`External validation metrics: ${metricsPath}`);
+console.log(`External validation report: ${reportPath}`);
+
+function markdown(metrics: ReturnType<typeof calculateValidationMetrics>): string {
+  const pct = (n: number | null) => n == null ? 'not estimable' : `${(n * 100).toFixed(2)}%`;
+  const ci = (value: typeof metrics.precision95) => value == null
+    ? 'not estimable'
+    : `${(value.lower * 100).toFixed(2)}%–${(value.upper * 100).toFixed(2)}%`;
+  return `# External validation metrics\n\n`
+    + `> This report is only as independent as the underlying customer/reviewer evidence. `
+    + `Generating this file does not create third-party validation.\n\n`
+    + `| Metric | Result |\n|---|---:|\n`
+    + `| Findings | ${metrics.findings} |\n`
+    + `| Adjudicated findings | ${metrics.adjudicated} |\n`
+    + `| Valid findings | ${metrics.valid} |\n`
+    + `| Invalid findings | ${metrics.invalid} |\n`
+    + `| Excluded findings | ${metrics.excluded} |\n`
+    + `| Unresolved findings | ${metrics.unresolved} |\n`
+    + `| Precision | ${pct(metrics.precision)} |\n`
+    + `| Precision 95% CI | ${ci(metrics.precision95)} |\n`
+    + `| Recall | ${pct(metrics.recall)} |\n`
+    + `| Recall 95% CI | ${ci(metrics.recall95)} |\n`
+    + `| Coverage | ${pct(metrics.coverage)} |\n`
+    + `| Unresolved rate | ${pct(metrics.unresolvedRate)} |\n`
+    + `| Predicted adjudicated dollars | $${metrics.predictedAdjudicatedDollars.toFixed(2)} |\n`
+    + `| Validated dollars | $${metrics.validatedDollars.toFixed(2)} |\n`
+    + `| Missed validated dollars | $${metrics.missedDollars.toFixed(2)} |\n`
+    + `| Dollar precision | ${pct(metrics.dollarPrecision)} |\n`
+    + `| Dollar recall | ${pct(metrics.dollarRecall)} |\n\n`
+    + (metrics.recall == null
+      ? `Recall and dollar recall are intentionally not reported because complete ground truth was not declared.\n`
+      : `Recall is based on a declared complete ground-truth review and must be supported by the evidence bundle.\n`);
+}
