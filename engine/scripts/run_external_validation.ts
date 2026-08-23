@@ -31,7 +31,12 @@ await writeFile(reportPath, markdown(metrics, reviewInputSha256));
 console.log(`External validation metrics: ${metricsPath}`);
 console.log(`External validation report: ${reportPath}`);
 console.log(`Review input SHA-256: ${reviewInputSha256}`);
-if (metrics.gatesPassed != null) console.log(`Pre-registered gates passed: ${metrics.gatesPassed ? 'yes' : 'no'}`);
+if (metrics.gatesPassed != null) {
+  console.log(`Pre-registered gates passed: ${metrics.gatesPassed ? 'yes' : 'no'}`);
+  // Preserve the report/evidence files but make a preregistered failure a
+  // machine-enforced failure for CI/release automation.
+  if (!metrics.gatesPassed) process.exitCode = 1;
+}
 
 function markdown(
   metrics: ReturnType<typeof calculateValidationMetrics>,
