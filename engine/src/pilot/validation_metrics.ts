@@ -1,4 +1,10 @@
-export type ValidationLabel = 'valid' | 'invalid' | 'excluded' | 'unresolved';
+export type ValidationDisposition =
+  | 'true_positive'
+  | 'false_positive'
+  | 'duplicate'
+  | 'already_recovered'
+  | 'excluded'
+  | 'unresolved';
 
 export interface ReviewedFinding {
   id: string;
@@ -6,7 +12,13 @@ export interface ReviewedFinding {
   category: string;
   predictedAmount: number;
   validatedAmount: number;
-  label: ValidationLabel;
+  disposition: ValidationDisposition;
+  reviewerId: string;
+  reviewedAt: string;
+  secondReviewerId?: string | null;
+  adjudicatorId?: string | null;
+  rationaleRef?: string | null;
+  exclusionReason?: string | null;
 }
 
 export interface MissedFinding {
@@ -14,9 +26,20 @@ export interface MissedFinding {
   payer: string;
   category: string;
   validatedAmount: number;
+  reviewerId: string;
+  reviewedAt: string;
+  secondReviewerId?: string | null;
+  adjudicatorId?: string | null;
+  rationaleRef?: string | null;
 }
 
 export interface ValidationInput {
+  schemaVersion: 1;
+  studyId: string;
+  datasetId: string;
+  datasetManifestSha256: string;
+  engineCommit: string;
+  protocolVersion: string;
   findings: ReviewedFinding[];
   missedFindings: MissedFinding[];
   groundTruthComplete: boolean;
@@ -30,10 +53,17 @@ export interface Interval {
 }
 
 export interface ValidationMetrics {
+  schemaVersion: 1;
+  studyId: string;
+  datasetId: string;
+  datasetManifestSha256: string;
+  engineCommit: string;
+  protocolVersion: string;
+  groundTruthComplete: boolean;
   findings: number;
   adjudicated: number;
-  valid: number;
-  invalid: number;
+  truePositives: number;
+  invalidFindings: number;
   excluded: number;
   unresolved: number;
   missed: number;
@@ -50,34 +80,45 @@ export interface ValidationMetrics {
   dollarRecall: number | null;
 }
 
+const INVALID = new Set<ValidationDisposition>([
+  'false_positive', 'duplicate', 'already_recovered',
+]);
+
 export function calculateValidationMetrics(input: ValidationInput): ValidationMetrics {
   validateInput(input);
-  const valid = input.findings.filter((f) => f.label === 'valid');
-  const invalid = input.findings.filter((f) => f.label === 'invalid');
-  const excluded = input.findings.filter((f) => f.label === 'excluded');
-  const unresolved = input.findings.filter((f) => f.label === 'unresolved');
-  const adjudicated = [...valid, ...invalid];
+  const truePositives = input.findings.filter((f) => f.disposition === 'true_positive');
+  const invalid = input.findings.filter((f) => INVALID.has(f.disposition));
+  const excluded = input.findings.filter((f) => f.disposition === 'excluded');
+  const unresolved = input.findings.filter((f) => f.disposition === 'unresolved');
+  const adjudicated = [...truePositives, ...invalid];
   const predicted = money(adjudicated.reduce((n, f) => n + f.predictedAmount, 0));
-  const validated = money(valid.reduce((n, f) => n + f.validatedAmount, 0));
+  const validated = money(truePositives.reduce((n, f) => n + f.validatedAmount, 0));
   const missedDollars = money(input.missedFindings.reduce((n, f) => n + f.validatedAmount, 0));
 
-  const precision = ratio(valid.length, adjudicated.length);
+  const precision = ratio(truePositives.length, adjudicated.length);
   const recall = input.groundTruthComplete
-    ? ratio(valid.length, valid.length + input.missedFindings.length)
+    ? ratio(truePositives.length, truePositives.length + input.missedFindings.length)
     : null;
 
   return {
+    schemaVersion: 1,
+    studyId: input.studyId,
+    datasetId: input.datasetId,
+    datasetManifestSha256: input.datasetManifestSha256,
+    engineCommit: input.engineCommit,
+    protocolVersion: input.protocolVersion,
+    groundTruthComplete: input.groundTruthComplete,
     findings: input.findings.length,
     adjudicated: adjudicated.length,
-    valid: valid.length,
-    invalid: invalid.length,
+    truePositives: truePositives.length,
+    invalidFindings: invalid.length,
     excluded: excluded.length,
     unresolved: unresolved.length,
     missed: input.missedFindings.length,
     precision,
-    precision95: precision == null ? null : wilson95(valid.length, adjudicated.length),
+    precision95: precision == null ? null : wilson95(truePositives.length, adjudicated.length),
     recall,
-    recall95: recall == null ? null : wilson95(valid.length, valid.length + input.missedFindings.length),
+    recall95: recall == null ? null : wilson95(truePositives.length, truePositives.length + input.missedFindings.length),
     coverage: ratio(input.matchedAndPricedLines, input.eligibleLines),
     unresolvedRate: input.findings.length === 0 ? 0 : round4(unresolved.length / input.findings.length),
     predictedAdjudicatedDollars: predicted,
@@ -89,34 +130,65 @@ export function calculateValidationMetrics(input: ValidationInput): ValidationMe
 }
 
 function validateInput(input: ValidationInput): void {
+  if (typeof input !== 'object' || input == null || Array.isArray(input)) {
+    throw new Error('validation input must be an object');
+  }
+  if (input.schemaVersion !== 1) throw new Error('schemaVersion must be 1');
+  text(input.studyId, 'studyId');
+  text(input.datasetId, 'datasetId');
+  text(input.engineCommit, 'engineCommit');
+  text(input.protocolVersion, 'protocolVersion');
+  if (typeof input.datasetManifestSha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(input.datasetManifestSha256)) {
+    throw new Error('datasetManifestSha256 must be a 64-character SHA-256 digest');
+  }
+  if (typeof input.groundTruthComplete !== 'boolean') {
+    throw new Error('groundTruthComplete must be boolean');
+  }
+  if (!Array.isArray(input.findings)) throw new Error('findings must be an array');
+  if (!Array.isArray(input.missedFindings)) throw new Error('missedFindings must be an array');
   whole(input.eligibleLines, 'eligibleLines');
   whole(input.matchedAndPricedLines, 'matchedAndPricedLines');
   if (input.matchedAndPricedLines > input.eligibleLines) {
     throw new Error('matchedAndPricedLines cannot exceed eligibleLines');
   }
+
   const ids = new Set<string>();
-  for (const finding of input.findings) {
+  for (const [index, finding] of input.findings.entries()) {
+    if (typeof finding !== 'object' || finding == null || Array.isArray(finding)) {
+      throw new Error(`findings[${index}] must be an object`);
+    }
     rowId(finding.id, ids);
-    text(finding.payer, 'payer');
-    text(finding.category, 'category');
-    amount(finding.predictedAmount, 'predictedAmount');
-    amount(finding.validatedAmount, 'validatedAmount');
-    if (!['valid', 'invalid', 'excluded', 'unresolved'].includes(finding.label)) {
-      throw new Error(`invalid validation label: ${finding.label}`);
+    text(finding.payer, `findings[${index}].payer`);
+    text(finding.category, `findings[${index}].category`);
+    text(finding.reviewerId, `findings[${index}].reviewerId`);
+    date(finding.reviewedAt, `findings[${index}].reviewedAt`);
+    amount(finding.predictedAmount, `findings[${index}].predictedAmount`);
+    amount(finding.validatedAmount, `findings[${index}].validatedAmount`);
+    if (!['true_positive', 'false_positive', 'duplicate', 'already_recovered', 'excluded', 'unresolved'].includes(finding.disposition)) {
+      throw new Error(`findings[${index}].disposition is invalid`);
     }
-    if (finding.label === 'valid' && finding.validatedAmount <= 0) {
-      throw new Error('valid findings require validatedAmount > 0');
+    if (finding.disposition === 'true_positive' && finding.validatedAmount <= 0) {
+      throw new Error(`findings[${index}] true_positive requires validatedAmount > 0`);
     }
-    if (finding.label === 'invalid' && finding.validatedAmount !== 0) {
-      throw new Error('invalid findings require validatedAmount = 0');
+    if (finding.disposition !== 'true_positive' && finding.validatedAmount !== 0) {
+      throw new Error(`findings[${index}] non-true-positive findings require validatedAmount = 0`);
+    }
+    if (finding.disposition === 'excluded' && !finding.exclusionReason?.trim()) {
+      throw new Error(`findings[${index}] excluded finding requires exclusionReason`);
     }
   }
-  for (const missed of input.missedFindings) {
+
+  for (const [index, missed] of input.missedFindings.entries()) {
+    if (typeof missed !== 'object' || missed == null || Array.isArray(missed)) {
+      throw new Error(`missedFindings[${index}] must be an object`);
+    }
     rowId(missed.id, ids);
-    text(missed.payer, 'payer');
-    text(missed.category, 'category');
-    amount(missed.validatedAmount, 'validatedAmount');
-    if (missed.validatedAmount <= 0) throw new Error('missed findings require validatedAmount > 0');
+    text(missed.payer, `missedFindings[${index}].payer`);
+    text(missed.category, `missedFindings[${index}].category`);
+    text(missed.reviewerId, `missedFindings[${index}].reviewerId`);
+    date(missed.reviewedAt, `missedFindings[${index}].reviewedAt`);
+    amount(missed.validatedAmount, `missedFindings[${index}].validatedAmount`);
+    if (missed.validatedAmount <= 0) throw new Error(`missedFindings[${index}].validatedAmount must be > 0`);
   }
 }
 
@@ -141,20 +213,29 @@ function round4(n: number): number {
   return Math.round((n + Number.EPSILON) * 10_000) / 10_000;
 }
 
-function whole(n: number, field: string): void {
-  if (!Number.isInteger(n) || n < 0) throw new Error(`${field} must be a nonnegative integer`);
+function whole(value: unknown, field: string): asserts value is number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error(`${field} must be a nonnegative integer`);
+  }
 }
 
-function amount(n: number, field: string): void {
-  if (!Number.isFinite(n) || n < 0) throw new Error(`${field} must be a finite nonnegative number`);
+function amount(value: unknown, field: string): asserts value is number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${field} must be a finite nonnegative number`);
+  }
 }
 
-function text(value: string, field: string): void {
-  if (!value.trim()) throw new Error(`${field} must be non-empty`);
+function text(value: unknown, field: string): asserts value is string {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} must be non-empty`);
 }
 
-function rowId(id: string, ids: Set<string>): void {
-  text(id, 'id');
-  if (ids.has(id)) throw new Error(`duplicate validation id: ${id}`);
-  ids.add(id);
+function date(value: unknown, field: string): asserts value is string {
+  text(value, field);
+  if (Number.isNaN(Date.parse(value))) throw new Error(`${field} must be an ISO-compatible date/time`);
+}
+
+function rowId(value: unknown, ids: Set<string>): asserts value is string {
+  text(value, 'id');
+  if (ids.has(value)) throw new Error(`duplicate validation id: ${value}`);
+  ids.add(value);
 }
