@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/fableagent/external-validation-v1.schema.json",
+  "title": "FableAgent External Validation Evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "studyId",
+    "datasetId",
+    "datasetManifestSha256",
+    "engineCommit",
+    "protocolVersion",
+    "groundTruthComplete",
+    "eligibleLines",
+    "matchedAndPricedLines",
+    "findings",
+    "missedFindings"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "studyId": { "$ref": "#/$defs/nonEmpty" },
+    "datasetId": { "$ref": "#/$defs/nonEmpty" },
+    "datasetManifestSha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+    "engineCommit": { "$ref": "#/$defs/nonEmpty" },
+    "protocolVersion": { "$ref": "#/$defs/nonEmpty" },
+    "groundTruthComplete": { "type": "boolean" },
+    "eligibleLines": { "type": "integer", "minimum": 0 },
+    "matchedAndPricedLines": { "type": "integer", "minimum": 0 },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "missedFindings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/missed" }
+    },
+    "gates": { "$ref": "#/$defs/gates" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "money": { "type": "number", "minimum": 0 },
+    "reviewBase": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmpty" },
+        "payer": { "$ref": "#/$defs/nonEmpty" },
+        "category": { "$ref": "#/$defs/nonEmpty" },
+        "reviewerId": { "$ref": "#/$defs/nonEmpty" },
+        "reviewedAt": { "type": "string", "format": "date-time" },
+        "secondReviewerId": { "type": ["string", "null"], "minLength": 1 },
+        "adjudicatorId": { "type": ["string", "null"], "minLength": 1 },
+        "rationaleRef": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "payer", "category", "predictedAmount", "validatedAmount",
+        "disposition", "reviewerId", "reviewedAt"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmpty" },
+        "payer": { "$ref": "#/$defs/nonEmpty" },
+        "category": { "$ref": "#/$defs/nonEmpty" },
+        "predictedAmount": { "$ref": "#/$defs/money" },
+        "validatedAmount": { "$ref": "#/$defs/money" },
+        "disposition": {
+          "enum": [
+            "true_positive",
+            "false_positive",
+            "duplicate",
+            "already_recovered",
+            "excluded",
+            "unresolved"
+          ]
+        },
+        "reviewerId": { "$ref": "#/$defs/nonEmpty" },
+        "reviewedAt": { "type": "string", "format": "date-time" },
+        "secondReviewerId": { "type": ["string", "null"], "minLength": 1 },
+        "adjudicatorId": { "type": ["string", "null"], "minLength": 1 },
+        "rationaleRef": { "type": ["string", "null"], "minLength": 1 },
+        "exclusionReason": { "type": ["string", "null"], "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "disposition": { "const": "true_positive" } }, "required": ["disposition"] },
+          "then": { "properties": { "validatedAmount": { "exclusiveMinimum": 0 } } },
+          "else": { "properties": { "validatedAmount": { "const": 0 } } }
+        },
+        {
+          "if": { "properties": { "disposition": { "const": "excluded" } }, "required": ["disposition"] },
+          "then": { "required": ["exclusionReason"], "properties": { "exclusionReason": { "type": "string", "minLength": 1 } } }
+        }
+      ]
+    },
+    "missed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "payer", "category", "validatedAmount", "reviewerId", "reviewedAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmpty" },
+        "payer": { "$ref": "#/$defs/nonEmpty" },
+        "category": { "$ref": "#/$defs/nonEmpty" },
+        "validatedAmount": { "type": "number", "exclusiveMinimum": 0 },
+        "reviewerId": { "$ref": "#/$defs/nonEmpty" },
+        "reviewedAt": { "type": "string", "format": "date-time" },
+        "secondReviewerId": { "type": ["string", "null"], "minLength": 1 },
+        "adjudicatorId": { "type": ["string", "null"], "minLength": 1 },
+        "rationaleRef": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minPrecision": { "$ref": "#/$defs/rate" },
+        "minRecall": { "$ref": "#/$defs/rate" },
+        "minDollarPrecision": { "$ref": "#/$defs/rate" },
+        "minDollarRecall": { "$ref": "#/$defs/rate" },
+        "minCoverage": { "$ref": "#/$defs/rate" },
+        "maxUnresolvedRate": { "$ref": "#/$defs/rate" }
+      }
+    },
+    "rate": { "type": "number", "minimum": 0, "maximum": 1 }
+  }
+}
