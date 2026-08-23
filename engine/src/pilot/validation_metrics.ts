@@ -92,6 +92,7 @@ export interface ValidationMetrics {
   unresolvedRate: number;
   predictedAdjudicatedDollars: number;
   validatedDollars: number;
+  matchedValidatedDollars: number;
   missedDollars: number;
   dollarPrecision: number | null;
   dollarRecall: number | null;
@@ -124,23 +125,37 @@ const GATE_KEYS = new Set([
 
 export function calculateValidationMetrics(input: ValidationInput): ValidationMetrics {
   validateInput(input);
+
   const truePositives = input.findings.filter((f) => f.disposition === 'true_positive');
   const invalid = input.findings.filter((f) => INVALID.has(f.disposition));
   const excluded = input.findings.filter((f) => f.disposition === 'excluded');
   const unresolved = input.findings.filter((f) => f.disposition === 'unresolved');
   const adjudicated = [...truePositives, ...invalid];
+
   const predicted = money(adjudicated.reduce((n, f) => n + f.predictedAmount, 0));
   const validated = money(truePositives.reduce((n, f) => n + f.validatedAmount, 0));
+  // Dollar performance must be bounded. A true positive contributes only the
+  // overlap between predicted and independently validated opportunity. This
+  // penalizes overstatement through the precision denominator and
+  // underestimation through the recall denominator instead of allowing a
+  // misleading >100% "dollar precision" result.
+  const matchedValidated = money(truePositives.reduce(
+    (n, f) => n + Math.min(f.predictedAmount, f.validatedAmount), 0,
+  ));
   const missedDollars = money(input.missedFindings.reduce((n, f) => n + f.validatedAmount, 0));
 
   const precision = ratio(truePositives.length, adjudicated.length);
   const recall = input.groundTruthComplete
     ? ratio(truePositives.length, truePositives.length + input.missedFindings.length)
     : null;
-  const dollarPrecision = ratio(validated, predicted);
-  const dollarRecall = input.groundTruthComplete ? ratio(validated, validated + missedDollars) : null;
+  const dollarPrecision = ratio(matchedValidated, predicted);
+  const dollarRecall = input.groundTruthComplete
+    ? ratio(matchedValidated, validated + missedDollars)
+    : null;
   const coverage = ratio(input.matchedAndPricedLines, input.eligibleLines);
-  const unresolvedRate = input.findings.length === 0 ? 0 : round4(unresolved.length / input.findings.length);
+  const unresolvedRate = input.findings.length === 0
+    ? 0
+    : round4(unresolved.length / input.findings.length);
 
   const result: ValidationMetrics = {
     schemaVersion: 1,
@@ -160,11 +175,14 @@ export function calculateValidationMetrics(input: ValidationInput): ValidationMe
     precision,
     precision95: precision == null ? null : wilson95(truePositives.length, adjudicated.length),
     recall,
-    recall95: recall == null ? null : wilson95(truePositives.length, truePositives.length + input.missedFindings.length),
+    recall95: recall == null
+      ? null
+      : wilson95(truePositives.length, truePositives.length + input.missedFindings.length),
     coverage,
     unresolvedRate,
     predictedAdjudicatedDollars: predicted,
     validatedDollars: validated,
+    matchedValidatedDollars: matchedValidated,
     missedDollars,
     dollarPrecision,
     dollarRecall,
@@ -173,7 +191,9 @@ export function calculateValidationMetrics(input: ValidationInput): ValidationMe
   };
 
   result.gateResults = evaluateGates(input.gates, result);
-  result.gatesPassed = input.gates == null ? null : result.gateResults.every((g) => g.passed);
+  result.gatesPassed = input.gates == null
+    ? null
+    : result.gateResults.every((g) => g.passed);
   return result;
 }
 
@@ -187,7 +207,8 @@ function validateInput(input: ValidationInput): void {
   text(input.datasetId, 'datasetId');
   text(input.engineCommit, 'engineCommit');
   text(input.protocolVersion, 'protocolVersion');
-  if (typeof input.datasetManifestSha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(input.datasetManifestSha256)) {
+  if (typeof input.datasetManifestSha256 !== 'string'
+      || !/^[a-f0-9]{64}$/i.test(input.datasetManifestSha256)) {
     throw new Error('datasetManifestSha256 must be a 64-character SHA-256 digest');
   }
   if (typeof input.groundTruthComplete !== 'boolean') {
@@ -217,7 +238,10 @@ function validateInput(input: ValidationInput): void {
     optionalText(finding.rationaleRef, `findings[${index}].rationaleRef`);
     amount(finding.predictedAmount, `findings[${index}].predictedAmount`);
     amount(finding.validatedAmount, `findings[${index}].validatedAmount`);
-    if (!['true_positive', 'false_positive', 'duplicate', 'already_recovered', 'excluded', 'unresolved'].includes(finding.disposition)) {
+    if (![
+      'true_positive', 'false_positive', 'duplicate', 'already_recovered',
+      'excluded', 'unresolved',
+    ].includes(finding.disposition)) {
       throw new Error(`findings[${index}].disposition is invalid`);
     }
     if (finding.disposition === 'true_positive' && finding.validatedAmount <= 0) {
@@ -247,16 +271,25 @@ function validateInput(input: ValidationInput): void {
     optionalText(missed.adjudicatorId, `missedFindings[${index}].adjudicatorId`);
     optionalText(missed.rationaleRef, `missedFindings[${index}].rationaleRef`);
     amount(missed.validatedAmount, `missedFindings[${index}].validatedAmount`);
-    if (missed.validatedAmount <= 0) throw new Error(`missedFindings[${index}].validatedAmount must be > 0`);
+    if (missed.validatedAmount <= 0) {
+      throw new Error(`missedFindings[${index}].validatedAmount must be > 0`);
+    }
   }
 
   if (input.gates != null) validateGates(input.gates);
 }
 
-function evaluateGates(gates: ValidationGates | undefined, metrics: ValidationMetrics): GateResult[] {
+function evaluateGates(
+  gates: ValidationGates | undefined,
+  metrics: ValidationMetrics,
+): GateResult[] {
   if (gates == null) return [];
   const results: GateResult[] = [];
-  const minimum = (gate: keyof ValidationGates, threshold: number | undefined, actual: number | null) => {
+  const minimum = (
+    gate: keyof ValidationGates,
+    threshold: number | undefined,
+    actual: number | null,
+  ) => {
     if (threshold == null) return;
     results.push({ gate, threshold, actual, passed: actual != null && actual >= threshold });
   };
@@ -267,15 +300,19 @@ function evaluateGates(gates: ValidationGates | undefined, metrics: ValidationMe
   minimum('minCoverage', gates.minCoverage, metrics.coverage);
   if (gates.maxUnresolvedRate != null) {
     results.push({
-      gate: 'maxUnresolvedRate', threshold: gates.maxUnresolvedRate,
-      actual: metrics.unresolvedRate, passed: metrics.unresolvedRate <= gates.maxUnresolvedRate,
+      gate: 'maxUnresolvedRate',
+      threshold: gates.maxUnresolvedRate,
+      actual: metrics.unresolvedRate,
+      passed: metrics.unresolvedRate <= gates.maxUnresolvedRate,
     });
   }
   return results;
 }
 
 function validateGates(gates: ValidationGates): void {
-  if (typeof gates !== 'object' || gates == null || Array.isArray(gates)) throw new Error('gates must be an object');
+  if (typeof gates !== 'object' || gates == null || Array.isArray(gates)) {
+    throw new Error('gates must be an object');
+  }
   rejectUnknown(gates as unknown as Record<string, unknown>, GATE_KEYS, 'gates');
   for (const [key, value] of Object.entries(gates)) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
@@ -289,8 +326,12 @@ function wilson95(successes: number, total: number): Interval {
   const p = successes / total;
   const d = 1 + z * z / total;
   const center = (p + z * z / (2 * total)) / d;
-  const margin = (z / d) * Math.sqrt(p * (1 - p) / total + z * z / (4 * total * total));
-  return { lower: round4(Math.max(0, center - margin)), upper: round4(Math.min(1, center + margin)) };
+  const margin = (z / d)
+    * Math.sqrt(p * (1 - p) / total + z * z / (4 * total * total));
+  return {
+    lower: round4(Math.max(0, center - margin)),
+    upper: round4(Math.min(1, center + margin)),
+  };
 }
 
 function ratio(n: number, d: number): number | null {
@@ -318,7 +359,9 @@ function amount(value: unknown, field: string): asserts value is number {
 }
 
 function text(value: unknown, field: string): asserts value is string {
-  if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} must be non-empty`);
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`${field} must be non-empty`);
+  }
 }
 
 function optionalText(value: unknown, field: string): void {
@@ -328,7 +371,9 @@ function optionalText(value: unknown, field: string): void {
 
 function date(value: unknown, field: string): asserts value is string {
   text(value, field);
-  if (Number.isNaN(Date.parse(value))) throw new Error(`${field} must be an ISO-compatible date/time`);
+  if (Number.isNaN(Date.parse(value))) {
+    throw new Error(`${field} must be an ISO-compatible date/time`);
+  }
 }
 
 function rowId(value: unknown, ids: Set<string>): asserts value is string {
@@ -337,8 +382,14 @@ function rowId(value: unknown, ids: Set<string>): asserts value is string {
   ids.add(value);
 }
 
-function rejectUnknown(value: Record<string, unknown>, allowed: Set<string>, field: string): void {
+function rejectUnknown(
+  value: Record<string, unknown>,
+  allowed: Set<string>,
+  field: string,
+): void {
   for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) throw new Error(`${field}.${key} is not allowed in the validation metric file`);
+    if (!allowed.has(key)) {
+      throw new Error(`${field}.${key} is not allowed in the validation metric file`);
+    }
   }
 }
