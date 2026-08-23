@@ -58,8 +58,6 @@ jobs:
           CREATE ROLE rcm_service NOLOGIN BYPASSRLS;
           CREATE ROLE rcm_pretenant_lookup NOLOGIN;
           CREATE ROLE rcm_catalog_lookup NOLOGIN;
-          -- Migration ownership transfers require SET membership, but runtime
-          -- must never inherit the owner roles' RLS exemption.
           GRANT rcm_pretenant_lookup, rcm_catalog_lookup
             TO rcm_runtime WITH ADMIN OPTION, INHERIT FALSE;
           ALTER DATABASE rcm OWNER TO rcm_runtime;
@@ -77,8 +75,6 @@ jobs:
 
       - name: Seed demo data (required by several integration suites)
         working-directory: engine
-        # Demo reseeding performs dependency-ordered hard deletes and is an
-        # administrator/maintenance operation, never an application-runtime task.
         run: DATABASE_URL="$ADMIN_DATABASE_URL" npm run seed
 
       - name: Unit tests
@@ -98,6 +94,37 @@ jobs:
             engine/var/pilot_benchmark/benchmark.md
           if-no-files-found: error
           retention-days: 30
+
+      - name: Generate CMS public-data POC evidence
+        working-directory: engine
+        run: npm run poc:cms-public -- --engine-commit "$GITHUB_SHA"
+
+      - name: Build CMS public-data POC evidence manifest
+        working-directory: engine
+        run: |
+          npm run evidence:manifest -- \
+            --bundle-id "cms-public-poc-${GITHUB_SHA}" \
+            --engine-commit "${GITHUB_SHA}" \
+            --protocol-version cms-public-poc-v1 \
+            --output var/cms_public_poc/evidence-manifest.json \
+            --files \
+              testdata/cms_2024_public_poc_fixture.json \
+              var/cms_public_poc/poc_summary.json \
+              var/cms_public_poc/poc_findings.csv \
+              var/cms_public_poc/poc_report.md
+
+      - name: Upload CMS public-data POC evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: cms-public-poc-${{ github.sha }}
+          path: |
+            engine/testdata/cms_2024_public_poc_fixture.json
+            engine/var/cms_public_poc/poc_summary.json
+            engine/var/cms_public_poc/poc_findings.csv
+            engine/var/cms_public_poc/poc_report.md
+            engine/var/cms_public_poc/evidence-manifest.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Smoke external assurance tooling
         working-directory: engine
