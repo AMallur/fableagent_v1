@@ -4,6 +4,11 @@ The repository is designed to fail closed when an external delivery service is
 not configured. A packet is not marked submitted merely because a connector
 attempt was recorded, and console-only email output is not marked delivered.
 
+Use `COMMERCIAL_ASSURANCE_MATRIX.md` as the evidence index,
+`SECURITY_THREAT_MODEL.md` for the current security boundary and residual
+risks, `OPERATIONAL_RESILIENCE_RUNBOOK.md` for target-environment exercises,
+and `RELEASE_EVIDENCE_TEMPLATE.md` for every customer-facing release.
+
 ## Automated release gates
 
 - Unit tests and the full PostgreSQL integration suite pass.
@@ -12,6 +17,12 @@ attempt was recorded, and console-only email output is not marked delivered.
 - The runtime Docker image builds successfully.
 - `npm audit --omit=dev --audit-level=high` reports no high or critical issue.
 - CodeQL completes successfully.
+- Pilot evidence-manifest and external-validation metric regression tests pass
+  as part of `npm test`.
+
+Automated gates prove implementation properties for the tested release. They
+do not create customer validation, HIPAA attestation, trading-partner
+certification, or recovered-revenue evidence.
 
 ## Required external gates
 
@@ -32,7 +43,9 @@ customer and trading partner:
 6. Require certified coding review for every corrected claim and modifier
    change. The rules engine is decision support, not clinical documentation.
 7. Run load, failover, backup/restore and disaster-recovery exercises in the
-   target infrastructure.
+   target infrastructure using `OPERATIONAL_RESILIENCE_RUNBOOK.md`; retain the
+   measured RPO/RTO and control-total evidence rather than marking the control
+   complete from the existence of a runbook.
 8. Complete the organizational HIPAA risk analysis, policies, workforce
    training, incident response plan and access-review process. Drafts of
    all of these — plus a deeper technical/operational layer (tenant
@@ -51,6 +64,15 @@ customer and trading partner:
 11. Validate AWS account-level controls (BAA, CloudTrail, Config/Security Hub,
     GuardDuty, central alarm routing and Terraform state protection). The
     application stack cannot establish those organizational controls itself.
+12. Before an internet-accessible live-PHI deployment, obtain an independent
+    application/infrastructure penetration test appropriate to the deployed
+    boundary and remediate high/critical findings or document formal risk
+    acceptance where legally and contractually permitted.
+13. Before publishing real-world precision, recall, dollar-accuracy or revenue
+    claims, execute `EXTERNAL_VALIDATION_PROTOCOL.md`, preserve the independent
+    reviewer/source evidence, and generate an immutable evidence manifest.
+    Recall is not publishable without a complete ground-truth design; recovered
+    revenue is not publishable until new post-action cash is reconciled.
 
 ## Supported initial production scope
 
