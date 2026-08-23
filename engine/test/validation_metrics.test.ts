@@ -55,6 +55,7 @@ describe('external validation metrics', () => {
     assert.equal(metrics.unresolvedRate, 0.1667);
     assert.equal(metrics.predictedAdjudicatedDollars, 250);
     assert.equal(metrics.validatedDollars, 140);
+    assert.equal(metrics.matchedValidatedDollars, 140);
     assert.equal(metrics.missedDollars, 30);
     assert.equal(metrics.dollarPrecision, 0.56);
     assert.equal(metrics.dollarRecall, 0.8235);
@@ -99,6 +100,24 @@ describe('external validation metrics', () => {
     });
     assert.equal(metrics.precision, 0.5);
     assert.equal(metrics.dollarPrecision, 0.5);
+  });
+
+  it('bounds dollar metrics and penalizes underprediction', () => {
+    const metrics = calculateValidationMetrics({
+      ...metadata,
+      eligibleLines: 1,
+      matchedAndPricedLines: 1,
+      groundTruthComplete: true,
+      findings: [reviewed({ predictedAmount: 50, validatedAmount: 100 })],
+      missedFindings: [],
+    });
+    assert.equal(metrics.precision, 1);
+    assert.equal(metrics.validatedDollars, 100);
+    assert.equal(metrics.matchedValidatedDollars, 50);
+    assert.equal(metrics.dollarPrecision, 1);
+    assert.equal(metrics.dollarRecall, 0.5);
+    assert.ok(metrics.dollarPrecision <= 1);
+    assert.ok(metrics.dollarRecall <= 1);
   });
 
   it('rejects unsupported evidence states and undeclared fields', () => {
