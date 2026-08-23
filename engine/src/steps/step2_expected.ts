@@ -10,11 +10,28 @@
 //   * fee_schedule        -> expected = contract_line.allowed_amount * units
 //   * per_diem/case_rate  -> line-level allowed_amount when present, else proxy
 //   * no contract         -> Medicare fee schedule as proxy, flagged no_contract
+//
+// Two adjustments then apply to whatever rate was found, and both exist to
+// stop the engine inventing shortfalls that were never owed:
+//
+//   MODIFIERS change the percentage payable. A second procedure with modifier
+//   51 pays 50%, a bilateral 50 pays 150%, an assistant 80 pays 16%. Pricing
+//   these at 100% makes every modified line look half underpaid. Rules compose
+//   multiplicatively in applyOrder — a bilateral assistant is 150% then 16%.
+//
+//   LESSER OF BILLED. Nearly every contract owes the lesser of billed charges
+//   and the contracted rate, so a line billed below the rate was never going
+//   to pay the rate. Comparing it against the rate manufactures a variance out
+//   of the provider's own charge master.
+//
+// The payer's post-adjudication payment reduction (Medicare sequestration) is
+// deliberately NOT applied here: it reduces the PAYMENT, not the allowed
+// amount, so it belongs in Step 3 against expected payer liability.
 // ============================================================================
 
 import type {
   ClaimInput, ClaimLineInput, ContractInput, ContractLineInput, EngineInput,
-  LinePricing,
+  LinePricing, ModifierPaymentRule,
 } from '../types.ts';
 import { round2 } from '../config.ts';
 import type { MatchedLine } from './step1_matching.ts';
@@ -82,6 +99,53 @@ function medicareServiceSetting(pos: string | null | undefined): 'facility' | 'n
   return null;
 }
 
+/**
+ * The modifier rules that apply to this line, most specific first: a
+ * tenant+payer rule beats a tenant-wide rule, which beats the shared default.
+ * Only one rule per modifier survives.
+ */
+function modifierRulesFor(
+  input: EngineInput, payerId: string, modifiers: string[],
+): ModifierPaymentRule[] {
+  const all = input.modifierRules ?? [];
+  if (all.length === 0 || modifiers.length === 0) return [];
+  const chosen: ModifierPaymentRule[] = [];
+  for (const modifier of modifiers) {
+    const candidates = all.filter((r) => r.modifier === modifier
+      && (r.payerId == null || r.payerId === payerId));
+    if (candidates.length === 0) continue;
+    // specificity: payer-scoped, then tenant-scoped, then shared default
+    candidates.sort((a, b) => specificity(b) - specificity(a));
+    chosen.push(candidates[0]);
+  }
+  return chosen.sort((a, b) => a.applyOrder - b.applyOrder);
+}
+
+function specificity(rule: ModifierPaymentRule): number {
+  return (rule.payerId != null ? 2 : 0) + (rule.tenantId != null ? 1 : 0);
+}
+
+function applyModifiers(
+  amount: number, input: EngineInput, payerId: string, modifiers: string[],
+): number {
+  let value = amount;
+  for (const rule of modifierRulesFor(input, payerId, modifiers)) {
+    value = value * (rule.percentOfAllowed / 100);
+  }
+  return round2(value);
+}
+
+/** The lesser of billed charges and the contracted rate, when the contract
+ * says so. Applied last, after modifiers, because the contract term is about
+ * the final amount payable. */
+function capAtBilled(
+  amount: number, line: ClaimLineInput, contract: ContractInput | undefined,
+): number {
+  if (!contract || contract.applyLesserOfBilled === false) return amount;
+  if (!Number.isFinite(line.billedAmount)) return amount;
+  return round2(Math.min(amount, line.billedAmount));
+}
+
 export function priceClaimLine(
   input: EngineInput, claim: ClaimInput, line: ClaimLineInput,
 ): LinePricing {
@@ -89,6 +153,14 @@ export function priceClaimLine(
     input.contracts, claim.clientId, claim.payerId, claim.dateOfServiceStart,
   );
   const units = line.units || 1;
+
+  /** Base rate x units, then modifier percentages, then the lesser-of-billed
+   * cap. Every pricing path funnels through here so no route can quietly skip
+   * an adjustment. */
+  const settle = (rate: number): number => capAtBilled(
+    applyModifiers(round2(rate * units), input, claim.payerId, line.modifiers),
+    line, contract,
+  );
 
   if (contract) {
     const cl = findContractLine(
@@ -101,7 +173,7 @@ export function priceClaimLine(
         if (rate != null) {
           return {
             claimId: claim.claimId, claimLineId: line.claimLineId,
-            expectedAmount: round2(rate * (cl.percentOfMedicare / 100) * units),
+            expectedAmount: settle(rate * (cl.percentOfMedicare / 100)),
             expectedSource: 'contract', contractId: contract.contractId, noContract: false,
           };
         }
@@ -110,7 +182,7 @@ export function priceClaimLine(
         // fee_schedule, and the per_diem/case_rate fallback when a line rate exists
         return {
           claimId: claim.claimId, claimLineId: line.claimLineId,
-          expectedAmount: round2(cl.allowedAmount * units),
+          expectedAmount: settle(cl.allowedAmount),
           expectedSource: 'contract', contractId: contract.contractId, noContract: false,
         };
       }
@@ -121,7 +193,7 @@ export function priceClaimLine(
       input.medicareLocalityByClient[claim.clientId], claim.placeOfService);
     return {
       claimId: claim.claimId, claimLineId: line.claimLineId,
-      expectedAmount: proxy != null ? round2(proxy * units) : null,
+      expectedAmount: proxy != null ? settle(proxy) : null,
       expectedSource: proxy != null ? 'medicare_proxy' : 'none',
       contractId: contract.contractId, noContract: false,
     };
@@ -132,7 +204,11 @@ export function priceClaimLine(
     input.medicareLocalityByClient[claim.clientId], claim.placeOfService);
   return {
     claimId: claim.claimId, claimLineId: line.claimLineId,
-    expectedAmount: proxy != null ? round2(proxy * units) : null,
+    // No contract, so no lesser-of term to apply — but modifier percentages
+    // are a property of the fee schedule, not the contract, and still hold.
+    expectedAmount: proxy != null
+      ? applyModifiers(round2(proxy * units), input, claim.payerId, line.modifiers)
+      : null,
     expectedSource: proxy != null ? 'medicare_proxy' : 'none',
     noContract: true,
   };

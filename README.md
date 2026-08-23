@@ -420,19 +420,65 @@ Medicare rate as proxy with `expected_source='medicare_proxy'` (the
 `no_contract` flag). A contract with a fee-schedule gap also proxy-prices but
 is not flagged `no_contract`.
 
-**Step 3 — variance.** `variance = expected - paid`. Any positive variance
-marks the line `underpaid`; a case candidate needs > $25 **or** > 5% of
-expected. Lines with denial codes route to classification instead — never
-double-counted. Reversal entries are skipped entirely: their amounts are
-negative and already netted into cumulative cash, so scoring them as an
-adjudication would manufacture a full-billed-amount "underpayment" out of an
-accounting entry.
+Two adjustments then apply to whatever rate was found, and both exist to stop
+the engine inventing shortfalls that were never owed:
+
+- **Modifier percentages** (`modifier_payment_rule`). A second procedure with
+  modifier 51 pays 50%, a bilateral 50 pays 150%, an assistant 80 pays 16%.
+  Pricing these at 100% made every modified line look half underpaid. Rules
+  compose multiplicatively in `apply_order` — a bilateral assistant is 150%
+  then 16%, not 166%. Seeded with the CMS percentages as shared defaults; a
+  tenant, or tenant+payer, row overrides them. True MPPR ranking by RVU across
+  the claim is **not** modeled: modifier 51 applies its configured percentage,
+  which is how contracts state the term.
+- **Lesser of billed** (`contract.apply_lesser_of_billed`, default on). Nearly
+  every contract owes the lesser of billed charges and the contracted rate, so
+  a line billed below the rate was never going to pay the rate. Comparing it
+  against the rate manufactured a variance out of the provider's own charge
+  master.
+
+**Step 3 — variance.**
+
+```
+expected_payer_amount =
+    (allowed - patient_responsibility - prior_payer_paid) x (1 - payment_reduction)
+variance = expected_payer_amount - cumulative_paid
+```
+
+Any positive variance marks the line `underpaid`; a case candidate needs > $25
+**or** > 5% of expected. Lines with denial codes route to classification
+instead — never double-counted. Reversal entries are skipped entirely: their
+amounts are negative and already netted into cumulative cash, so scoring them
+as an adjudication would manufacture a full-billed-amount "underpayment" out of
+an accounting entry.
+
+The last two terms are what stop the engine billing a payer for money it never
+owed:
+
+- **`prior_payer_paid`** applies on a secondary or tertiary claim. The primary
+  has already settled part of the allowed amount; without subtracting it every
+  secondary claim reads as massively underpaid. Sourced in order of precision:
+  line-level COB detail (837 loop 2430 `SVD02`), the claim-level COB total
+  (loop 2320 `AMT*D`), and finally the payer's own `OA-23` "impact of prior
+  payer adjudication" on the remit line. Only consulted when the claim is known
+  to be secondary or tertiary (`claim.payer_sequence`, from `SBR01`) — guessing
+  coverage order from an OA-23 alone would subtract real money from a primary
+  claim and hide a genuine underpayment.
+- **`payment_reduction`** (`payer.payment_reduction_percent`) is Medicare
+  sequestration and its equivalents: a percentage withheld from the payment
+  after adjudication, which is why it multiplies the payer's liability rather
+  than the allowed amount. Set it to `2.000` on Medicare payers. Left at zero it
+  fires on every Medicare line and, with five or more of them, trips the
+  `systemic_underpayment` anomaly against a payer that is paying correctly.
 
 **Step 4 — classification.** Codes normalize to `CO-45` form from any of
 `45`+group, `CO45`, `co-45`. The contractual codes (CO-45, CO-131) carry
 `requiresVariance`: they appear on virtually every clean remit as the normal
 contractual write-off, so they only become cases when payment is actually
-below the expected amount. CO-97 reclassifies from coding to bundling when a
+below the expected amount. `OA-23` and `CO-253` carry it for the same reason —
+`OA-23` is the payer reporting what the *prior* payer did and appears on
+essentially every line of every secondary claim, and `CO-253` is statutory
+sequestration, which is not appealable. CO-97 reclassifies from coding to bundling when a
 sibling line on the same claim was paid (the "included in primary procedure"
 context). Unmapped codes produce a low-likelihood manual-review candidate
 rather than being dropped. Deadline = remit check date + payer
@@ -495,6 +541,47 @@ Every component is stored on `payment_event` — `pre_appeal_paid`,
 `gross_post_appeal_paid`, `unallocated_paid`, `reversals_netted`,
 `recoupments_netted`, `attribution_basis`, `attribution_scope` — so a
 recovery line can be defended figure by figure rather than asserted.
+
+## Commercial terms
+
+Recovery work is sold on contingency — a share of the money the client actually
+got back — not per case. An invoice is therefore an assertion about someone
+else's cash, so three things have to hold, and the schema enforces all three:
+
+- **The basis is verifiable.** The contingency is charged on recovery this
+  platform attributed and can defend line by line (see **Recovery attribution**
+  above), never on an estimate. A plan set to the `verified` basis charges only
+  on recovery a person confirmed.
+- **Each recovery is billed once.** `invoice_line` carries one row per
+  `payment_event` with a unique index on it, so a re-run, an overlapping
+  period, or a regenerated month cannot bill the same dollar twice. A negative
+  event — a payer clawing money back — reduces the basis rather than being
+  quietly kept.
+- **An issued invoice does not change.** A database trigger refuses to alter
+  the figures on anything past `draft`, or to delete it; corrections are made
+  by voiding and reissuing, which releases that invoice's recoveries to be
+  billed again. Before this, regenerating a month silently rewrote a bill that
+  had already gone out.
+
+`pricing_plan` holds the agreed terms, effective-dated, per tenant with an
+optional per-client override: base fee, per-case fee, contingency percent,
+minimum and maximum. A mid-term renegotiation is a new row, not an edit.
+`POST /api/admin/clients/:id/billing/preview` computes a month without writing
+anything. The legacy self-serve tier table (`PLAN_PRICING`) still renders a
+tenant's `subscription_tier` but no longer decides what is billed.
+
+**Subscription and feature enforcement.** `client.subscription_status` and
+`client.features` used to be stored, toggled in the admin UI, and read by
+almost nothing: a suspended client kept full web access and the scheduler kept
+running their nightly processing, and every client got every feature regardless
+of plan. Two database functions are now the single enforcement point —
+`app.client_processing_enabled(tenant, client)` and
+`app.client_feature_enabled(tenant, client, feature)` — used by the scheduler,
+the web session layer and the public API alike. Both take the tenant explicitly
+rather than reading the session GUC, because a check that returns "deny" in any
+context that forgot to set it would silently switch features off. Tenant admins
+are never locked out by these gates, so a suspended client can still be
+reactivated.
 
 ## Money
 

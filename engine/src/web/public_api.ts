@@ -113,7 +113,9 @@ export async function authenticateApiKey(
       `SELECT k.api_key_id, k.tenant_id, k.client_id, k.scopes, k.rate_limit_per_minute
        FROM api_key k
        JOIN client c ON c.client_id = k.client_id AND c.deleted_at IS NULL
-         AND c.subscription_status <> 'cancelled'
+         -- A suspended subscription stops API processing too; previously only
+         -- a cancelled one did, so a suspended client kept full API access.
+         AND c.subscription_status IN ('trial', 'active')
        WHERE k.key_hash = $1 AND k.revoked_at IS NULL`, [hash]);
     const k = rows.rows[0];
     if (!k) return null;
@@ -184,6 +186,18 @@ export async function logApiRequest(
 // JSON -> parsed-EDI transforms (the API accepts raw X12 or structured JSON)
 // ---------------------------------------------------------------------------
 
+const PAYER_SEQUENCES = ['primary', 'secondary', 'tertiary', 'unknown'] as const;
+
+function payerSequenceFrom(value: unknown, index: number): ClaimFile837['claims'][number]['payerSequence'] {
+  if (value == null || value === '') return 'primary';
+  const normalized = String(value).toLowerCase();
+  if (!(PAYER_SEQUENCES as readonly string[]).includes(normalized)) {
+    throw err(
+      `claims[${index}]: payerSequence must be one of ${PAYER_SEQUENCES.join(', ')}`, 400);
+  }
+  return normalized as ClaimFile837['claims'][number]['payerSequence'];
+}
+
 export function json837ToClaimFile(body: any): ClaimFile837 {
   const claims = body?.claims;
   if (!Array.isArray(claims) || claims.length === 0) {
@@ -214,6 +228,11 @@ export function json837ToClaimFile(body: any): ClaimFile837 {
         payerName: c.payerName ?? null,
         renderingProviderNpi: c.renderingProvider?.npi ?? null,
         renderingProviderName: c.renderingProvider?.name ?? null,
+        // Coordination of benefits. Send payerSequence "secondary" (or
+        // "tertiary") with priorPayerPaid, on the claim or per line, so
+        // expected payer liability is net of what the primary already paid.
+        payerSequence: payerSequenceFrom(c.payerSequence, i),
+        priorPayerPaid: c.priorPayerPaid == null ? null : Number(c.priorPayerPaid),
         lines: c.lines.map((l: any, j: number) => {
           if (!l.procedureCode) throw err(`claims[${i}].lines[${j}]: procedureCode is required`, 400);
           return {
@@ -222,6 +241,7 @@ export function json837ToClaimFile(body: any): ClaimFile837 {
             chargeAmount: l.chargeAmount ?? null,
             units: l.units ?? 1,
             dateOfService: l.dateOfService ?? null,
+            priorPayerPaid: l.priorPayerPaid == null ? null : Number(l.priorPayerPaid),
           };
         }),
       };

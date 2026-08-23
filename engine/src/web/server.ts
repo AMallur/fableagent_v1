@@ -22,6 +22,7 @@ import {
 } from './auth.ts';
 import { TenantContextPool } from '../db/tenant_pool.ts';
 import * as admin from './admin_api.ts';
+import * as billing from './billing.ts';
 import * as compliance from './compliance_api.ts';
 import * as pub from './public_api.ts';
 import { API_ENDPOINTS, buildOpenApi, docsHtml } from './api_docs.ts';
@@ -216,9 +217,59 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
         setSessionCookie(ctx, current);
       }
       ctx.scope = { tenantId: current.tenantId, clientIds: await visibleClientIds(pool, current) };
+
+      // Commercial gates. A tenant admin always gets through — otherwise a
+      // suspended client could never be reactivated, and locking the operator
+      // out of their own billing screen is not an enforcement strategy.
+      if (!isTenantAdmin(current)) {
+        const gate = await commercialGate(pool, current, ctx.url.pathname);
+        if (gate) {
+          return kind === 'api'
+            ? json(ctx, 403, { error: gate })
+            : redirect(ctx, '/?unavailable=' + encodeURIComponent(gate));
+        }
+      }
       return h(ctx);
     });
   };
+
+  const isTenantAdmin = (s: Session): boolean =>
+    s.role === 'tenant_admin' || s.role === 'super_admin';
+
+  /**
+   * Route prefixes that a plan feature has to be switched on for. The flags
+   * were previously stored, toggled in the admin UI, and read by nothing.
+   */
+  const FEATURE_ROUTES: Array<[RegExp, string]> = [
+    [/^\/(api\/)?(cases|case|queue)/, 'detection'],
+    [/^\/(api\/)?(appeals?|packets?)/, 'appeals'],
+    [/^\/(api\/)?(rules|notifications|automation)/, 'automation'],
+    [/^\/(api\/)?(reports|analytics|payers|denials|workload)/, 'analytics'],
+  ];
+
+  /** null when the request may proceed, otherwise the reason it may not. */
+  async function commercialGate(
+    db: typeof pool, session: Session, pathname: string,
+  ): Promise<string | null> {
+    const clientId = session.clientId;
+    if (!clientId) return null;
+
+    const status = await db.query(
+      `SELECT app.client_processing_enabled($1, $2) AS enabled`,
+      [session.tenantId, clientId]);
+    if (status.rows[0]?.enabled !== true) {
+      return 'this client\'s subscription is not active — contact your administrator';
+    }
+
+    const feature = FEATURE_ROUTES.find(([pattern]) => pattern.test(pathname))?.[1];
+    if (!feature) return null;
+    const enabled = await db.query(
+      `SELECT app.client_feature_enabled($1, $2, $3) AS enabled`,
+      [session.tenantId, clientId, feature]);
+    return enabled.rows[0]?.enabled === true
+      ? null
+      : `the ${feature} feature is not enabled for this client`;
+  }
 
   // ---- routes ---------------------------------------------------------------
   const routes: Array<[string, RegExp, Handler]> = [];
@@ -709,8 +760,31 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     json(ctx, 200, await admin.billingSummary(pool, ctx.session!, ctx.scope!, ctx.params[0])));
   authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/billing\/invoice$/, async (ctx) => {
     const body = await readJson(ctx.req);
-    json(ctx, 200, await admin.generateInvoice(
+    json(ctx, 200, await billing.generateInvoice(
       pool, ctx.session!, ctx.scope!, ctx.params[0], String(body.month ?? '')));
+  });
+  // Compute a month without writing anything — what the bill would be.
+  authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/billing\/preview$/, async (ctx) => {
+    const body = await readJson(ctx.req);
+    json(ctx, 200, await billing.previewInvoice(
+      pool, ctx.session!, ctx.scope!, ctx.params[0], String(body.month ?? '')));
+  });
+  authed('GET', /^\/api\/admin\/invoices\/([0-9a-f-]{36})$/, async (ctx) =>
+    json(ctx, 200, await billing.invoiceDetail(pool, ctx.session!, ctx.scope!, ctx.params[0])));
+  authed('POST', /^\/api\/admin\/invoices\/([0-9a-f-]{36})\/issue$/, async (ctx) =>
+    json(ctx, 200, await billing.issueInvoice(pool, ctx.session!, ctx.scope!, ctx.params[0])));
+  authed('POST', /^\/api\/admin\/invoices\/([0-9a-f-]{36})\/void$/, async (ctx) => {
+    const body = await readJson(ctx.req);
+    json(ctx, 200, await billing.voidInvoice(
+      pool, ctx.session!, ctx.scope!, ctx.params[0], String(body.reason ?? '')));
+  });
+
+  // pricing plans (the agreed commercial terms behind every invoice)
+  authed('GET', /^\/api\/admin\/pricing-plans$/, async (ctx) =>
+    json(ctx, 200, await billing.listPricingPlans(pool, ctx.session!, ctx.scope!)));
+  authed('POST', /^\/api\/admin\/pricing-plans$/, async (ctx) => {
+    const body = await readJson(ctx.req);
+    json(ctx, 200, await billing.createPricingPlan(pool, ctx.session!, ctx.scope!, body));
   });
   authed('POST', /^\/api\/admin\/plan$/, async (ctx) => {
     const body = await readJson(ctx.req);

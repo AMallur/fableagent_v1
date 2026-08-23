@@ -494,16 +494,27 @@ export function ingestParsed837(
          claim.placeOfService, claim.authorizationNumber, claim.diagnosisCodes],
       );
 
+      if ((claim.payerSequence === 'secondary' || claim.payerSequence === 'tertiary')
+          && claim.priorPayerPaid == null
+          && !claim.lines.some((l) => l.priorPayerPaid != null)) {
+        warnings.push(
+          `claim ${claim.patientControlNumber} is ${claim.payerSequence} but carries no COB `
+          + 'payer-paid amount (AMT*D / SVD02); expected payer liability will fall back to the '
+          + "remit's OA-23 amount, and to the full allowed amount if there is none",
+        );
+      }
+
       const inserted = await db.query(
         `INSERT INTO claim
            (tenant_id, client_id, encounter_id, payer_id, claim_type,
             claim_number_internal, submission_date, billed_amount, claim_status,
-            raw_837_reference)
-         VALUES ($1,$2,$3,$4,'professional',$5,$6,$7,'submitted',$8)
+            raw_837_reference, payer_sequence, prior_payer_paid)
+         VALUES ($1,$2,$3,$4,'professional',$5,$6,$7,'submitted',$8,$9,$10)
          RETURNING claim_id`,
         [params.tenantId, params.clientId, encounter.rows[0].encounter_id, payerId,
          claim.patientControlNumber, file.transactionDate,
-         claim.chargeAmount ?? 0, params.fileName],
+         claim.chargeAmount ?? 0, params.fileName,
+         claim.payerSequence ?? 'primary', claim.priorPayerPaid],
       );
       const claimId = inserted.rows[0].claim_id;
 
@@ -514,12 +525,12 @@ export function ingestParsed837(
           `INSERT INTO claim_line
              (tenant_id, claim_id, line_number, procedure_code,
               modifier_1, modifier_2, modifier_3, modifier_4,
-              units, billed_amount)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+              units, billed_amount, prior_payer_paid)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
           [params.tenantId, claimId, lineNo, line.procedureCode,
            line.modifiers[0] ?? null, line.modifiers[1] ?? null,
            line.modifiers[2] ?? null, line.modifiers[3] ?? null,
-           line.units, line.chargeAmount ?? 0],
+           line.units, line.chargeAmount ?? 0, line.priorPayerPaid ?? null],
         );
       }
       processed += 1;

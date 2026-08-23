@@ -116,17 +116,22 @@ export async function schedulerTick(
     (n, s) => n + s.files.filter((f) => f.status === 'ingested').length, 0);
 
   const clients = await pool.query(
-    `SELECT client_id, tenant_id, client_name, timezone, nightly_run_time
+    `SELECT client_id, tenant_id, client_name, timezone, nightly_run_time, features
      FROM app.list_active_clients()`);
 
   for (const c of clients.rows) {
+    // app.list_active_clients() already excludes suspended and cancelled
+    // subscriptions. The feature flags travel with the row so each step can
+    // check the plan rather than every client getting every feature.
+    const features = (c.features ?? {}) as Record<string, boolean>;
+    const has = (feature: string) => features[feature] === true;
     const clock = localClock(now, c.timezone);
     const nightlyAt = String(c.nightly_run_time).slice(0, 5);
 
     try {
       await scoped.runAsTenant(c.tenant_id, async () => {
         // nightly processing (payment reconciliation runs inside it, per spec)
-        if (clock.time >= nightlyAt) {
+        if (clock.time >= nightlyAt && has('detection')) {
         const ran = await runClaimed(pool, c.tenant_id, c.client_id, 'nightly_processing', 20, async () => {
           log(`nightly: ${c.client_name}`);
           await runNightlyProcessing(pool, {
@@ -136,8 +141,8 @@ export async function schedulerTick(
         if (ran) report.nightly.push(c.client_id);
         }
 
-      // 7am deadline monitor
-        if (clock.time >= '07:00') {
+      // 7am deadline monitor — a workflow feature, not a detection one
+        if (clock.time >= '07:00' && has('automation')) {
         const ran = await runClaimed(pool, c.tenant_id, c.client_id, 'deadline_monitor', 20, async () => {
           log(`deadline monitor: ${c.client_name}`);
           await runDeadlineMonitor(pool, {
@@ -149,7 +154,7 @@ export async function schedulerTick(
 
       // 9am clearinghouse delivery reconciliation — after nightly/deadline
       // so anything submitted overnight has had time to reach the payer
-        if (clock.time >= '09:00') {
+        if (clock.time >= '09:00' && has('appeals')) {
         const ran = await runClaimed(pool, c.tenant_id, c.client_id, 'reconcile_deliveries', 20, async () => {
           log(`delivery reconciliation: ${c.client_name}`);
           await runDeliveryReconciliation(pool, { tenantId: c.tenant_id, clientId: c.client_id });
@@ -158,7 +163,7 @@ export async function schedulerTick(
         }
 
       // Monday weekly summary
-        if (clock.weekday === 'Mon' && clock.time >= '08:00') {
+        if (clock.weekday === 'Mon' && clock.time >= '08:00' && has('automation')) {
         const ran = await runClaimed(pool, c.tenant_id, c.client_id, 'weekly_summary', 24 * 6, async () => {
           log(`weekly summary: ${c.client_name}`);
           await runWeeklySummary(pool, {
@@ -169,7 +174,7 @@ export async function schedulerTick(
         }
 
       // digest emails at 07:15 local — once per tenant per day
-        if (clock.time >= '07:15') {
+        if (clock.time >= '07:15' && has('automation')) {
         await runClaimed(pool, c.tenant_id, null, 'send_alerts', 20, async () => {
           const job = await pool.query(
             `INSERT INTO system_job (tenant_id, job_type, status, started_at)

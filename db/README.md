@@ -40,9 +40,15 @@ db/
     ├── 0022_reference_data_provenance.sql   # versioned, checksummed CMS/X12 imports
     ├── 0023_reconcile_deliveries_job_type.sql
     ├── 0024_client_payer_readiness.sql   # per-client/payer activation capabilities
-    └── 0025_era_financial_integrity.sql  # PLB provider adjustments, 835 balancing state,
-                                          #   reversal/adjudication detail, recovery
-                                          #   attribution columns, client balance policy
+    ├── 0025_era_financial_integrity.sql  # PLB provider adjustments, 835 balancing state,
+    │                                     #   reversal/adjudication detail, recovery
+    │                                     #   attribution columns, client balance policy
+    └── 0026_pricing_cob_and_commercial_terms.sql
+                                          # payer payment reduction, contract lesser-of,
+                                          #   modifier payment rules, claim payer sequence
+                                          #   + prior-payer paid, pricing_plan +
+                                          #   invoice_line + issued-invoice immutability,
+                                          #   subscription/feature enforcement functions
 ```
 
 The detection engine that consumes this schema lives in [../engine](../engine).
@@ -153,6 +159,9 @@ are skipped.
 | — | `remittance_line.claim_id / claim_line_id` nullable | 835s land before matching; the `match_claims` job links them later. Partial index `idx_remit_line_unmatched` feeds that job |
 | — | `remittance_provider_adjustment` (0025) | PLB moves real money (recoupments, forwarding balances, interest) that never appears on a CLP claim. Without it a check cannot be balanced and a payer takeback is invisible |
 | — | `payment_event` attribution columns (0025) | A recovered dollar has to be defensible against the customer's own remittances, so the scope, basis, gross, reversals and recoupments behind each figure are stored, not just the total |
+| — | `modifier_payment_rule` (0026) | Modifiers change the percentage payable (51 at 50%, 50 at 150%, 80 at 16%). Pricing every modified line at 100% made it look half underpaid. Shared defaults with tenant/payer overrides, composed multiplicatively in `apply_order` |
+| — | `pricing_plan` + `invoice_line` (0026) | Recovery is sold on contingency, so the terms are effective-dated data rather than a code constant, and an invoice names every `payment_event` it charges for. A unique index on `payment_event_id` means a recovery can be billed only once |
+| — | `invoice` immutable past `draft` (0026) | A trigger refuses to change the figures on an issued bill or delete it; corrections are a void and reissue. Regenerating a month used to silently rewrite an invoice that had already gone out |
 
 ### Other conventions
 

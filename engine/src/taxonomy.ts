@@ -128,14 +128,33 @@ export const DENIAL_TAXONOMY: Record<string, TaxonomyEntry> = {
     recommendedAction: 'Verify primary payer; update COB information and resubmit to correct payer',
     supportingDocuments: ['eob'],
   },
+  // OA-23 is the payer stating what the PRIOR payer did. On a secondary claim
+  // it appears on virtually every line as normal adjudication, so treating it
+  // as a denial opened a case on every secondary claim and counted the
+  // primary's payment as recovery opportunity. It becomes a case only when
+  // money is genuinely still owed after the prior payment is accounted for.
   'OA-23': {
     category: 'coordination_of_benefits', caseType: 'denial',
     baseLikelihood: 'medium',
     recommendedAction: 'Reconcile primary payer payment; bill secondary with primary EOB attached',
     supportingDocuments: ['eob'],
+    requiresVariance: true,
   },
 
   // -- CONTRACTUAL ------------------------------------------------------------------
+  // Sequestration: a statutory percentage withheld from the payment, not a
+  // denial and not appealable. Classified so it is recognized rather than
+  // landing in the unmapped-code manual-review bucket, and gated on variance
+  // so it only surfaces if the withholding exceeds what the payer's configured
+  // payment_reduction_percent accounts for.
+  'CO-253': {
+    category: 'contractual', caseType: 'other',
+    baseLikelihood: 'low',
+    recommendedAction: 'Statutory payment reduction (sequestration) — not appealable; '
+      + 'confirm the payer payment_reduction_percent matches the amount withheld',
+    supportingDocuments: [],
+    requiresVariance: true,
+  },
   'CO-45': {
     category: 'contractual', caseType: 'underpayment',
     baseLikelihood: 'high',

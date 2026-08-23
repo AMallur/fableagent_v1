@@ -33,7 +33,16 @@ facts or missing documentation.
 
 1. Create the tenant and client; require admin MFA and acknowledge the BAA.
 2. Restrict users to named pilot participants and the pilot client.
-3. Configure payer IDs/deadlines and leave autopilot disabled.
+3. Configure payer IDs/deadlines and leave autopilot disabled. Set
+   `payment_reduction_percent` to 2.000 on any Medicare or Medicare Advantage
+   payer in scope — sequestration is withheld from every payment and is not an
+   underpayment. Confirm whether each contract pays the lesser of billed
+   charges or the schedule regardless, and set `apply_lesser_of_billed` to
+   match; the default (lesser-of) is the near-universal term.
+3a. Establish for each payer in scope whether the pilot data includes secondary
+   claims. If it does, the 837 must carry SBR01 and the COB payer-paid amount
+   (`AMT*D`, or `SVD02` per line) — without them expected payer liability falls
+   back to the remit's OA-23, and to the full allowed amount if there is none.
 4. Import/version external references and set the client CMS locality only if
    percent-of-Medicare pricing is in scope.
 5. Enter the contract as structured lines, resolve every validation error,

@@ -2,15 +2,25 @@
 // STEP 3 — VARIANCE DETECTION
 //
 // For each claim line with a matched remit:
-//   expected_payer_amount = contract_allowed - patient_responsibility
+//   expected_payer_amount =
+//       (contract_allowed - patient_responsibility - prior_payer_paid)
+//       x (1 - payer payment reduction)
 //   variance = expected_payer_amount - cumulative_paid_amount
+//
+// The last two terms are what stop the engine billing a payer for money it
+// never owed. PRIOR PAYER PAID applies on a secondary or tertiary claim: the
+// primary has already settled part of the allowed amount, and without
+// subtracting it every secondary claim reads as massively underpaid. The
+// PAYMENT REDUCTION is Medicare sequestration and its equivalents — a
+// percentage withheld from the payment after adjudication, which is why it
+// multiplies the payer's liability rather than the allowed amount.
 //   * denial code present -> route to denial classification (Step 4), never
 //     double-flagged as a plain underpayment
 //   * variance > $0                    -> flag line as underpayment
 //   * variance > $25 OR > 5% expected  -> candidate recovery case (underpayment)
 // ============================================================================
 
-import type { EngineInput, LinePricing } from '../types.ts';
+import type { ClaimInput, ClaimLineInput, EngineInput, LinePricing, PayerInput } from '../types.ts';
 import { moneyGt, round2 } from '../config.ts';
 import { normalizeDenialCode, DENIAL_TAXONOMY } from '../taxonomy.ts';
 import type { MatchedLine } from './step1_matching.ts';
@@ -65,8 +75,10 @@ export function runVarianceDetection(
     const paid = remitLine.paidAmount ?? claimLine.paidAmount ?? 0;
     const expected = priced.expectedAmount;
     const patientResponsibility = patientResponsibilityFor(remitLine);
+    const priorPayerPaid = priorPayerPaidFor(matched.claim, claimLine, remitLine);
+    const reduction = paymentReductionFor(input, matched.claim.payerId);
     const expectedPayerAmount = expected != null && patientResponsibility != null
-      ? round2(Math.max(0, expected - patientResponsibility))
+      ? round2(Math.max(0, expected - patientResponsibility - priorPayerPaid) * (1 - reduction))
       : null;
     const variance = expectedPayerAmount != null
       ? round2(expectedPayerAmount - paid)
@@ -100,6 +112,38 @@ export function runVarianceDetection(
   }
 
   return { underpayments, denialRoutes };
+}
+
+/**
+ * What a prior payer already paid toward this line. Line-level detail (837
+ * loop 2430 SVD02) is preferred; the claim-level COB total (loop 2320 AMT*D)
+ * is the fallback; and when the 837 carried neither, the payer's own OA-23
+ * "impact of prior payer adjudication" on the remit line is the last source.
+ *
+ * Only consulted for a claim we know is secondary or tertiary. Guessing at
+ * coverage order from an OA-23 alone would subtract real money from a primary
+ * claim and hide a genuine underpayment.
+ */
+function priorPayerPaidFor(
+  claim: ClaimInput, claimLine: ClaimLineInput, remitLine: MatchedLine['remitLine'],
+): number {
+  const sequence = claim.payerSequence ?? 'primary';
+  if (sequence === 'primary') return 0;
+
+  if (claimLine.priorPayerPaid != null) return Math.max(0, claimLine.priorPayerPaid);
+  if (claim.priorPayerPaid != null) return Math.max(0, claim.priorPayerPaid);
+
+  const oa23 = (remitLine.adjustments ?? [])
+    .filter((a) => a.groupCode.toUpperCase() === 'OA' && a.reasonCode.replace(/^0+/, '') === '23')
+    .reduce((sum, a) => sum + a.amount, 0);
+  return Math.max(0, oa23);
+}
+
+function paymentReductionFor(input: EngineInput, payerId: string): number {
+  const payer: PayerInput | undefined = input.payers.find((p) => p.payerId === payerId);
+  const percent = payer?.paymentReductionPercent;
+  if (percent == null || !Number.isFinite(percent) || percent <= 0) return 0;
+  return Math.min(percent, 100) / 100;
 }
 
 function patientResponsibilityFor(remitLine: MatchedLine['remitLine']): number | null {

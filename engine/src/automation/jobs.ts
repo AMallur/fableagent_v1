@@ -127,7 +127,14 @@ export async function runNightlyProcessing(
     }
 
     // -- step 8: appeal letters for new cases with sufficient data -----------
-    const gen = await generateAppealPackets(pool, { tenantId, clientId, asOf, store });
+    // Skipped entirely when the client's plan does not include appeals, rather
+    // than generating packets nobody is entitled to.
+    const appealsEnabled = (await pool.query(
+      `SELECT app.client_feature_enabled($1, $2, 'appeals') AS enabled`, [tenantId, clientId],
+    )).rows[0]?.enabled === true;
+    const gen = appealsEnabled
+      ? await generateAppealPackets(pool, { tenantId, clientId, asOf, store })
+      : { summary: { packetsCreated: 0, packetsRefreshed: 0, ready: 0, draft: 0 } };
 
     // -- reconciliation (spec: runs after each nightly ingest) ---------------
     const recon = await reconcilePaymentsInner(pool, tenantId, clientId);

@@ -325,12 +325,43 @@ describe('enterprise administration', { skip: !url && 'TEST_DATABASE_URL not set
     assert.ok(b1.usageThisPeriod.claimsProcessed >= 0);
     assert.ok(b1.availablePlans.length === 3);
 
+    // The bill comes from the tenant's pricing plan (contingency terms), not
+    // from the legacy self-serve tier table.
+    assert.ok(b1.pricingPlan, 'a pricing plan is in force');
+    assert.equal(b1.pricingPlan.contingencyPercent, 22);
+
     const month = new Date().toISOString().slice(0, 7);
+    const preview = await admin.post(`/api/admin/clients/${C}/billing/preview`, { month });
     const inv = await admin.post(`/api/admin/clients/${C}/billing/invoice`, { month });
-    assert.ok(inv.amountDue >= b1.pricing.base, 'base fee + per-case usage');
+    assert.equal(inv.amountDue, preview.amountDue, 'preview matches what is written');
+    assert.equal(inv.contingencyPercent, 22);
+    // base fee + 22% of attributed recovery, floored at the plan minimum
+    const expected = Math.max(
+      750, Math.round((750 + Math.max(0, inv.attributedRecovery) * 0.22) * 100) / 100);
+    assert.equal(inv.amountDue, expected, 'base fee plus contingency, floored at the minimum');
+    assert.equal(inv.lines.length >= 0, true);
+    assert.equal(
+      Math.round(inv.lines.reduce((t: number, l: any) => t + l.amountRecovered, 0) * 100) / 100,
+      inv.attributedRecovery, 'the lines add up to the billed basis');
+
     const b2 = await admin.get(`/api/admin/clients/${C}/billing`) as any;
     assert.equal(b2.invoices.length, 1);
     assert.ok(b2.invoices[0].casesCreated >= 0);
+    assert.equal(b2.invoices[0].status, 'draft');
+
+    // issuing freezes it: regenerating the same month is refused
+    const issued = await admin.post(`/api/admin/invoices/${inv.invoiceId}/issue`, {});
+    assert.match(issued.invoiceNumber, /^INV-\d{6}-\d{5}$/);
+    await admin.post(`/api/admin/clients/${C}/billing/invoice`, { month }, 409);
+
+    const detail = await admin.get(`/api/admin/invoices/${inv.invoiceId}`) as any;
+    assert.equal(detail.status, 'issued');
+    assert.equal(detail.amountDue, expected);
+
+    // a recovery already billed is never pulled into a second invoice
+    await admin.post(`/api/admin/invoices/${inv.invoiceId}/void`, { reason: 'test correction' });
+    const reissued = await admin.post(`/api/admin/clients/${C}/billing/invoice`, { month });
+    assert.equal(reissued.amountDue, expected, 'voiding releases the lines to be rebilled');
 
     await admin.post('/api/admin/plan', { tier: 'enterprise' });
     const b3 = await admin.get(`/api/admin/clients/${C}/billing`) as any;

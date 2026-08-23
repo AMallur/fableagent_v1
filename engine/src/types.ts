@@ -33,6 +33,9 @@ export type DenialCategory =
 
 export type ExpectedSource = 'contract' | 'medicare_proxy' | 'none';
 
+/** Where a claim sits in the patient's coverage order (837 SBR01). */
+export type PayerSequence = 'primary' | 'secondary' | 'tertiary' | 'unknown';
+
 // ---------------------------------------------------------------------------
 // Input snapshot
 // ---------------------------------------------------------------------------
@@ -42,6 +45,11 @@ export interface PayerInput {
   payerName: string;
   appealDeadlineDays?: number | null;
   timelyFilingLimitDays?: number | null;
+  /** Percentage withheld from the payment after adjudication — Medicare
+   * sequestration is 2. It reduces what the payer owes, not what the contract
+   * allows, so it applies to expected payer liability rather than to the
+   * allowed amount. */
+  paymentReductionPercent?: number | null;
 }
 
 export interface PatientInput {
@@ -63,6 +71,9 @@ export interface ClaimLineInput {
   patientResponsibility?: number | null;
   denialReasonCode?: string | null;
   lineStatus?: string | null;
+  /** Line-level COB amount (837 loop 2430 SVD02) — what the prior payer paid
+   * for this specific service line. Preferred over the claim-level total. */
+  priorPayerPaid?: number | null;
 }
 
 export interface ClaimInput {
@@ -78,6 +89,11 @@ export interface ClaimInput {
   claimStatus: ClaimStatus;
   authorizationNumber?: string | null; // denormalized from encounter
   availableDocumentTypes: string[];    // document_type values on file for this claim/client
+  /** 837 SBR01. On a secondary or tertiary claim this payer owes the allowed
+   * amount less patient responsibility AND less what the prior payer paid. */
+  payerSequence?: PayerSequence;
+  /** Claim-level COB amount (837 loop 2320 AMT*D). */
+  priorPayerPaid?: number | null;
   lines: ClaimLineInput[];
 }
 
@@ -143,7 +159,27 @@ export interface ContractInput {
   effectiveDate: ISODate;
   expirationDate?: ISODate | null;
   feeScheduleType: 'percent_of_medicare' | 'fee_schedule' | 'per_diem' | 'case_rate';
+  /** The near-universal contract term: the payer owes the lesser of billed
+   * charges and the contracted rate. A line billed below the rate therefore
+   * cannot be underpaid against that rate. */
+  applyLesserOfBilled?: boolean;
   lines: ContractLineInput[];
+}
+
+/**
+ * Percentage of the otherwise-allowed amount payable when a modifier is on the
+ * line (51 multiple procedure, 50 bilateral, 80/AS assistant, and so on).
+ * Rules compose multiplicatively in applyOrder, because a bilateral assistant
+ * surgery pays 150% and then 16% of that, not 166%.
+ */
+export interface ModifierPaymentRule {
+  modifier: string;
+  percentOfAllowed: number;
+  applyOrder: number;
+  /** null = every payer for this tenant. */
+  payerId?: UUID | null;
+  /** null = the shared default, overridden by any tenant-specific rule. */
+  tenantId?: UUID | null;
 }
 
 export interface ExistingCaseInput {
@@ -191,6 +227,8 @@ export interface EngineInput {
   claims: ClaimInput[];
   remitLines: RemitLineInput[];
   contracts: ContractInput[];
+  /** Modifier payment rules in effect: shared defaults plus tenant overrides. */
+  modifierRules?: ModifierPaymentRule[];
   /** Imported key: `${code}|${modifier}|${locality}|${facility|nonfacility}`.
    * Legacy/test fixtures may provide `${code}|${modifier}`. */
   medicareRates: Record<string, number>;

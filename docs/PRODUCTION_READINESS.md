@@ -32,6 +32,13 @@ customer and trading partner:
    reconcile acknowledgements before autonomous delivery is enabled.
 5. Validate each supported payer contract model against adjudicated examples.
    Unsupported contract constructs remain manual-review cases.
+5b. Configure the pricing terms before invoicing anyone: `pricing_plan` is the
+   only thing that decides what is billed, and a client with no plan on file
+   invoices nothing. Set `payer.payment_reduction_percent` to 2.000 on Medicare
+   and Medicare Advantage payers, and confirm `contract.apply_lesser_of_billed`
+   matches each signed contract — left wrong, the first two produce a
+   `systemic_underpayment` anomaly against payers that are paying correctly,
+   and the third fabricates variance from the provider's own charge master.
 5a. Agree the recovery-attribution basis in writing with the customer before
    any fee is charged against recovered dollars. The reconciler attributes
    line-scoped, post-appeal cash net of reversals and PLB recoupments, records
