@@ -18,12 +18,20 @@ const reviewed = (overrides: Partial<ValidationInput['findings'][number]> = {}):
 });
 
 describe('external validation metrics', () => {
-  it('calculates conservative count and amount metrics', () => {
+  it('calculates conservative metrics and preregistered gates', () => {
     const metrics = calculateValidationMetrics({
       ...metadata,
       eligibleLines: 100,
       matchedAndPricedLines: 90,
       groundTruthComplete: true,
+      gates: {
+        minPrecision: 0.5,
+        minRecall: 0.6,
+        minDollarPrecision: 0.5,
+        minDollarRecall: 0.8,
+        minCoverage: 0.85,
+        maxUnresolvedRate: 0.2,
+      },
       findings: [
         reviewed(),
         reviewed({ id: 'b', category: 'type-b', predictedAmount: 50, validatedAmount: 50 }),
@@ -50,16 +58,19 @@ describe('external validation metrics', () => {
     assert.equal(metrics.dollarPrecision, 0.56);
     assert.equal(metrics.dollarRecall, 0.8235);
     assert.equal(metrics.datasetManifestSha256, 'a'.repeat(64));
+    assert.equal(metrics.gateResults.length, 6);
+    assert.equal(metrics.gatesPassed, true);
     assert.ok(metrics.precision95 && metrics.precision95.lower < metrics.precision);
     assert.ok(metrics.recall95 && metrics.recall95.upper > metrics.recall);
   });
 
-  it('does not report recall without complete ground truth', () => {
+  it('fails recall gates when complete ground truth is absent', () => {
     const metrics = calculateValidationMetrics({
       ...metadata,
       eligibleLines: 20,
       matchedAndPricedLines: 20,
       groundTruthComplete: false,
+      gates: { minPrecision: 0.9, minRecall: 0.8 },
       findings: [reviewed({ validatedAmount: 100 })],
       missedFindings: [],
     });
@@ -67,6 +78,10 @@ describe('external validation metrics', () => {
     assert.equal(metrics.recall, null);
     assert.equal(metrics.recall95, null);
     assert.equal(metrics.dollarRecall, null);
+    assert.equal(metrics.gatesPassed, false);
+    assert.deepEqual(metrics.gateResults.find((g) => g.gate === 'minRecall'), {
+      gate: 'minRecall', threshold: 0.8, actual: null, passed: false,
+    });
   });
 
   it('counts duplicate outcomes against precision', () => {
@@ -85,7 +100,7 @@ describe('external validation metrics', () => {
     assert.equal(metrics.dollarPrecision, 0.5);
   });
 
-  it('rejects unsupported evidence states', () => {
+  it('rejects unsupported evidence states and undeclared fields', () => {
     assert.throws(() => calculateValidationMetrics({
       ...metadata,
       eligibleLines: 10,
@@ -103,5 +118,16 @@ describe('external validation metrics', () => {
       findings: [reviewed({ disposition: 'excluded', validatedAmount: 0, exclusionReason: null })],
       missedFindings: [],
     }), /excluded finding requires exclusionReason/);
+
+    const extraField = {
+      ...metadata,
+      eligibleLines: 1,
+      matchedAndPricedLines: 1,
+      groundTruthComplete: false,
+      findings: [],
+      missedFindings: [],
+      patientName: 'not allowed',
+    } as unknown as ValidationInput;
+    assert.throws(() => calculateValidationMetrics(extraField), /patientName is not allowed/);
   });
 });
