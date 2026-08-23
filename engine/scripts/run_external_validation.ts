@@ -31,6 +31,7 @@ await writeFile(reportPath, markdown(metrics, reviewInputSha256));
 console.log(`External validation metrics: ${metricsPath}`);
 console.log(`External validation report: ${reportPath}`);
 console.log(`Review input SHA-256: ${reviewInputSha256}`);
+if (metrics.gatesPassed != null) console.log(`Pre-registered gates passed: ${metrics.gatesPassed ? 'yes' : 'no'}`);
 
 function markdown(
   metrics: ReturnType<typeof calculateValidationMetrics>,
@@ -40,6 +41,14 @@ function markdown(
   const ci = (value: typeof metrics.precision95) => value == null
     ? 'not estimable'
     : `${(value.lower * 100).toFixed(2)}%–${(value.upper * 100).toFixed(2)}%`;
+  const gateRows = metrics.gateResults.map((g) =>
+    `| ${g.gate} | ${pct(g.threshold)} | ${pct(g.actual)} | ${g.passed ? 'PASS' : 'FAIL'} |`,
+  ).join('\n');
+  const gateSection = metrics.gateResults.length === 0
+    ? `## Pre-registered acceptance gates\n\nNo machine-readable gates were supplied. This report is descriptive only.\n\n`
+    : `## Pre-registered acceptance gates\n\nOverall: **${metrics.gatesPassed ? 'PASS' : 'FAIL'}**\n\n`
+      + `| Gate | Threshold | Actual | Result |\n|---|---:|---:|---:|\n${gateRows}\n\n`;
+
   return `# External validation metrics\n\n`
     + `> This report is only as independent as the underlying customer/reviewer evidence. `
     + `Generating this file does not create third-party validation.\n\n`
@@ -51,6 +60,7 @@ function markdown(
     + `- Engine commit: ${metrics.engineCommit}\n`
     + `- Protocol version: ${metrics.protocolVersion}\n`
     + `- Complete ground truth declared: ${metrics.groundTruthComplete ? 'yes' : 'no'}\n\n`
+    + `## Primary metrics\n\n`
     + `| Metric | Result |\n|---|---:|\n`
     + `| Findings | ${metrics.findings} |\n`
     + `| Adjudicated findings | ${metrics.adjudicated} |\n`
@@ -70,6 +80,7 @@ function markdown(
     + `| Missed validated dollars | $${metrics.missedDollars.toFixed(2)} |\n`
     + `| Dollar precision | ${pct(metrics.dollarPrecision)} |\n`
     + `| Dollar recall | ${pct(metrics.dollarRecall)} |\n\n`
+    + gateSection
     + (metrics.recall == null
       ? `Recall and dollar recall are intentionally not reported because complete ground truth was not declared.\n`
       : `Recall is based on a declared complete ground-truth review and must be supported by the evidence bundle.\n`);
