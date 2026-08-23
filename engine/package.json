@@ -18,7 +18,8 @@
     "seed": "node scripts/seed_demo.ts",
     "scheduler": "node src/cli.ts schedule",
     "test:sftp": "node --test test/sftp_integration.test.ts",
-    "benchmark:pilot": "node scripts/run_pilot_benchmark.ts"
+    "benchmark:pilot": "node scripts/run_pilot_benchmark.ts",
+    "evidence:manifest": "node scripts/build_evidence_manifest.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1104.0",
