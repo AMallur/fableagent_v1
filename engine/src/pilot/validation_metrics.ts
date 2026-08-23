@@ -33,6 +33,15 @@ export interface MissedFinding {
   rationaleRef?: string | null;
 }
 
+export interface ValidationGates {
+  minPrecision?: number;
+  minRecall?: number;
+  minDollarPrecision?: number;
+  minDollarRecall?: number;
+  minCoverage?: number;
+  maxUnresolvedRate?: number;
+}
+
 export interface ValidationInput {
   schemaVersion: 1;
   studyId: string;
@@ -45,11 +54,19 @@ export interface ValidationInput {
   groundTruthComplete: boolean;
   eligibleLines: number;
   matchedAndPricedLines: number;
+  gates?: ValidationGates;
 }
 
 export interface Interval {
   lower: number;
   upper: number;
+}
+
+export interface GateResult {
+  gate: keyof ValidationGates;
+  threshold: number;
+  actual: number | null;
+  passed: boolean;
 }
 
 export interface ValidationMetrics {
@@ -78,10 +95,31 @@ export interface ValidationMetrics {
   missedDollars: number;
   dollarPrecision: number | null;
   dollarRecall: number | null;
+  gateResults: GateResult[];
+  gatesPassed: boolean | null;
 }
 
 const INVALID = new Set<ValidationDisposition>([
   'false_positive', 'duplicate', 'already_recovered',
+]);
+
+const INPUT_KEYS = new Set([
+  'schemaVersion', 'studyId', 'datasetId', 'datasetManifestSha256', 'engineCommit',
+  'protocolVersion', 'findings', 'missedFindings', 'groundTruthComplete',
+  'eligibleLines', 'matchedAndPricedLines', 'gates',
+]);
+const FINDING_KEYS = new Set([
+  'id', 'payer', 'category', 'predictedAmount', 'validatedAmount', 'disposition',
+  'reviewerId', 'reviewedAt', 'secondReviewerId', 'adjudicatorId', 'rationaleRef',
+  'exclusionReason',
+]);
+const MISSED_KEYS = new Set([
+  'id', 'payer', 'category', 'validatedAmount', 'reviewerId', 'reviewedAt',
+  'secondReviewerId', 'adjudicatorId', 'rationaleRef',
+]);
+const GATE_KEYS = new Set([
+  'minPrecision', 'minRecall', 'minDollarPrecision', 'minDollarRecall',
+  'minCoverage', 'maxUnresolvedRate',
 ]);
 
 export function calculateValidationMetrics(input: ValidationInput): ValidationMetrics {
@@ -99,8 +137,12 @@ export function calculateValidationMetrics(input: ValidationInput): ValidationMe
   const recall = input.groundTruthComplete
     ? ratio(truePositives.length, truePositives.length + input.missedFindings.length)
     : null;
+  const dollarPrecision = ratio(validated, predicted);
+  const dollarRecall = input.groundTruthComplete ? ratio(validated, validated + missedDollars) : null;
+  const coverage = ratio(input.matchedAndPricedLines, input.eligibleLines);
+  const unresolvedRate = input.findings.length === 0 ? 0 : round4(unresolved.length / input.findings.length);
 
-  return {
+  const result: ValidationMetrics = {
     schemaVersion: 1,
     studyId: input.studyId,
     datasetId: input.datasetId,
@@ -119,20 +161,27 @@ export function calculateValidationMetrics(input: ValidationInput): ValidationMe
     precision95: precision == null ? null : wilson95(truePositives.length, adjudicated.length),
     recall,
     recall95: recall == null ? null : wilson95(truePositives.length, truePositives.length + input.missedFindings.length),
-    coverage: ratio(input.matchedAndPricedLines, input.eligibleLines),
-    unresolvedRate: input.findings.length === 0 ? 0 : round4(unresolved.length / input.findings.length),
+    coverage,
+    unresolvedRate,
     predictedAdjudicatedDollars: predicted,
     validatedDollars: validated,
     missedDollars,
-    dollarPrecision: ratio(validated, predicted),
-    dollarRecall: input.groundTruthComplete ? ratio(validated, validated + missedDollars) : null,
+    dollarPrecision,
+    dollarRecall,
+    gateResults: [],
+    gatesPassed: null,
   };
+
+  result.gateResults = evaluateGates(input.gates, result);
+  result.gatesPassed = input.gates == null ? null : result.gateResults.every((g) => g.passed);
+  return result;
 }
 
 function validateInput(input: ValidationInput): void {
   if (typeof input !== 'object' || input == null || Array.isArray(input)) {
     throw new Error('validation input must be an object');
   }
+  rejectUnknown(input as unknown as Record<string, unknown>, INPUT_KEYS, 'input');
   if (input.schemaVersion !== 1) throw new Error('schemaVersion must be 1');
   text(input.studyId, 'studyId');
   text(input.datasetId, 'datasetId');
@@ -157,11 +206,15 @@ function validateInput(input: ValidationInput): void {
     if (typeof finding !== 'object' || finding == null || Array.isArray(finding)) {
       throw new Error(`findings[${index}] must be an object`);
     }
+    rejectUnknown(finding as unknown as Record<string, unknown>, FINDING_KEYS, `findings[${index}]`);
     rowId(finding.id, ids);
     text(finding.payer, `findings[${index}].payer`);
     text(finding.category, `findings[${index}].category`);
     text(finding.reviewerId, `findings[${index}].reviewerId`);
     date(finding.reviewedAt, `findings[${index}].reviewedAt`);
+    optionalText(finding.secondReviewerId, `findings[${index}].secondReviewerId`);
+    optionalText(finding.adjudicatorId, `findings[${index}].adjudicatorId`);
+    optionalText(finding.rationaleRef, `findings[${index}].rationaleRef`);
     amount(finding.predictedAmount, `findings[${index}].predictedAmount`);
     amount(finding.validatedAmount, `findings[${index}].validatedAmount`);
     if (!['true_positive', 'false_positive', 'duplicate', 'already_recovered', 'excluded', 'unresolved'].includes(finding.disposition)) {
@@ -173,8 +226,10 @@ function validateInput(input: ValidationInput): void {
     if (finding.disposition !== 'true_positive' && finding.validatedAmount !== 0) {
       throw new Error(`findings[${index}] non-true-positive findings require validatedAmount = 0`);
     }
-    if (finding.disposition === 'excluded' && !finding.exclusionReason?.trim()) {
-      throw new Error(`findings[${index}] excluded finding requires exclusionReason`);
+    if (finding.disposition === 'excluded') {
+      text(finding.exclusionReason, `findings[${index}].exclusionReason`);
+    } else if (finding.exclusionReason != null) {
+      throw new Error(`findings[${index}].exclusionReason is only allowed for excluded findings`);
     }
   }
 
@@ -182,13 +237,50 @@ function validateInput(input: ValidationInput): void {
     if (typeof missed !== 'object' || missed == null || Array.isArray(missed)) {
       throw new Error(`missedFindings[${index}] must be an object`);
     }
+    rejectUnknown(missed as unknown as Record<string, unknown>, MISSED_KEYS, `missedFindings[${index}]`);
     rowId(missed.id, ids);
     text(missed.payer, `missedFindings[${index}].payer`);
     text(missed.category, `missedFindings[${index}].category`);
     text(missed.reviewerId, `missedFindings[${index}].reviewerId`);
     date(missed.reviewedAt, `missedFindings[${index}].reviewedAt`);
+    optionalText(missed.secondReviewerId, `missedFindings[${index}].secondReviewerId`);
+    optionalText(missed.adjudicatorId, `missedFindings[${index}].adjudicatorId`);
+    optionalText(missed.rationaleRef, `missedFindings[${index}].rationaleRef`);
     amount(missed.validatedAmount, `missedFindings[${index}].validatedAmount`);
     if (missed.validatedAmount <= 0) throw new Error(`missedFindings[${index}].validatedAmount must be > 0`);
+  }
+
+  if (input.gates != null) validateGates(input.gates);
+}
+
+function evaluateGates(gates: ValidationGates | undefined, metrics: ValidationMetrics): GateResult[] {
+  if (gates == null) return [];
+  const results: GateResult[] = [];
+  const minimum = (gate: keyof ValidationGates, threshold: number | undefined, actual: number | null) => {
+    if (threshold == null) return;
+    results.push({ gate, threshold, actual, passed: actual != null && actual >= threshold });
+  };
+  minimum('minPrecision', gates.minPrecision, metrics.precision);
+  minimum('minRecall', gates.minRecall, metrics.recall);
+  minimum('minDollarPrecision', gates.minDollarPrecision, metrics.dollarPrecision);
+  minimum('minDollarRecall', gates.minDollarRecall, metrics.dollarRecall);
+  minimum('minCoverage', gates.minCoverage, metrics.coverage);
+  if (gates.maxUnresolvedRate != null) {
+    results.push({
+      gate: 'maxUnresolvedRate', threshold: gates.maxUnresolvedRate,
+      actual: metrics.unresolvedRate, passed: metrics.unresolvedRate <= gates.maxUnresolvedRate,
+    });
+  }
+  return results;
+}
+
+function validateGates(gates: ValidationGates): void {
+  if (typeof gates !== 'object' || gates == null || Array.isArray(gates)) throw new Error('gates must be an object');
+  rejectUnknown(gates as unknown as Record<string, unknown>, GATE_KEYS, 'gates');
+  for (const [key, value] of Object.entries(gates)) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+      throw new Error(`gates.${key} must be between 0 and 1`);
+    }
   }
 }
 
@@ -229,6 +321,11 @@ function text(value: unknown, field: string): asserts value is string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} must be non-empty`);
 }
 
+function optionalText(value: unknown, field: string): void {
+  if (value == null) return;
+  text(value, field);
+}
+
 function date(value: unknown, field: string): asserts value is string {
   text(value, field);
   if (Number.isNaN(Date.parse(value))) throw new Error(`${field} must be an ISO-compatible date/time`);
@@ -238,4 +335,10 @@ function rowId(value: unknown, ids: Set<string>): asserts value is string {
   text(value, 'id');
   if (ids.has(value)) throw new Error(`duplicate validation id: ${value}`);
   ids.add(value);
+}
+
+function rejectUnknown(value: Record<string, unknown>, allowed: Set<string>, field: string): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`${field}.${key} is not allowed in the validation metric file`);
+  }
 }
