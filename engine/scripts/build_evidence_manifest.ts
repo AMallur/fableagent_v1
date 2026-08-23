@@ -30,7 +30,7 @@ const manifest = await buildEvidenceManifest(
   bundleId,
   engineCommit,
   protocolVersion,
-  filePaths.map(resolve),
+  filePaths.map((filePath) => resolve(filePath)),
 );
 const manifestSha256 = canonicalManifestDigest(manifest);
 await writeFile(resolve(output), `${JSON.stringify({ manifestSha256, manifest }, null, 2)}\n`);
