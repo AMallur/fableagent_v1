@@ -85,6 +85,20 @@ jobs:
         working-directory: engine
         run: npm test
 
+      - name: Generate deterministic synthetic benchmark evidence
+        working-directory: engine
+        run: npm run benchmark:pilot
+
+      - name: Upload synthetic benchmark evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-pilot-benchmark-${{ github.sha }}
+          path: |
+            engine/var/pilot_benchmark/benchmark.json
+            engine/var/pilot_benchmark/benchmark.md
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Integration tests
         working-directory: engine
         run: npm run test:integration
