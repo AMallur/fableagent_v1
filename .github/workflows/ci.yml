@@ -58,8 +58,6 @@ jobs:
           CREATE ROLE rcm_service NOLOGIN BYPASSRLS;
           CREATE ROLE rcm_pretenant_lookup NOLOGIN;
           CREATE ROLE rcm_catalog_lookup NOLOGIN;
-          -- Migration ownership transfers require SET membership, but runtime
-          -- must never inherit the owner roles' RLS exemption.
           GRANT rcm_pretenant_lookup, rcm_catalog_lookup
             TO rcm_runtime WITH ADMIN OPTION, INHERIT FALSE;
           ALTER DATABASE rcm OWNER TO rcm_runtime;
@@ -77,13 +75,85 @@ jobs:
 
       - name: Seed demo data (required by several integration suites)
         working-directory: engine
-        # Demo reseeding performs dependency-ordered hard deletes and is an
-        # administrator/maintenance operation, never an application-runtime task.
         run: DATABASE_URL="$ADMIN_DATABASE_URL" npm run seed
 
       - name: Unit tests
         working-directory: engine
         run: npm test
+
+      - name: Generate deterministic synthetic benchmark evidence
+        working-directory: engine
+        run: npm run benchmark:pilot
+
+      - name: Upload synthetic benchmark evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-pilot-benchmark-${{ github.sha }}
+          path: |
+            engine/var/pilot_benchmark/benchmark.json
+            engine/var/pilot_benchmark/benchmark.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Generate CMS public-data POC evidence
+        working-directory: engine
+        run: npm run poc:cms-public -- --engine-commit "$GITHUB_SHA"
+
+      - name: Build CMS public-data POC evidence manifest
+        working-directory: engine
+        run: |
+          npm run evidence:manifest -- \
+            --bundle-id "cms-public-poc-${GITHUB_SHA}" \
+            --engine-commit "${GITHUB_SHA}" \
+            --protocol-version cms-public-poc-v1 \
+            --output var/cms_public_poc/evidence-manifest.json \
+            --files \
+              testdata/cms_2024_public_poc_fixture.json \
+              var/cms_public_poc/poc_summary.json \
+              var/cms_public_poc/poc_findings.csv \
+              var/cms_public_poc/poc_report.md
+
+      - name: Upload CMS public-data POC evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: cms-public-poc-${{ github.sha }}
+          path: |
+            engine/testdata/cms_2024_public_poc_fixture.json
+            engine/var/cms_public_poc/poc_summary.json
+            engine/var/cms_public_poc/poc_findings.csv
+            engine/var/cms_public_poc/poc_report.md
+            engine/var/cms_public_poc/evidence-manifest.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Smoke external assurance tooling
+        working-directory: engine
+        run: |
+          npm run validation:external -- --input ../docs/examples/external_validation.example.json --output-dir var/external_validation_example
+          mkdir -p var/assurance_smoke
+          npm run evidence:manifest -- \
+            --bundle-id "ci-${GITHUB_SHA}" \
+            --engine-commit "${GITHUB_SHA}" \
+            --protocol-version external-validation-v1 \
+            --output var/assurance_smoke/evidence-manifest.json \
+            --files \
+              ../docs/examples/external_validation.example.json \
+              ../docs/examples/external_validation.schema.json \
+              var/external_validation_example/metrics.json \
+              var/external_validation_example/report.md \
+              var/pilot_benchmark/benchmark.json \
+              var/pilot_benchmark/benchmark.md
+
+      - name: Upload assurance tooling smoke evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: assurance-tooling-smoke-${{ github.sha }}
+          path: |
+            engine/var/external_validation_example/metrics.json
+            engine/var/external_validation_example/report.md
+            engine/var/assurance_smoke/evidence-manifest.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Integration tests
         working-directory: engine
@@ -96,6 +166,24 @@ jobs:
       - name: Production dependency audit
         working-directory: engine
         run: npm audit --omit=dev --audit-level=high
+
+      - name: Generate dependency security evidence
+        if: always()
+        working-directory: engine
+        run: |
+          npm audit --omit=dev --json > dependency-audit.json || true
+          npm sbom --sbom-format=cyclonedx > sbom.cdx.json
+
+      - name: Upload dependency security evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-security-evidence-${{ github.sha }}
+          path: |
+            engine/dependency-audit.json
+            engine/sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 90
 
       - uses: hashicorp/setup-terraform@v3
 

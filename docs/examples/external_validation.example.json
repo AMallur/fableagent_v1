@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "studyId": "pilot-001",
+  "datasetId": "dataset-2026-q3",
+  "datasetManifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "engineCommit": "replace-with-release-git-sha",
+  "protocolVersion": "external-validation-v1",
+  "groundTruthComplete": false,
+  "eligibleLines": 100,
+  "matchedAndPricedLines": 95,
+  "findings": [
+    {
+      "id": "finding-001",
+      "payer": "PAYER_A",
+      "category": "underpayment",
+      "predictedAmount": 125.0,
+      "validatedAmount": 120.0,
+      "disposition": "true_positive",
+      "reviewerId": "reviewer-01",
+      "reviewedAt": "2026-08-22T12:00:00Z",
+      "secondReviewerId": null,
+      "adjudicatorId": null,
+      "rationaleRef": "review-notes/finding-001",
+      "exclusionReason": null
+    },
+    {
+      "id": "finding-002",
+      "payer": "PAYER_A",
+      "category": "denial",
+      "predictedAmount": 80.0,
+      "validatedAmount": 0,
+      "disposition": "already_recovered",
+      "reviewerId": "reviewer-01",
+      "reviewedAt": "2026-08-22T12:05:00Z",
+      "secondReviewerId": null,
+      "adjudicatorId": null,
+      "rationaleRef": "review-notes/finding-002",
+      "exclusionReason": null
+    },
+    {
+      "id": "finding-003",
+      "payer": "PAYER_B",
+      "category": "other",
+      "predictedAmount": 45.0,
+      "validatedAmount": 0,
+      "disposition": "excluded",
+      "reviewerId": "reviewer-02",
+      "reviewedAt": "2026-08-22T12:10:00Z",
+      "secondReviewerId": null,
+      "adjudicatorId": null,
+      "rationaleRef": "review-notes/finding-003",
+      "exclusionReason": "pre-registered unsupported contract construct"
+    }
+  ],
+  "missedFindings": []
+}
