@@ -606,12 +606,23 @@ export const RECON_BODY = `
     <div class="sub" id="k-period"></div></div>
   <div class="card"><h3>Auto-matched</h3><div class="big" id="k-auto">—</div></div>
   <div class="card alarm"><h3>Unmatched — needs manual match</h3><div class="big" id="k-un">—</div></div>
+  <div class="card alarm"><h3>Payer takebacks (period)</h3><div class="big" id="k-take">—</div>
+    <div class="sub">provider-level adjustments</div></div>
 </div>
 <div class="grid2">
   <div class="panel"><h2>Unmatched post-appeal remittances</h2>
     <table class="data" id="unmatched"><tbody></tbody></table></div>
   <div class="panel"><h2>Recovery rate by category</h2><div id="rates"></div></div>
 </div>
+<div class="panel" style="margin-top:14px"><h2>Payer takebacks (PLB)</h2>
+  <div class="sub" style="margin-bottom:6px">Money the payer kept out of a check. It never
+    appears on a claim, so claim-level reconciliation cannot see it.</div>
+  <table class="data" id="takebacks"><tbody></tbody></table></div>
+<div class="panel" id="oob-panel" style="margin-top:14px;display:none"><h2>Checks that do not balance</h2>
+  <div class="sub" style="margin-bottom:6px">Loaded because this client's ERA balance policy is
+    set to warn. Every figure derived from these checks is suspect until the trading partner
+    explains the difference.</div>
+  <table class="data" id="oob"><tbody></tbody></table></div>
 <div class="panel" style="margin-top:14px"><h2>Matched recoveries</h2>
   <table class="data" id="matched"><tbody></tbody></table></div>
 <div class="modal-back" id="m-match"><div class="modal"><h3>Match payment to case</h3>
@@ -623,6 +634,19 @@ export const RECON_BODY = `
 
 export const RECON_JS = `
 let d = null, target = null;
+/** How a recovery figure was arrived at, so it can be checked rather than trusted. */
+function attributionCell(a) {
+  if (!a) return '<span class="sub">—</span>';
+  if (a.basis === 'manual') return '<span class="sub">operator match</span>';
+  const parts = [];
+  if (a.grossPostAppealPaid) parts.push(usd(a.grossPostAppealPaid) + ' paid');
+  if (a.reversalsNetted) parts.push('less ' + usd(a.reversalsNetted) + ' reversed');
+  if (a.recoupmentsNetted) parts.push('less ' + usd(a.recoupmentsNetted) + ' recouped');
+  if (a.unallocatedPaid) parts.push(usd(a.unallocatedPaid) + ' not line-resolved');
+  return '<span class="sub" title="' + esc(parts.join(', ')) + '">' +
+    esc(a.scope === 'claim_line' ? 'line-scoped' : 'claim-scoped') +
+    (parts.length ? ' · ' + esc(parts.join(', ')) : '') + '</span>';
+}
 async function load() {
   d = await api('/api/reports/reconciliation');
   $('#k-rec').textContent = usd(d.totalRecovered);
@@ -637,17 +661,46 @@ async function load() {
       '<td>' + fmtDate(u.appealSubmittedAt) + '</td>' +
       '<td><button class="btn small" data-i="' + i + '">Match</button></td></tr>').join('')
     || '<tr><td class="sub" colspan="7">nothing awaiting manual match</td></tr>';
+  $('#k-take').textContent = usd(d.providerTakebackTotal || 0);
+  $('#takebacks tbody').innerHTML =
+    '<tr><th>Check</th><th>Payer</th><th>Reason</th><th>Type</th><th>Reference</th>' +
+    '<th class="num">Amount</th></tr>' +
+    (d.providerTakebacks || []).map((t) => '<tr><td>' + esc(t.checkNumber || '—') + ' ' +
+      fmtDate(t.checkDate) + '</td><td>' + esc(t.payerName) + '</td>' +
+      '<td>' + esc(t.reasonCode) + '</td>' +
+      '<td>' + esc((t.category || '').replaceAll('_',' ')) + '</td>' +
+      '<td>' + (t.matchedToClaim
+        ? esc(t.claimNumber || t.referenceId || '—')
+        : '<span class="sub">' + esc(t.referenceId || 'no reference') + ' (unmatched)</span>') + '</td>' +
+      '<td class="num">' + usd(t.amount) + '</td></tr>').join('')
+    || '<tr><td class="sub" colspan="6">no provider-level adjustments in this period</td></tr>';
+
+  const oob = d.outOfBalanceChecks || [];
+  $('#oob-panel').style.display = oob.length ? '' : 'none';
+  $('#oob tbody').innerHTML =
+    '<tr><th>Check</th><th>Payer</th><th class="num">Claim payments</th>' +
+    '<th class="num">Provider adj.</th><th class="num">Check total</th>' +
+    '<th>What does not add up</th></tr>' +
+    oob.map((c) => '<tr><td>' + esc(c.checkNumber || '—') + ' ' + fmtDate(c.checkDate) + '</td>' +
+      '<td>' + esc(c.payerName) + '</td>' +
+      '<td class="num">' + usd(c.claimPaymentTotal) + '</td>' +
+      '<td class="num">' + usd(c.providerAdjustmentTotal) + '</td>' +
+      '<td class="num">' + usd(c.totalPaid) + '</td>' +
+      '<td class="deadline-red">' + ((c.detail || []).map(esc).join('<br>')
+        || ('check total out by ' + usd(c.variance))) + '</td></tr>').join('');
+
   const all = [...d.autoMatched, ...d.manualMatched].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
   $('#matched tbody').innerHTML =
     '<tr><th>Date</th><th>Claim</th><th>Patient</th><th>Payer</th><th>Category</th>' +
-    '<th class="num">Amount</th><th>Matched</th><th>Verified by</th></tr>' +
+    '<th class="num">Amount</th><th>Matched</th><th>Basis</th><th>Verified by</th></tr>' +
     all.map((m) => '<tr><td>' + fmtDate(m.date) + '</td><td><a href="/case/' + m.caseId + '">' + esc(m.claimNumber) + '</a></td>' +
       '<td>' + esc(m.patientName) + '</td><td>' + esc(m.payerName) + '</td>' +
       '<td>' + esc((m.category || '').replaceAll('_',' ')) + '</td>' +
       '<td class="num">' + usd(m.amount) + '</td>' +
       '<td>' + (m.verifiedBy ? 'manually' : 'automatically') + '</td>' +
+      '<td>' + attributionCell(m.attribution) + '</td>' +
       '<td>' + esc(m.verifiedBy || 'system') + '</td></tr>').join('')
-    || '<tr><td class="sub" colspan="8">no recoveries in this period</td></tr>';
+    || '<tr><td class="sub" colspan="9">no recoveries in this period</td></tr>';
   hbarChart($('#rates'), d.recoveryRateByCategory.map((r) =>
     ({ label: r.category.replaceAll('_',' ') + ' (' + r.rate + '%)', value: r.recovered })));
   $$('#unmatched button').forEach((b) => b.addEventListener('click', () => {

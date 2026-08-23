@@ -245,7 +245,50 @@ export const CLIENT_ADMIN_BODY = `
       <label>Nightly run time<input data-f="nightlyRunTime" type="time"></label>
       <label>Alert threshold $<input data-f="alertThreshold" type="number"></label>
       <label>Review threshold $<input data-f="reviewThreshold" type="number"></label>
+      <label>Out-of-balance 835 handling
+        <select data-f="eraBalancePolicy">
+          <option value="strict">Reject the file (strict)</option>
+          <option value="warn">Load it and warn</option>
+        </select>
+      </label>
+      <label>835 balance tolerance $<input data-f="eraBalanceTolerance" type="number"
+        step="0.01" min="0" max="100"></label>
+      <label>Unappealable bundling denials
+        <select data-f="ncciBundlingPolicy">
+          <option value="advisory">Open the case, marked not winnable</option>
+          <option value="suppress_unappealable">Do not open a case</option>
+        </select>
+      </label>
+      <label>Recovery attribution basis
+        <select data-f="attributionBasis">
+          <option value="incremental_net">Incremental, net of reversals and takebacks</option>
+          <option value="gross_post_appeal">Gross payment after appeal submission</option>
+        </select>
+      </label>
+      <label>Attribution window (days after submission, blank for none)
+        <input data-f="attributionWindowDays" type="number" step="1" min="1" max="3650"></label>
+      <label>Minimum attributable movement $<input data-f="attributionMinAmount"
+        type="number" step="0.01" min="0"></label>
+      <label><input data-f="attributionIncludeUnallocated" type="checkbox">
+        Attribute payment the payer did not resolve to a service line</label>
+      <label>Payer takeback after a credited recovery
+        <select data-f="clawbackPolicy">
+          <option value="auto">Reverse the recovery automatically</option>
+          <option value="flag_only">Flag it and leave the figure to a person</option>
+        </select>
+      </label>
     </div>
+    <div class="sub" style="margin-top:-4px;margin-bottom:8px">An 835 must satisfy the X12
+      balancing rules (service line, claim, and check totals including provider-level
+      adjustments). Strict rejects a file that does not, because every downstream dollar
+      depends on it. Relax only for a trading partner whose rounding quirk you have
+      documented.</div>
+    <div class="sub" style="margin-bottom:8px">Attribution decides which post-appeal
+      dollars count as recovery, and therefore what this client is invoiced. The
+      defaults are the conservative reading: only the incremental movement, net of
+      anything the payer reversed or recouped. Change them to match the signed
+      agreement, not to make a number look better &mdash; every setting here is
+      reproduced on the invoice.</div>
     <button class="btn primary" id="save-profile">Save profile</button>
     <div id="sub-panel" style="margin-top:14px"></div>
   </div>
@@ -322,7 +365,10 @@ let detail = null;
 async function load() {
   detail = await api('/api/admin/clients/' + clientId);
   const c = detail.client;
-  $$('#profile [data-f]').forEach((el) => { el.value = c[el.dataset.f] ?? ''; });
+  $$('#profile [data-f]').forEach((el) => {
+    if (el.type === 'checkbox') el.checked = c[el.dataset.f] === true;
+    else el.value = c[el.dataset.f] ?? '';
+  });
 
   $('#sub-panel').innerHTML = '<h2>Subscription &amp; features</h2>' +
     '<div class="filters"><label>Status<select id="sub-status">' +
@@ -348,12 +394,22 @@ async function load() {
 
   $('#payers tbody').innerHTML =
     '<tr><th>Payer</th><th class="num">Filing days</th><th class="num">Appeal days</th>' +
-    '<th>Portal</th><th>Autopilot</th><th class="num">Review $</th><th></th></tr>' +
+    '<th>Portal</th><th class="num" title="Percentage withheld from the payment after ' +
+    'adjudication — Medicare sequestration is 2. Not an underpayment.">Pay reduction %</th>' +
+    '<th title="Whether this payer adjudicates bundling on the published CMS NCCI ' +
+    'tables or its own edits. It decides what the absence of a CMS edit proves.">' +
+    'Bundling edits</th>' +
+    '<th>Autopilot</th><th class="num">Review $</th><th></th></tr>' +
     detail.payers.map((p, i) => '<tr>' +
       '<td>' + esc(p.name) + (p.editable ? '' : ' <span class="sub">(shared)</span>') + '</td>' +
       '<td class="num"><input style="width:56px" data-p="' + i + '" class="p-filing" value="' + (p.timelyFilingDays ?? '') + '"' + (p.editable ? '' : ' disabled') + '></td>' +
       '<td class="num"><input style="width:56px" data-p="' + i + '" class="p-appeal" value="' + (p.appealDeadlineDays ?? '') + '"' + (p.editable ? '' : ' disabled') + '></td>' +
       '<td><input style="width:130px" data-p="' + i + '" class="p-portal" value="' + esc(p.portalUrl ?? '') + '"' + (p.editable ? '' : ' disabled') + '></td>' +
+      '<td class="num"><input style="width:56px" type="number" step="0.001" min="0" max="100" data-p="' + i + '" class="p-reduction" value="' + (p.paymentReductionPercent ?? 0) + '"' + (p.editable ? '' : ' disabled') + '></td>' +
+      '<td><select style="width:104px" data-p="' + i + '" class="p-bundling"' + (p.editable ? '' : ' disabled') + '>' +
+        '<option value="ncci"' + (p.bundlingEditSource !== 'proprietary' ? ' selected' : '') + '>CMS NCCI</option>' +
+        '<option value="proprietary"' + (p.bundlingEditSource === 'proprietary' ? ' selected' : '') + '>Proprietary</option>' +
+      '</select></td>' +
       '<td><input type="checkbox" data-p="' + i + '" class="p-auto"' + (p.autopilot ? ' checked' : '') + '></td>' +
       '<td class="num"><input style="width:70px" data-p="' + i + '" class="p-review" value="' + (p.reviewThreshold ?? '') + '"></td>' +
       '<td><button class="btn small p-save" data-p="' + i + '">Save</button></td></tr>').join('');
@@ -369,18 +425,24 @@ async function load() {
             timelyFilingDays: Number($('.p-filing[data-p="' + i + '"]').value) || null,
             appealDeadlineDays: Number($('.p-appeal[data-p="' + i + '"]').value) || null,
             portalUrl: $('.p-portal[data-p="' + i + '"]').value || null,
+            paymentReductionPercent: Number($('.p-reduction[data-p="' + i + '"]').value) || 0,
+            bundlingEditSource: $('.p-bundling[data-p="' + i + '"]').value,
           } : {}) }) });
       toast('payer configuration saved');
     } catch (e) { toast(e.message, true); }
   }));
 
   $('#contracts tbody').innerHTML =
-    '<tr><th>Payer</th><th>Effective</th><th>Type</th><th>Status</th><th class="num">Lines</th></tr>' +
+    '<tr><th>Payer</th><th>Effective</th><th>Type</th><th title="The payer owes the ' +
+    'lesser of billed charges and the contracted rate — the near-universal term. ' +
+    'Off means the schedule is paid regardless of the charge.">Lesser of billed</th>' +
+    '<th>Status</th><th class="num">Lines</th></tr>' +
     detail.contracts.map((x) => '<tr><td>' + esc(x.payerName) + '</td>' +
       '<td>' + fmtDate(x.effectiveDate) + '</td><td>' + esc(x.feeScheduleType) + '</td>' +
+      '<td>' + (x.applyLesserOfBilled ? 'yes' : '<span class="sub">no</span>') + '</td>' +
       '<td>' + stBadge(x.status) + '</td>' +
       '<td class="num">' + x.lines + '</td></tr>').join('')
-    || '<tr><td class="sub" colspan="5">no contracts</td></tr>';
+    || '<tr><td class="sub" colspan="6">no contracts</td></tr>';
   $('#docs').innerHTML = detail.documents.map((d) =>
     '<li>' + esc(d.fileName) + ' <span class="meta">' + esc(d.type) + ' · ' + fmtWhen(d.uploadedAt) + '</span></li>').join('');
 
@@ -429,39 +491,129 @@ async function load() {
 }
 async function loadBilling() {
   const b = await api('/api/admin/clients/' + clientId + '/billing');
+  const plan = b.pricingPlan;
   $('#billing').innerHTML =
     '<div class="kv">' +
-    '<div><dt>Plan</dt><dd><b>' + esc(b.plan) + '</b> ($' + b.pricing.base + '/mo + $' + b.pricing.perCase + '/case)</dd></div>' +
-    '<div><dt>Status</dt><dd>' + stBadge(b.subscriptionStatus) + '</dd></div>' +
+    // The agreed commercial terms drive every invoice. Legacy self-serve tiers
+    // are still shown, but they are not what gets billed.
+    '<div><dt>Commercial terms</dt><dd>' + (plan
+      ? '<b>' + esc(plan.planName) + '</b><br><span class="sub">' +
+        usd(plan.baseFee) + '/mo base · ' + plan.contingencyPercent +
+        '% of ' + esc(plan.contingencyBasis) + ' recovery' +
+        (plan.perCaseFee ? ' · ' + usd(plan.perCaseFee) + '/case' : '') +
+        (plan.minimumFee ? ' · min ' + usd(plan.minimumFee) : '') +
+        (plan.maximumFee ? ' · cap ' + usd(plan.maximumFee) : '') +
+        '<br>effective ' + plan.effectiveDate + '</span>'
+      : '<span class="deadline-red">no pricing plan on file — nothing can be billed</span>') +
+    '</dd></div>' +
+    '<div><dt>Subscription</dt><dd>' + stBadge(b.subscriptionStatus) +
+    (['suspended','cancelled'].includes(b.subscriptionStatus)
+      ? '<br><span class="sub deadline-red">processing is stopped for this client</span>' : '') +
+    '</dd></div>' +
+    '<div><dt>Legacy tier</dt><dd><span class="sub">' + esc(b.plan) + '</span></dd></div>' +
     '<div><dt>Claims this period</dt><dd>' + b.usageThisPeriod.claimsProcessed + '</dd></div>' +
     '<div><dt>Cases this period</dt><dd>' + b.usageThisPeriod.casesCreated + '</dd></div>' +
     '<div><dt>Recovered this period</dt><dd>' + usd(b.usageThisPeriod.amountRecovered) + '</dd></div></div>' +
-    '<div class="filters" style="margin-top:8px"><label>Change plan<select id="plan-sel">' +
-    b.availablePlans.map((p) => '<option' + (p.name === b.plan ? ' selected' : '') + '>' + p.name + '</option>').join('') +
-    '</select></label>' +
-    '<label>Generate invoice<input id="inv-month" placeholder="YYYY-MM" style="width:90px"></label>' +
-    '<button class="btn small" id="inv-go">Generate</button></div>' +
-    '<table class="data"><tbody><tr><th>Period</th><th>Plan</th><th class="num">Cases</th>' +
-    '<th class="num">Recovered</th><th class="num">Due</th><th>Status</th></tr>' +
-    b.invoices.map((i) => '<tr><td>' + i.periodStart + '</td><td>' + esc(i.plan) + '</td>' +
-      '<td class="num">' + i.casesCreated + '</td><td class="num">' + usd(i.amountRecovered) + '</td>' +
-      '<td class="num">' + usd(i.amountDue) + '</td><td>' + stBadge(i.status) + '</td></tr>').join('') +
+    '<div class="filters" style="margin-top:8px">' +
+    '<label>Month<input id="inv-month" placeholder="YYYY-MM" style="width:90px"></label>' +
+    '<button class="btn small" id="inv-preview">Preview</button>' +
+    '<button class="btn small" id="inv-go">Generate draft</button>' +
+    '<button class="btn small" id="inv-ledger" title="The append-only record ' +
+    'every invoice is built from — what has been billed and what has not">' +
+    'Usage ledger</button></div>' +
+    '<div id="inv-preview-out" class="sub" style="margin-top:6px"></div>' +
+    '<div id="inv-ledger-out" style="margin-top:6px"></div>' +
+    '<table class="data" style="margin-top:8px"><tbody>' +
+    '<tr><th>Period</th><th>Number</th><th class="num">Basis</th>' +
+    '<th class="num">Base</th><th class="num">Contingency</th><th class="num">Due</th>' +
+    '<th>Status</th><th></th></tr>' +
+    b.invoices.map((i) => '<tr><td>' + i.periodStart + '</td>' +
+      '<td>' + esc(i.invoiceNumber || '—') + '</td>' +
+      '<td class="num">' + usd(i.attributedRecovery) + '</td>' +
+      '<td class="num">' + usd(i.baseFee) + '</td>' +
+      '<td class="num">' + usd(i.contingencyFee) +
+        (i.contingencyPercent ? ' <span class="sub">(' + i.contingencyPercent + '%)</span>' : '') + '</td>' +
+      '<td class="num"><b>' + usd(i.amountDue) + '</b></td>' +
+      '<td>' + stBadge(i.status) + '</td>' +
+      '<td>' + (i.status === 'draft'
+        ? '<button class="btn small inv-issue" data-id="' + i.invoiceId + '">Issue</button>'
+        : i.status === 'void' ? ''
+        : '<button class="btn small danger inv-void" data-id="' + i.invoiceId + '">Void</button>') +
+      '</td></tr>').join('') +
     '</tbody></table>';
-  $('#plan-sel').addEventListener('change', async (e) => {
-    try { await api('/api/admin/plan', { method: 'POST', body: JSON.stringify({ tier: e.target.value }) });
-      toast('plan changed'); loadBilling(); } catch (err) { toast(err.message, true); }
+
+  const renderComputed = (r, label) =>
+    '<b>' + label + '</b> ' + usd(r.amountDue) + ' = ' + usd(r.baseFee) + ' base' +
+    (r.caseFeeTotal ? ' + ' + usd(r.caseFeeTotal) + ' cases' : '') +
+    ' + ' + usd(r.contingencyFee) + ' (' + r.contingencyPercent + '% of ' +
+    usd(r.attributedRecovery) + ')' +
+    (r.minimumApplied ? ' — raised to the plan minimum' : '') +
+    (r.maximumApplied ? ' — capped at the plan maximum' : '') +
+    ' · ' + r.lines.length + ' recovery line(s)' +
+    (r.warnings && r.warnings.length
+      ? '<br><span class="deadline-red">' + r.warnings.map(esc).join('<br>') + '</span>' : '');
+
+  $('#inv-ledger').addEventListener('click', async () => {
+    try {
+      const r = await api('/api/admin/clients/' + clientId + '/billing/ledger?limit=100');
+      $('#inv-ledger-out').innerHTML = r.events.length === 0
+        ? '<span class="sub">no billable events recorded yet</span>'
+        : '<div class="sub" style="margin-bottom:4px">' + usd(r.totals.billed)
+          + ' billed &middot; <b>' + usd(r.totals.unbilled) + ' not yet billed</b></div>'
+          + '<table class="data"><tbody>'
+          + '<tr><th>Date</th><th>Claim</th><th>Payer</th><th>Event</th>'
+          + '<th class="num">Amount</th><th>Invoice</th></tr>'
+          + r.events.map((e) => '<tr><td>' + e.occurredAt + '</td>'
+            + '<td>' + esc(e.claimNumber || '—') + '</td>'
+            + '<td>' + esc(e.payerName || '—') + '</td>'
+            + '<td>' + (e.eventType === 'recovery_clawed_back'
+              ? '<span class="deadline-red">taken back</span>' : 'recovered') + '</td>'
+            + '<td class="num">' + usd(e.amount) + '</td>'
+            + '<td>' + (e.invoiceNumber
+              ? esc(e.invoiceNumber)
+              : '<span class="sub">unbilled</span>') + '</td></tr>').join('')
+          + '</tbody></table>';
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#inv-preview').addEventListener('click', async () => {
+    try {
+      const r = await api('/api/admin/clients/' + clientId + '/billing/preview',
+        { method: 'POST', body: JSON.stringify({ month: $('#inv-month').value }) });
+      $('#inv-preview-out').innerHTML = renderComputed(r, 'Would bill');
+    } catch (e) { toast(e.message, true); }
   });
   $('#inv-go').addEventListener('click', async () => {
     try {
       const r = await api('/api/admin/clients/' + clientId + '/billing/invoice',
         { method: 'POST', body: JSON.stringify({ month: $('#inv-month').value }) });
-      toast('invoice generated: ' + usd(r.amountDue)); loadBilling();
+      $('#inv-preview-out').innerHTML = renderComputed(r, 'Draft invoice:');
+      toast('draft invoice generated: ' + usd(r.amountDue)); loadBilling();
     } catch (e) { toast(e.message, true); }
   });
+  $$('.inv-issue').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!confirm('Issue this invoice? Once issued its figures are frozen and it '
+      + 'can only be corrected by voiding it.')) return;
+    try {
+      const r = await api('/api/admin/invoices/' + btn.dataset.id + '/issue',
+        { method: 'POST', body: '{}' });
+      toast('issued ' + r.invoiceNumber); loadBilling();
+    } catch (e) { toast(e.message, true); }
+  }));
+  $$('.inv-void').forEach((btn) => btn.addEventListener('click', async () => {
+    const reason = prompt('Why is this invoice being voided?');
+    if (!reason) return;
+    try {
+      await api('/api/admin/invoices/' + btn.dataset.id + '/void',
+        { method: 'POST', body: JSON.stringify({ reason }) });
+      toast('invoice voided; its recoveries are billable again'); loadBilling();
+    } catch (e) { toast(e.message, true); }
+  }));
 }
 $('#save-profile').addEventListener('click', async () => {
   const body = {};
-  $$('#profile [data-f]').forEach((el) => { body[el.dataset.f] = el.value; });
+  $$('#profile [data-f]').forEach((el) => {
+    body[el.dataset.f] = el.type === 'checkbox' ? el.checked : el.value;
+  });
   try {
     await api('/api/admin/clients/' + clientId + '/settings',
       { method: 'POST', body: JSON.stringify(body) });
@@ -506,8 +658,23 @@ $('#edi-preview').addEventListener('click', async () => {
     s.claims + ' claim(s), ' + s.lines + ' line(s)' +
     (s.transactions ? ' in ' + s.transactions + ' transaction(s)' : '') +
     (s.payers && s.payers.length ? ' · payer: ' + s.payers.map(esc).join(', ') : '') +
-    ' · billed ' + usd(s.totalBilled) + ' · paid ' + usd(s.totalPaid) + '</div>' +
+    ' · billed ' + usd(s.totalBilled) + ' · paid ' + usd(s.totalPaid) +
+    (s.reversals ? ' · <b>' + s.reversals + ' reversal(s)</b>' : '') +
+    (s.recodedLines ? ' · ' + s.recodedLines + ' line(s) re-coded by the payer' : '') +
+    '</div>' +
+    (s.providerAdjustments && s.providerAdjustments.length
+      ? '<div class="sub" style="margin-top:6px"><b>Provider-level adjustments (PLB): ' +
+        usd(s.providerAdjustmentTotal) + '</b><br>' +
+        s.providerAdjustments.map((a) => esc(a.reasonCode) + ' (' + esc(a.category) + ') ' +
+          usd(a.amount) + (a.referenceId ? ' ref ' + esc(a.referenceId) : '')).join('<br>') +
+        '</div>' : '') +
+    (s.checks && s.checks.some((c) => c.balanced === false)
+      ? '<div class="deadline-red">' + s.checks.filter((c) => c.balanced === false).map((c) =>
+        'check ' + esc(c.checkNumber || '(no trace number)') + ' is out of balance by ' +
+        usd(c.balanceVariance)).join('<br>') + '</div>' : '') +
     (p.errors.length ? '<div class="deadline-red">' + p.errors.map(esc).join('<br>') + '</div>' : '') +
+    (p.warnings && p.warnings.length
+      ? '<div class="sub">' + p.warnings.map(esc).join('<br>') + '</div>' : '') +
     (s.sample.length ? '<table class="data"><tbody><tr>' +
       Object.keys(s.sample[0]).map((k) => '<th>' + esc(k) + '</th>').join('') + '</tr>' +
       s.sample.map((row) => '<tr>' + Object.values(row).map((v) =>

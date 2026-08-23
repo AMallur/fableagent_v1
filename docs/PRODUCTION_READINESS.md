@@ -16,6 +16,9 @@ customer-facing release.
 - Unit tests and the full PostgreSQL integration suite pass.
 - The dedicated RLS suite passes using a non-superuser runtime login.
 - Migrations and their `schema_migrations` records commit atomically.
+- Every ingested 835 satisfies the X12 balancing rules (service line, claim,
+  and check totals including provider-level adjustments) under the client's
+  configured policy. `strict` is the default and rejects a file that does not.
 - The runtime Docker image builds successfully.
 - `npm audit --omit=dev --audit-level=high` reports no high or critical issue.
 - CodeQL completes successfully.
@@ -44,6 +47,36 @@ customer and trading partner:
    reconcile acknowledgements before autonomous delivery is enabled.
 5. Validate each supported payer contract model against adjudicated examples.
    Unsupported contract constructs remain manual-review cases.
+5b. Configure the pricing terms before invoicing anyone: `pricing_plan` is the
+   only thing that decides what is billed, and a client with no plan on file
+   invoices nothing. Set `payer.payment_reduction_percent` to 2.000 on Medicare
+   and Medicare Advantage payers, and confirm `contract.apply_lesser_of_billed`
+   matches each signed contract — left wrong, the first two produce a
+   `systemic_underpayment` anomaly against payers that are paying correctly,
+   and the third fabricates variance from the provider's own charge master.
+5a. Agree the recovery-attribution basis in writing with the customer before
+   any fee is charged against recovered dollars. The reconciler attributes
+   line-scoped, post-appeal cash net of reversals and PLB recoupments, records
+   every component on `payment_event`, and never reverses a recovery a person
+   matched by hand. That is a defensible basis, not a substitute for the
+   customer having agreed to it. Where the agreement says something different,
+   set it rather than living with the default: `client.attribution_basis`,
+   `attribution_window_days`, `attribution_min_amount`,
+   `attribution_include_unallocated` and `clawback_policy` are the five
+   decisions a contract can legitimately state, each defaulting to the
+   conservative reading. Invoices are built from the append-only `usage_event`
+   ledger, so a bill stays reconstructible after the operational data moves on
+   — do not bypass it by billing off `payment_event` directly.
+5c. Import the current quarterly CMS NCCI PTP files before relying on bundling
+   recommendations (`node src/cli.ts reference-import --kind ncci_ptp
+   --service-setting practitioner|outpatient_hospital`). Without them the
+   platform says so and declines to conclude anything, which is correct but
+   means every CO-97 falls back to manual verification. Re-import each quarter:
+   only the newest dataset per setting is consulted, and a table older than the
+   date of service cannot rule out an edit. Set
+   `payer.bundling_edit_source = 'proprietary'` for payers that do not
+   adjudicate on NCCI, or the platform will tell billers a denial contradicts
+   a policy that payer never adopted.
 6. Require certified coding review for every corrected claim and modifier
    change. The rules engine is decision support, not clinical documentation.
 7. Run load, failover, backup/restore and disaster-recovery exercises in the

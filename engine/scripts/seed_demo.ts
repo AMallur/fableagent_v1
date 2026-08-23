@@ -73,9 +73,17 @@ console.log('cleaning previous demo tenant…');
 // under REAL foreign-key enforcement (no session_replication_role bypass),
 // so it has to be genuine dependency order, not just "worked because
 // triggers were off."
+// Reseeding tears the demo tenant down completely, invoices included. An
+// issued invoice is otherwise undeletable (migration 0026) precisely so the
+// application can never destroy the record of a bill that went out; a
+// deliberate administrative teardown says so explicitly.
+await q(`SELECT set_config('app.allow_invoice_purge', 'on', false)`);
 for (const table of [
   'api_rate_window', 'api_request_log', 'api_key', 'scheduler_lease',
-  'onboarding_step', 'client_integration', 'sso_config', 'data_export_request', 'invoice',
+  'onboarding_step', 'client_integration', 'sso_config', 'data_export_request',
+  // usage_event is billing history and references invoice; it goes first so
+  // the invoice rows that claimed it can follow.
+  'invoice_line', 'usage_event', 'invoice',
   'rule_execution', 'automation_rule', 'notification_preference', 'notification',
   'email_outbox', 'dashboard_snapshot',
   // outbound_delivery/appeal_packet_document/case_action/payment_event/
@@ -87,7 +95,8 @@ for (const table of [
   // before appeal_packet.
   'outbound_delivery', 'appeal_packet_document', 'case_action', 'appeal_packet',
   'document', 'payment_event', 'corrected_claim', 'recovery_case',
-  'remittance_line', 'remittance',
+  'pricing_plan',
+  'remittance_line', 'remittance_provider_adjustment', 'remittance',
   'claim_line', 'claim', 'encounter', 'patient', 'client_payer_config',
   'contract_line', 'contract', 'provider', 'system_job',
 ]) await q(`DELETE FROM ${table} WHERE tenant_id = $1`, [T]);
@@ -127,6 +136,16 @@ await q(`INSERT INTO client (client_id, tenant_id, client_name, tax_id, npi_grou
            recovery_alert_threshold = EXCLUDED.recovery_alert_threshold,
            appeal_review_threshold = EXCLUDED.appeal_review_threshold,
            status = 'active', deleted_at = NULL, updated_at = now()`, [C, T]);
+// The commercial terms behind every invoice. RCM recovery is sold on
+// contingency, so the demo shows a real one: a small platform fee plus 22% of
+// what was actually recovered, with a floor.
+await q(`INSERT INTO pricing_plan (tenant_id, client_id, plan_name, effective_date,
+                                   base_fee, per_case_fee, contingency_percent,
+                                   minimum_fee, contingency_basis, notes)
+         VALUES ($1, NULL, 'Recovery contingency 22%', CURRENT_DATE - 365,
+                 750.00, 0, 22.000, 750.00, 'attributed',
+                 'Demo terms: platform fee plus 22% of attributed recovery, $750 minimum')
+         ON CONFLICT DO NOTHING`, [T]);
 await q(`INSERT INTO client_medicare_config (tenant_id, client_id, medicare_locality)
          VALUES ($1, $2, 'DEMO')
          ON CONFLICT (client_id) DO UPDATE SET

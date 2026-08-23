@@ -5,9 +5,11 @@
 // ============================================================================
 
 import type {
-  ClaimInput, ContractInput, EngineConfig, EngineInput, UUID,
+  ClaimInput, ContractInput, EngineConfig, EngineInput, NcciBundlingPolicy,
+  NcciDatasetInput, NcciEditInput, NcciServiceSetting, UUID,
 } from '../types.ts';
 import { makeConfig } from '../config.ts';
+import { proceduresNeedingNcci } from '../steps/ncci.ts';
 
 /** Minimal query surface — pg.Pool and pg.PoolClient both satisfy it. */
 export interface Queryable {
@@ -42,6 +44,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
             rl.procedure_code, rl.billed_amount, rl.allowed_amount, rl.paid_amount,
             rl.patient_responsibility, rl.adjustment_group_code,
             rl.adjustment_reason_code, rl.adjustments, rl.remark_code,
+            rl.claim_status_code, rl.is_reversal, rl.adjudicated_procedure_code,
+            rl.paid_units, rl.original_units, rl.payer_recoded,
             rl.claim_id, rl.claim_line_id, rl.matched_at
      FROM remittance_line rl
      JOIN remittance r ON r.remittance_id = rl.remittance_id
@@ -55,6 +59,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
   const claims = await db.query(
     `SELECT cl.claim_id, cl.client_id, cl.payer_id, cl.claim_type, cl.claim_status,
             cl.claim_number_internal, cl.claim_number_payer, cl.submission_date,
+            cl.payer_sequence, cl.prior_payer_paid,
             e.patient_id, e.date_of_service_start, e.place_of_service, e.authorization_number,
             COALESCE(docs.doc_types, '{}') AS doc_types
      FROM claim cl
@@ -81,7 +86,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
             modifier_1, modifier_2, modifier_3, modifier_4, units,
             billed_amount, expected_amount, allowed_amount, paid_amount,
             patient_responsibility,
-            denial_reason_code, line_status
+            denial_reason_code, line_status, prior_payer_paid
      FROM claim_line
      WHERE claim_id = ANY($1) AND deleted_at IS NULL
      ORDER BY claim_id, line_number`,
@@ -100,12 +105,15 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
     patientId: r.patient_id,
     claimNumberInternal: r.claim_number_internal,
     claimNumberPayer: r.claim_number_payer,
+    claimType: r.claim_type,
     dateOfServiceStart: iso(r.date_of_service_start),
     placeOfService: r.place_of_service,
     submissionDate: iso(r.submission_date),
     claimStatus: r.claim_status,
     authorizationNumber: r.authorization_number,
     availableDocumentTypes: r.doc_types ?? [],
+    payerSequence: r.payer_sequence ?? 'primary',
+    priorPayerPaid: num(r.prior_payer_paid),
     lines: (linesByClaim.get(r.claim_id) ?? []).map((l) => ({
       claimLineId: l.claim_line_id,
       lineNumber: l.line_number,
@@ -119,6 +127,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
       patientResponsibility: num(l.patient_responsibility),
       denialReasonCode: l.denial_reason_code,
       lineStatus: l.line_status,
+      priorPayerPaid: num(l.prior_payer_paid),
     })),
   }));
 
@@ -132,7 +141,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
 
   // ---- payers (shared masters + tenant-scoped) ------------------------------
   const payers = await db.query(
-    `SELECT payer_id, payer_name, appeal_deadline_days, timely_filing_limit_days
+    `SELECT payer_id, payer_name, appeal_deadline_days, timely_filing_limit_days,
+            payment_reduction_percent, bundling_edit_source
      FROM payer WHERE (tenant_id IS NULL OR tenant_id = $1) AND deleted_at IS NULL`,
     [tenantId],
   );
@@ -140,7 +150,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
   // ---- contracts + lines ------------------------------------------------------
   const contracts = await db.query(
     `SELECT ct.contract_id, ct.client_id, ct.payer_id, ct.effective_date,
-            ct.expiration_date, ct.fee_schedule_type
+            ct.expiration_date, ct.fee_schedule_type, ct.apply_lesser_of_billed
      FROM contract ct JOIN client c ON c.client_id = ct.client_id
      WHERE ct.tenant_id = $1 ${clientFilter} AND ct.deleted_at IS NULL
        AND ct.status = 'active'
@@ -166,6 +176,7 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
     effectiveDate: iso(r.effective_date)!,
     expirationDate: iso(r.expiration_date),
     feeScheduleType: r.fee_schedule_type,
+    applyLesserOfBilled: r.apply_lesser_of_billed !== false,
     lines: (clByContract.get(r.contract_id) ?? []).map((l) => ({
       procedureCode: l.procedure_code,
       modifier: l.modifier,
@@ -174,6 +185,14 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
       effectiveDate: iso(l.effective_date),
     })),
   }));
+
+  // ---- modifier payment rules (shared defaults + tenant overrides) -----------
+  const modifierRules = await db.query(
+    `SELECT modifier, percent_of_allowed, apply_order, payer_id, tenant_id
+     FROM modifier_payment_rule
+     WHERE (tenant_id IS NULL OR tenant_id = $1) AND deleted_at IS NULL`,
+    [tenantId],
+  );
 
   // ---- medicare reference rates ----------------------------------------------
   const medicare = await db.query(
@@ -202,6 +221,63 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
      WHERE c.tenant_id = $1 ${clientFilter}`, params);
   const medicareLocalityByClient: Record<string, string> = {};
   for (const r of localityRows.rows) medicareLocalityByClient[r.client_id] = r.medicare_locality;
+
+  // ---- CMS NCCI procedure-to-procedure edits ---------------------------------
+  // Narrow on purpose. The published tables run to millions of pairs; only
+  // edits whose BOTH sides appear on this run's claims can ever fire, and the
+  // (service_setting, column_one_code, column_two_code) index makes that a
+  // cheap lookup. Loading the tables wholesale would put a quarter of a
+  // gigabyte of reference data into a per-run snapshot to answer questions
+  // about a handful of codes.
+  //
+  // Only the newest imported dataset per service setting is consulted: the CMS
+  // PTP files are cumulative full replacements each quarter, so an older
+  // import is superseded rather than additive, and mixing the two would revive
+  // edits CMS has since withdrawn.
+  const runProcedures = proceduresNeedingNcci(claimInputs);
+  const ncciDatasetRows = await db.query(
+    `SELECT DISTINCT ON (scope) dataset_id, scope, version, effective_date
+     FROM reference_dataset
+     WHERE dataset_kind = 'ncci_ptp'
+     ORDER BY scope, effective_date DESC NULLS LAST, imported_at DESC`,
+  );
+  const ncciDatasets: NcciDatasetInput[] = ncciDatasetRows.rows
+    .filter((r) => r.scope === 'practitioner' || r.scope === 'outpatient_hospital')
+    .map((r) => ({
+      serviceSetting: r.scope as NcciServiceSetting,
+      version: r.version,
+      effectiveDate: iso(r.effective_date),
+    }));
+  const ncciDatasetIds = ncciDatasetRows.rows
+    .filter((r) => r.scope === 'practitioner' || r.scope === 'outpatient_hospital')
+    .map((r) => r.dataset_id);
+
+  const ncciRows = (runProcedures.length === 0 || ncciDatasetIds.length === 0)
+    ? { rows: [] }
+    : await db.query(
+      `SELECT service_setting, column_one_code, column_two_code,
+              effective_date, deletion_date, modifier_indicator
+       FROM ncci_ptp_edit
+       WHERE dataset_id = ANY($1)
+         AND column_one_code = ANY($2) AND column_two_code = ANY($2)`,
+      [ncciDatasetIds, runProcedures],
+    );
+  const ncciEdits: NcciEditInput[] = ncciRows.rows.map((r) => ({
+    serviceSetting: r.service_setting,
+    columnOneCode: r.column_one_code,
+    columnTwoCode: r.column_two_code,
+    effectiveDate: iso(r.effective_date)!,
+    deletionDate: iso(r.deletion_date),
+    modifierIndicator: Number(r.modifier_indicator) as 0 | 1 | 9,
+  }));
+
+  const ncciPolicyRows = await db.query(
+    `SELECT c.client_id, c.ncci_bundling_policy
+     FROM client c WHERE c.tenant_id = $1 ${clientFilter}`, params);
+  const ncciBundlingPolicyByClient: Record<string, NcciBundlingPolicy> = {};
+  for (const r of ncciPolicyRows.rows) {
+    ncciBundlingPolicyByClient[r.client_id] = r.ncci_bundling_policy ?? 'advisory';
+  }
 
   // ---- open cases (dedup), win-rate history, configs -------------------------
   const existingCases = await db.query(
@@ -250,6 +326,8 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
       payerName: r.payer_name,
       appealDeadlineDays: r.appeal_deadline_days,
       timelyFilingLimitDays: r.timely_filing_limit_days,
+      paymentReductionPercent: num(r.payment_reduction_percent),
+      bundlingEditSource: r.bundling_edit_source ?? 'ncci',
     })),
     patients: patients.rows.map((r) => ({
       patientId: r.patient_id,
@@ -281,13 +359,29 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
       adjustmentGroupCode: r.adjustment_group_code,
       adjustmentReasonCode: r.adjustment_reason_code,
       remarkCode: r.remark_code,
+      claimStatusCode: r.claim_status_code,
+      isReversal: r.is_reversal === true,
+      adjudicatedProcedureCode: r.adjudicated_procedure_code,
+      payerRecoded: r.payer_recoded === true,
+      paidUnits: num(r.paid_units),
+      originalUnits: num(r.original_units),
       claimId: r.claim_id,
       claimLineId: r.claim_line_id,
       previouslyProcessed: r.matched_at != null,
     })),
     contracts: contractInputs,
+    modifierRules: modifierRules.rows.map((r) => ({
+      modifier: r.modifier,
+      percentOfAllowed: Number(r.percent_of_allowed),
+      applyOrder: r.apply_order,
+      payerId: r.payer_id,
+      tenantId: r.tenant_id,
+    })),
     medicareRates,
     medicareLocalityByClient,
+    ncciEdits,
+    ncciDatasets,
+    ncciBundlingPolicyByClient,
     existingCases: existingCases.rows.map((r) => ({
       caseId: r.case_id,
       claimId: r.claim_id,

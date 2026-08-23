@@ -68,6 +68,8 @@ export function runEngine(input: EngineInput): EngineResult {
     skipped: rules.skipped,
     varianceFlags: variance.underpayments,
     pricedLinesByPayer,
+    reversedLines: matching.matchedLines.filter(
+      (m) => m.remitLine.isReversal && !m.remitLine.previouslyProcessed),
   });
 
   return {
@@ -100,9 +102,16 @@ function aggregateMatchedLines(
   }
 
   return [...groups.values()].map((group) => {
-    const latest = [...group].sort((a, b) =>
-      (a.remitLine.checkDate ?? '').localeCompare(b.remitLine.checkDate ?? ''))
-      .at(-1)!;
+    const byDate = [...group].sort((a, b) =>
+      (a.remitLine.checkDate ?? '').localeCompare(b.remitLine.checkDate ?? ''));
+    // The newest adjudication wins, but a reversal is not an adjudication: a
+    // reverse-and-reissue pair carries the same check date, so a replacement
+    // on that date is preferred over the reversal that precedes it. A group
+    // whose newest entry really is a reversal stays flagged, and Step 3 will
+    // not build a case out of it.
+    const newestDate = byDate.at(-1)!.remitLine.checkDate ?? '';
+    const newest = byDate.filter((m) => (m.remitLine.checkDate ?? '') === newestDate);
+    const latest = [...newest].reverse().find((m) => !m.remitLine.isReversal) ?? newest.at(-1)!;
     const priorPaid = latest.claimLine.paidAmount ?? 0;
     const newPaid = group.reduce(
       (sum, m) => sum + (m.remitLine.previouslyProcessed ? 0 : (m.remitLine.paidAmount ?? 0)),
@@ -136,6 +145,9 @@ function aggregateMatchedLines(
         paidAmount: roundMoney(priorPaid + newPaid),
         patientResponsibility,
         adjustments,
+        // Reversed cash still nets into paidAmount above; the flag only says
+        // whether the payer's LAST word on this line was a reversal.
+        isReversal: latest.remitLine.isReversal === true,
       },
     };
   });

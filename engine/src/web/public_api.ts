@@ -14,7 +14,7 @@ import type { Queryable } from '../db/snapshot.ts';
 import type { Session } from './auth.ts';
 import type { Scope } from './queries.ts';
 import { assertClientAccess } from './admin_api.ts';
-import type { Remittance835 } from '../ingest/parse835.ts';
+import { providerAdjustmentCategory, type Remittance835 } from '../ingest/parse835.ts';
 import type { ClaimFile837 } from '../ingest/parse837.ts';
 import { releaseTenantConnection } from '../db/tenant_pool.ts';
 
@@ -113,7 +113,9 @@ export async function authenticateApiKey(
       `SELECT k.api_key_id, k.tenant_id, k.client_id, k.scopes, k.rate_limit_per_minute
        FROM api_key k
        JOIN client c ON c.client_id = k.client_id AND c.deleted_at IS NULL
-         AND c.subscription_status <> 'cancelled'
+         -- A suspended subscription stops API processing too; previously only
+         -- a cancelled one did, so a suspended client kept full API access.
+         AND c.subscription_status IN ('trial', 'active')
        WHERE k.key_hash = $1 AND k.revoked_at IS NULL`, [hash]);
     const k = rows.rows[0];
     if (!k) return null;
@@ -184,6 +186,18 @@ export async function logApiRequest(
 // JSON -> parsed-EDI transforms (the API accepts raw X12 or structured JSON)
 // ---------------------------------------------------------------------------
 
+const PAYER_SEQUENCES = ['primary', 'secondary', 'tertiary', 'unknown'] as const;
+
+function payerSequenceFrom(value: unknown, index: number): ClaimFile837['claims'][number]['payerSequence'] {
+  if (value == null || value === '') return 'primary';
+  const normalized = String(value).toLowerCase();
+  if (!(PAYER_SEQUENCES as readonly string[]).includes(normalized)) {
+    throw err(
+      `claims[${index}]: payerSequence must be one of ${PAYER_SEQUENCES.join(', ')}`, 400);
+  }
+  return normalized as ClaimFile837['claims'][number]['payerSequence'];
+}
+
 export function json837ToClaimFile(body: any): ClaimFile837 {
   const claims = body?.claims;
   if (!Array.isArray(claims) || claims.length === 0) {
@@ -214,6 +228,11 @@ export function json837ToClaimFile(body: any): ClaimFile837 {
         payerName: c.payerName ?? null,
         renderingProviderNpi: c.renderingProvider?.npi ?? null,
         renderingProviderName: c.renderingProvider?.name ?? null,
+        // Coordination of benefits. Send payerSequence "secondary" (or
+        // "tertiary") with priorPayerPaid, on the claim or per line, so
+        // expected payer liability is net of what the primary already paid.
+        payerSequence: payerSequenceFrom(c.payerSequence, i),
+        priorPayerPaid: c.priorPayerPaid == null ? null : Number(c.priorPayerPaid),
         lines: c.lines.map((l: any, j: number) => {
           if (!l.procedureCode) throw err(`claims[${i}].lines[${j}]: procedureCode is required`, 400);
           return {
@@ -222,6 +241,7 @@ export function json837ToClaimFile(body: any): ClaimFile837 {
             chargeAmount: l.chargeAmount ?? null,
             units: l.units ?? 1,
             dateOfService: l.dateOfService ?? null,
+            priorPayerPaid: l.priorPayerPaid == null ? null : Number(l.priorPayerPaid),
           };
         }),
       };
@@ -242,13 +262,33 @@ export function json835ToRemittance(body: any): Remittance835 {
     totalPaid: body.totalPaid ?? null,
     checkDate: body.checkDate ?? null,
     traceNumber: body.checkNumber ?? body.traceNumber ?? null,
+    // PLB equivalents: provider-level adjustments the payer applied to the
+    // whole payment (recoupments, forwarding balances, interest). They are
+    // what makes the check balance, so the JSON path accepts them too.
+    providerAdjustments: (body.providerAdjustments ?? []).map((p: any, i: number) => {
+      const reasonCode = String(p.reasonCode ?? '').trim().toUpperCase();
+      if (!reasonCode) {
+        throw err(`providerAdjustments[${i}]: reasonCode is required`, 400);
+      }
+      return {
+        providerNpi: p.providerNpi ?? null,
+        fiscalPeriodEnd: p.fiscalPeriodEnd ?? null,
+        sequenceNumber: i + 1,
+        reasonCode,
+        referenceId: p.referenceId ?? null,
+        amount: Number(p.amount ?? 0),
+        category: providerAdjustmentCategory(reasonCode),
+      };
+    }),
     claims: claims.map((c: any, i: number) => {
       if (!c.claimNumber && !c.payerClaimNumber) {
         throw err(`claims[${i}]: claimNumber or payerClaimNumber is required`, 400);
       }
+      const statusCode = String(c.statusCode ?? '1');
       return {
         patientControlNumber: c.claimNumber ?? '',
-        statusCode: c.statusCode ?? '1',
+        statusCode,
+        isReversal: statusCode === '22',
         billedAmount: c.billedAmount ?? null,
         paidAmount: c.paidAmount ?? null,
         patientResponsibility: c.patientResponsibility ?? null,
@@ -261,22 +301,38 @@ export function json835ToRemittance(body: any): Remittance835 {
         claimDate: c.dateOfService ?? null,
         adjustments: (c.adjustments ?? []).map((a: any) => ({
           groupCode: a.groupCode ?? 'CO', reasonCode: String(a.reasonCode ?? ''),
-          amount: a.amount ?? 0,
+          amount: a.amount ?? 0, quantity: a.quantity ?? null,
         })),
-        lines: (c.lines ?? []).map((l: any) => ({
-          procedureCode: l.procedureCode ?? '',
-          modifiers: l.modifiers ?? [],
-          billedAmount: l.billedAmount ?? null,
-          paidAmount: l.paidAmount ?? null,
-          allowedAmount: l.allowedAmount ?? null,
-          units: l.units ?? 1,
-          dateOfService: l.dateOfService ?? null,
-          adjustments: (l.adjustments ?? []).map((a: any) => ({
-            groupCode: a.groupCode ?? 'CO', reasonCode: String(a.reasonCode ?? ''),
-            amount: a.amount ?? 0,
-          })),
-          remarkCodes: l.remarkCodes ?? [],
-        })),
+        lines: (c.lines ?? []).map((l: any) => {
+          // adjudicatedProcedureCode is what the payer paid under;
+          // procedureCode stays the code we submitted, which is what the
+          // detection engine matches our claim line on.
+          const submitted = l.procedureCode ?? '';
+          const adjudicated = l.adjudicatedProcedureCode ?? submitted;
+          const paidUnits = Number(l.paidUnits ?? l.units ?? 1);
+          const originalUnits = l.originalUnits == null ? null : Number(l.originalUnits);
+          return {
+            procedureCode: submitted,
+            adjudicatedProcedureCode: adjudicated,
+            payerRecoded: Boolean(submitted) && Boolean(adjudicated) && submitted !== adjudicated,
+            modifiers: l.modifiers ?? [],
+            submittedModifiers: l.submittedModifiers ?? l.modifiers ?? [],
+            billedAmount: l.billedAmount ?? null,
+            paidAmount: l.paidAmount ?? null,
+            allowedAmount: l.allowedAmount ?? null,
+            units: originalUnits != null && originalUnits > 0
+              ? originalUnits
+              : Number(l.units ?? paidUnits),
+            paidUnits,
+            originalUnits,
+            dateOfService: l.dateOfService ?? null,
+            adjustments: (l.adjustments ?? []).map((a: any) => ({
+              groupCode: a.groupCode ?? 'CO', reasonCode: String(a.reasonCode ?? ''),
+              amount: a.amount ?? 0, quantity: a.quantity ?? null,
+            })),
+            remarkCodes: l.remarkCodes ?? [],
+          };
+        }),
       };
     }),
   };

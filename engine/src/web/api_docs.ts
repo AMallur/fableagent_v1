@@ -50,21 +50,43 @@ export const API_ENDPOINTS: EndpointDoc[] = [
       + 'reimbursement calculation, and variance/denial detection for the '
       + 'client. The response includes both the ingest stats and the '
       + 'detection summary (cases created, recovery identified). Idempotent '
-      + 'by check/EFT trace number.',
+      + 'by check/EFT trace number.\n\n'
+      + 'The payload must satisfy the X12 835 balancing rules, the same as a '
+      + 'raw 835: billedAmount less the sum of adjustments equals paidAmount '
+      + 'on each line and on each claim, and the claim payments less '
+      + 'providerAdjustments equal totalPaid. A payload that does not balance '
+      + 'is rejected with 400 (or loaded and flagged, if the client is '
+      + 'configured to warn rather than reject).\n\n'
+      + 'providerAdjustments are the PLB equivalent — recoupments (WO), '
+      + 'forwarding balances (FB), interest (L6) and similar. Positive '
+      + 'amounts reduce the payment. referenceId should be the payer claim '
+      + 'number the adjustment applies to so it can be linked to the claim.\n\n'
+      + 'Set statusCode to "22" for a reversal of a previously reported '
+      + 'payment; its amounts are negative, they net against prior cash, and '
+      + 'the reversal never becomes a recovery case on its own. Send '
+      + 'adjudicatedProcedureCode when the payer paid under a different code '
+      + 'than was submitted, and originalUnits when it paid fewer units — '
+      + 'procedureCode and units stay what was submitted, since that is what '
+      + 'identifies the claim line.',
     requestExample: {
       contentType: 'application/json',
       body: JSON.stringify({
         payer: { name: 'Unity Health Plan', idCode: 'DEMO-UNI' },
-        checkNumber: 'CHK-881', checkDate: '2026-07-05', totalPaid: 80,
+        // 80.00 paid less a 25.00 recoupment = 55.00 deposited
+        checkNumber: 'CHK-881', checkDate: '2026-07-05', totalPaid: 55,
         claims: [{
-          claimNumber: 'CLM-2001', payerClaimNumber: 'ICN-77', paidAmount: 80, billedAmount: 250,
+          claimNumber: 'CLM-2001', payerClaimNumber: 'ICN-77', paidAmount: 80,
+          billedAmount: 250, patientResponsibility: 0,
           patient: { firstName: 'Jane', lastName: 'Doe', memberId: 'MEM-1' },
           lines: [{
             procedureCode: '99213', billedAmount: 250, paidAmount: 80, allowedAmount: 125,
-            dateOfService: '2026-06-20',
-            adjustments: [{ groupCode: 'CO', reasonCode: '45', amount: 125 }],
+            units: 1, dateOfService: '2026-06-20',
+            adjustments: [{ groupCode: 'CO', reasonCode: '45', amount: 170 }],
           }],
         }],
+        providerAdjustments: [
+          { reasonCode: 'WO', referenceId: 'ICN-40', amount: 25 },
+        ],
       }, null, 2),
     },
     responseExample: JSON.stringify({

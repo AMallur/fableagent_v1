@@ -28,7 +28,31 @@ db/
     ├── 0013_enterprise_admin.sql         # security policy (lockout/MFA/rotation), SSO,
     │                                     #   integrations, onboarding, exports, invoices,
     │                                     #   immutable audit_log, PHI access logging
-    └── 0014_integration_api.sql          # api_key, api_request_log, outbound_delivery
+    ├── 0014_integration_api.sql          # api_key, api_request_log, outbound_delivery
+    ├── 0015_sftp_inbound.sql             # per-client inbound SFTP credentials
+    ├── 0016_tenant_rls_fix.sql           # tenant-scoping corrections
+    ├── 0017_pretenant_lookup_functions.sql  # pre-tenant lookups via SECURITY DEFINER
+    ├── 0018_payer_shared_insert.sql      # shared/tenant payer write rules
+    ├── 0019_runtime_rls_and_delivery.sql # non-superuser runtime roles, rate windows,
+    │                                     #   scheduler leases, delivery uniqueness
+    ├── 0020_remittance_adjustments.sql   # all CAS adjustments per remit line
+    ├── 0021_pilot_contract_governance.sql   # contract draft/active/approval gates
+    ├── 0022_reference_data_provenance.sql   # versioned, checksummed CMS/X12 imports
+    ├── 0023_reconcile_deliveries_job_type.sql
+    ├── 0024_client_payer_readiness.sql   # per-client/payer activation capabilities
+    ├── 0025_era_financial_integrity.sql  # PLB provider adjustments, 835 balancing state,
+    │                                     #   reversal/adjudication detail, recovery
+    │                                     #   attribution columns, client balance policy
+    ├── 0026_pricing_cob_and_commercial_terms.sql
+                                          # payer payment reduction, contract lesser-of,
+                                          #   modifier payment rules, claim payer sequence
+                                          #   + prior-payer paid, pricing_plan +
+                                          #   invoice_line + issued-invoice immutability,
+                                          #   subscription/feature enforcement functions
+    └── 0027_usage_ledger_ncci_and_attribution_policy.sql
+                                          # append-only usage_event billing ledger,
+                                          #   payer bundling-edit source + client NCCI
+                                          #   policy, per-client attribution policy
 ```
 
 The detection engine that consumes this schema lives in [../engine](../engine).
@@ -137,6 +161,14 @@ are skipped.
 | `AUDIT_LOG.timestamp` | `created_at` | avoids the reserved word; same semantics |
 | `PAYER` (no tenant field in spec) | nullable `tenant_id` | `NULL` = shared master payer visible to all tenants; non-null = tenant-specific payer/override. RLS allows reading global rows but writing only your own |
 | — | `remittance_line.claim_id / claim_line_id` nullable | 835s land before matching; the `match_claims` job links them later. Partial index `idx_remit_line_unmatched` feeds that job |
+| — | `remittance_provider_adjustment` (0025) | PLB moves real money (recoupments, forwarding balances, interest) that never appears on a CLP claim. Without it a check cannot be balanced and a payer takeback is invisible |
+| — | `payment_event` attribution columns (0025) | A recovered dollar has to be defensible against the customer's own remittances, so the scope, basis, gross, reversals and recoupments behind each figure are stored, not just the total |
+| — | `modifier_payment_rule` (0026) | Modifiers change the percentage payable (51 at 50%, 50 at 150%, 80 at 16%). Pricing every modified line at 100% made it look half underpaid. Shared defaults with tenant/payer overrides, composed multiplicatively in `apply_order` |
+| — | `pricing_plan` + `invoice_line` (0026) | Recovery is sold on contingency, so the terms are effective-dated data rather than a code constant, and an invoice names every `payment_event` it charges for. A unique index on `payment_event_id` means a recovery can be billed only once |
+| — | `invoice` immutable past `draft` (0026) | A trigger refuses to change the figures on an issued bill or delete it; corrections are a void and reissue. Regenerating a month used to silently rewrite an invoice that had already gone out |
+| — | `usage_event` (0027) | Freezing the invoice totals stopped the bill changing; it did not stop the evidence changing. The ledger is written once per billable fact with the figures as they stood, is append-only in the database (only `invoice_id` may ever move), and is what invoices are built from — so an issued bill can be reconstructed after the operational tables have moved on |
+| — | `client` attribution policy (0027) | Which post-appeal dollars count as recovery is a commercial term, not an engineering constant: basis, window, floor, unallocated handling and clawback rule are per client, each defaulting to the previous hardcoded behavior |
+| — | `payer.bundling_edit_source` + `client.ncci_bundling_policy` (0027) | The CMS NCCI tables have been importable since 0022 and nothing read them. These two say how to read them for this payer and what to do when CMS says a bundle can never be unbundled |
 
 ### Other conventions
 

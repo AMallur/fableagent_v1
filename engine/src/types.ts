@@ -6,6 +6,12 @@
 // and persists the result; tests build snapshots in memory.
 // ============================================================================
 
+// Re-exported from the NCCI step so EngineInput can name these without this
+// module owning the shape of CMS reference data. Type-only, so there is no
+// runtime cycle despite ncci.ts importing back from here.
+import type { NcciDatasetInput, NcciEditInput } from './steps/ncci.ts';
+export type { NcciDatasetInput, NcciEditInput };
+
 export type UUID = string;
 export type ISODate = string; // 'YYYY-MM-DD'
 
@@ -33,6 +39,22 @@ export type DenialCategory =
 
 export type ExpectedSource = 'contract' | 'medicare_proxy' | 'none';
 
+/** Where a claim sits in the patient's coverage order (837 SBR01). */
+export type PayerSequence = 'primary' | 'secondary' | 'tertiary' | 'unknown';
+
+/** Professional vs institutional billing. Also decides which of the two CMS
+ * NCCI PTP tables adjudicates the claim. */
+export type ClaimType = 'professional' | 'facility';
+
+/** The two CMS NCCI PTP tables. */
+export type NcciServiceSetting = 'practitioner' | 'outpatient_hospital';
+
+/** Whether a payer adjudicates bundling against the published CMS NCCI tables
+ * or against edits of its own. It decides what the ABSENCE of a CMS edit
+ * means: a contradiction of the payer's own policy, or a demand for the
+ * rationale under the contract. */
+export type BundlingEditSource = 'ncci' | 'proprietary';
+
 // ---------------------------------------------------------------------------
 // Input snapshot
 // ---------------------------------------------------------------------------
@@ -42,6 +64,13 @@ export interface PayerInput {
   payerName: string;
   appealDeadlineDays?: number | null;
   timelyFilingLimitDays?: number | null;
+  /** Percentage withheld from the payment after adjudication — Medicare
+   * sequestration is 2. It reduces what the payer owes, not what the contract
+   * allows, so it applies to expected payer liability rather than to the
+   * allowed amount. */
+  paymentReductionPercent?: number | null;
+  /** Default 'ncci'. */
+  bundlingEditSource?: BundlingEditSource | null;
 }
 
 export interface PatientInput {
@@ -63,6 +92,9 @@ export interface ClaimLineInput {
   patientResponsibility?: number | null;
   denialReasonCode?: string | null;
   lineStatus?: string | null;
+  /** Line-level COB amount (837 loop 2430 SVD02) — what the prior payer paid
+   * for this specific service line. Preferred over the claim-level total. */
+  priorPayerPaid?: number | null;
 }
 
 export interface ClaimInput {
@@ -72,12 +104,19 @@ export interface ClaimInput {
   patientId: UUID;
   claimNumberInternal: string;
   claimNumberPayer?: string | null;
+  /** Professional or facility. Decides which CMS NCCI PTP table applies. */
+  claimType?: ClaimType;
   dateOfServiceStart: ISODate;         // denormalized from encounter
   placeOfService?: string | null;
   submissionDate?: ISODate | null;
   claimStatus: ClaimStatus;
   authorizationNumber?: string | null; // denormalized from encounter
   availableDocumentTypes: string[];    // document_type values on file for this claim/client
+  /** 837 SBR01. On a secondary or tertiary claim this payer owes the allowed
+   * amount less patient responsibility AND less what the prior payer paid. */
+  payerSequence?: PayerSequence;
+  /** Claim-level COB amount (837 loop 2320 AMT*D). */
+  priorPayerPaid?: number | null;
   lines: ClaimLineInput[];
 }
 
@@ -100,6 +139,20 @@ export interface RemitLineInput {
   adjustmentGroupCode?: string | null; // CO / PR / OA / PI
   adjustmentReasonCode?: string | null;// CARC, e.g. '45'
   remarkCode?: string | null;          // RARC
+  /** CLP02 claim status: 1 processed primary, 4 denied, 22 reversal, ... */
+  claimStatusCode?: string | null;
+  /** CLP02 = 22 — reverses a previously reported payment. Its amounts are
+   * negative, they net against prior cash, and they must never be read as a
+   * fresh adjudication or turned into a recovery case. */
+  isReversal?: boolean;
+  /** SVC01 — the code the payer adjudicated, when it differs from the code we
+   * submitted (which stays in procedureCode so matching still works). */
+  adjudicatedProcedureCode?: string | null;
+  payerRecoded?: boolean;
+  /** SVC05 — units the payer paid. */
+  paidUnits?: number | null;
+  /** SVC07 — units originally submitted, when the payer reported them. */
+  originalUnits?: number | null;
   claimId?: UUID | null;               // pre-linked (already matched earlier)
   claimLineId?: UUID | null;
   /** True when this exact remittance line was processed in an earlier run.
@@ -129,7 +182,27 @@ export interface ContractInput {
   effectiveDate: ISODate;
   expirationDate?: ISODate | null;
   feeScheduleType: 'percent_of_medicare' | 'fee_schedule' | 'per_diem' | 'case_rate';
+  /** The near-universal contract term: the payer owes the lesser of billed
+   * charges and the contracted rate. A line billed below the rate therefore
+   * cannot be underpaid against that rate. */
+  applyLesserOfBilled?: boolean;
   lines: ContractLineInput[];
+}
+
+/**
+ * Percentage of the otherwise-allowed amount payable when a modifier is on the
+ * line (51 multiple procedure, 50 bilateral, 80/AS assistant, and so on).
+ * Rules compose multiplicatively in applyOrder, because a bilateral assistant
+ * surgery pays 150% and then 16% of that, not 166%.
+ */
+export interface ModifierPaymentRule {
+  modifier: string;
+  percentOfAllowed: number;
+  applyOrder: number;
+  /** null = every payer for this tenant. */
+  payerId?: UUID | null;
+  /** null = the shared default, overridden by any tenant-specific rule. */
+  tenantId?: UUID | null;
 }
 
 export interface ExistingCaseInput {
@@ -155,6 +228,10 @@ export interface ClientPayerConfigInput {
   minCaseThreshold?: number | null;
 }
 
+/** 'advisory' still opens the case and states plainly that an unbundling
+ * appeal cannot win; 'suppress_unappealable' does not open it at all. */
+export type NcciBundlingPolicy = 'advisory' | 'suppress_unappealable';
+
 export interface EngineConfig {
   /** deterministic "today" for deadline math */
   asOf: ISODate;
@@ -177,11 +254,23 @@ export interface EngineInput {
   claims: ClaimInput[];
   remitLines: RemitLineInput[];
   contracts: ContractInput[];
+  /** Modifier payment rules in effect: shared defaults plus tenant overrides. */
+  modifierRules?: ModifierPaymentRule[];
   /** Imported key: `${code}|${modifier}|${locality}|${facility|nonfacility}`.
    * Legacy/test fixtures may provide `${code}|${modifier}`. */
   medicareRates: Record<string, number>;
   /** Explicit CMS locality per client; never inferred from address text. */
   medicareLocalityByClient: Record<UUID, string>;
+  /** CMS NCCI procedure-to-procedure edits relevant to this run's procedure
+   * codes. Loaded narrowly on purpose: the full CMS tables run to millions of
+   * pairs and there is no reason to hold them in memory. */
+  ncciEdits?: NcciEditInput[];
+  /** Which NCCI tables are loaded, so "CMS publishes no edit for this pair"
+   * can be told apart from "we have not imported the file". */
+  ncciDatasets?: NcciDatasetInput[];
+  /** Per client: what to do with a bundling denial CMS says can never be
+   * unbundled. Default 'advisory'. */
+  ncciBundlingPolicyByClient?: Record<UUID, NcciBundlingPolicy>;
   existingCases: ExistingCaseInput[];
   winRates: WinRateInput[];
   clientPayerConfigs: ClientPayerConfigInput[];
@@ -249,24 +338,31 @@ export interface CaseOutput {
   deadlineDate: ISODate | null;
   expired: boolean;
   autoAction: boolean;
+  /** A finding the biller needs in front of them, written to the case notes:
+   * today, what the CMS NCCI tables say about a bundling denial. */
+  evidenceNote?: string;
 }
 
 export interface SkippedCase {
   claimId: UUID;
   claimLineId: UUID | null;
   caseType: CaseType;
-  reason: 'below_threshold' | 'no_recovery_amount';
+  reason: 'below_threshold' | 'no_recovery_amount' | 'ncci_not_separately_payable';
   recoveryOpportunity: number;
 }
 
 export interface Anomaly {
-  type: 'systemic_underpayment';
+  type: 'systemic_underpayment' | 'payment_reversed';
   payerId: UUID;
   payerName: string;
   detail: string;
-  linesChecked: number;
-  linesUnderpaid: number;
-  totalVariance: number;
+  /** systemic_underpayment only */
+  linesChecked?: number;
+  linesUnderpaid?: number;
+  totalVariance?: number;
+  /** payment_reversed only */
+  reversedLines?: number;
+  reversedAmount?: number;
 }
 
 export interface AlertNotification {
@@ -289,6 +385,14 @@ export interface RunSummary {
   byPriority: Record<string, { count: number; amount: number }>;
   anomalies: Anomaly[];
   alerts: AlertNotification[];
+  /** Payer reversals seen in this run. Reversals take cash back, so they are
+   * reported explicitly rather than being absorbed into the paid totals. */
+  reversals: {
+    lines: number;
+    /** Total reversed cash as a positive number. */
+    amount: number;
+    claimLineIds: UUID[];
+  };
 }
 
 export interface EngineResult {

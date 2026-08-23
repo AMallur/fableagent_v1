@@ -17,6 +17,7 @@ import type { DocumentStore } from '../appeals/storage.ts';
 import { FileSystemDocumentStore } from '../appeals/storage.ts';
 import { createNotification, notifyRoles } from './notify.ts';
 import { processTrigger } from './rules.ts';
+import { syncUsageLedger } from '../web/usage_ledger.ts';
 import { reconcileChangeHealthcareDelivery } from '../integration/optum_reconciliation.ts';
 
 const OPEN_STATUSES = ['open', 'in_progress', 'submitted', 'pending_payer'];
@@ -127,7 +128,14 @@ export async function runNightlyProcessing(
     }
 
     // -- step 8: appeal letters for new cases with sufficient data -----------
-    const gen = await generateAppealPackets(pool, { tenantId, clientId, asOf, store });
+    // Skipped entirely when the client's plan does not include appeals, rather
+    // than generating packets nobody is entitled to.
+    const appealsEnabled = (await pool.query(
+      `SELECT app.client_feature_enabled($1, $2, 'appeals') AS enabled`, [tenantId, clientId],
+    )).rows[0]?.enabled === true;
+    const gen = appealsEnabled
+      ? await generateAppealPackets(pool, { tenantId, clientId, asOf, store })
+      : { summary: { packetsCreated: 0, packetsRefreshed: 0, ready: 0, draft: 0 } };
 
     // -- reconciliation (spec: runs after each nightly ingest) ---------------
     const recon = await reconcilePaymentsInner(pool, tenantId, clientId);
@@ -210,6 +218,7 @@ export async function runNightlyProcessing(
       },
       reconciliation: {
         matched: recon.matched, won: recon.won, partial: recon.partial, recovered: recon.recovered,
+        recouped: recon.recouped, clawedBack: recon.clawedBack,
       },
       deadlineAlerts, ruleFirings, snapshotWritten: true,
       recordsProcessed: s.remitLinesProcessed,
@@ -316,80 +325,364 @@ export async function runDeadlineMonitor(
 // ============================================================================
 
 interface ReconInner {
-  matched: number; won: number; partial: number; recovered: number; caseIds: UUID[];
+  matched: number; won: number; partial: number; recovered: number;
+  recouped: number; clawedBack: number; caseIds: UUID[];
 }
+
+/**
+ * Recovery attribution.
+ *
+ * A recovered dollar is one the appeal actually produced. Three things make
+ * that different from "cash arrived after we submitted":
+ *
+ *   1. Scope. A case is opened on a claim LINE. Payment landing on a sibling
+ *      line of the same claim is not this case's recovery, so attribution is
+ *      line-scoped whenever the case names a line.
+ *   2. Reversals. A reverse-and-reissue pair re-pays the original amount plus
+ *      the correction. Only the net movement is recovery; the gross reissue
+ *      would bill the customer for money they already had.
+ *   3. Recoupments. A PLB takeback referencing the claim after the appeal is
+ *      cash going the other way and is netted out too.
+ *
+ * Every component is written to payment_event so an invoice line can be
+ * defended line-by-line against the customer's own remittances.
+ */
+/**
+ * Attribution scope.
+ *
+ * A case is opened on a claim LINE, so line-scoped cash is the accurate
+ * measure and payment on a sibling line is not this case's recovery.
+ *
+ * The one deliberate widening: remittance detail the payer never resolved to
+ * a service line (a header-only ERA row, or a line the matcher could not
+ * place) carries a claim_id and nothing more. Dropping it would silently lose
+ * real recoveries, which is worse than attributing it, so it is included and
+ * reported separately as unallocated_paid — the part of an invoice line a
+ * customer is most likely to question, and the part an operator can go and
+ * resolve properly.
+ */
+const LINE_SCOPED = 'rl.claim_line_id = rc.claim_line_id';
+const UNALLOCATED = `cli.attribution_include_unallocated
+  AND rl.claim_line_id IS NULL AND rl.claim_id = rc.claim_id`;
+const ATTRIBUTION_SCOPE = `
+  (rc.claim_line_id IS NOT NULL AND ((${LINE_SCOPED}) OR (${UNALLOCATED})))
+  OR (rc.claim_line_id IS NULL AND rl.claim_id = rc.claim_id)`;
+
+/**
+ * Attribution window.
+ *
+ * Payment landing a year after an appeal went out is rarely that appeal's
+ * doing, and billing a contingency on it is the kind of thing a customer
+ * audits and then disputes. attribution_window_days is how long after
+ * submission a remittance still counts; NULL (the default) is the previous
+ * behavior of no limit at all, so no existing client's numbers move.
+ */
+const WITHIN_WINDOW = `(cli.attribution_window_days IS NULL
+  OR $ALIAS.created_at <= ap.submitted_at
+       + make_interval(days => cli.attribution_window_days))`;
+const withinWindow = (alias: string) => WITHIN_WINDOW.replaceAll('$ALIAS', alias);
 
 async function reconcilePaymentsInner(
   pool: PoolLike, tenantId: UUID, clientId: UUID | null,
 ): Promise<ReconInner> {
-  // submitted appeals whose claim received remit rows AFTER the appeal went
-  // out, with payment not yet recorded on the case
+  // Cases with a submitted appeal, and the cash movement on the attributed
+  // scope since it went out. 'won' cases are included so a later clawback is
+  // caught rather than left standing as recovered revenue.
   const rows = await pool.query(
-    `SELECT rc.case_id, rc.claim_id, rc.recovery_opportunity, rc.assigned_to_user_id,
+    `SELECT rc.case_id, rc.claim_id, rc.claim_line_id, rc.recovery_opportunity,
+            rc.assigned_to_user_id, rc.status,
             cl.claim_number_internal,
+            cli.attribution_basis        AS policy_basis,
+            cli.attribution_min_amount   AS policy_min_amount,
+            cli.attribution_window_days  AS policy_window_days,
+            cli.clawback_policy          AS policy_clawback,
             COALESCE((SELECT sum(pe.amount_recovered) FROM payment_event pe
                       WHERE pe.case_id = rc.case_id), 0) AS already_recovered,
-            (SELECT COALESCE(sum(rl.paid_amount), 0)
-             FROM remittance_line rl JOIN remittance r ON r.remittance_id = rl.remittance_id
-             WHERE rl.claim_id = rc.claim_id AND r.created_at > ap.submitted_at) AS post_appeal_paid,
-            (SELECT max(rl.remittance_id::text)
-             FROM remittance_line rl JOIN remittance r ON r.remittance_id = rl.remittance_id
-             WHERE rl.claim_id = rc.claim_id AND r.created_at > ap.submitted_at) AS remittance_id
+            -- What THIS reconciler attributed, on the terms currently in
+            -- force, as opposed to what a person matched by hand. Only its own
+            -- arithmetic may be reversed out; a verified manual match is not
+            -- something a robot undoes. Matching on the basis too means a
+            -- client whose terms were renegotiated has recovery credited under
+            -- the OLD basis flagged for a person rather than silently reversed
+            -- by arithmetic that no longer describes how it was computed.
+            COALESCE((SELECT sum(pe.amount_recovered) FROM payment_event pe
+                      WHERE pe.case_id = rc.case_id
+                        AND pe.matched_automatically
+                        AND pe.attribution_basis = cli.attribution_basis), 0) AS auto_recovered,
+            att.pre_appeal_paid,
+            att.gross_post_appeal_paid,
+            att.unallocated_paid,
+            att.reversals,
+            att.remittance_id,
+            COALESCE(plb.recoupments, 0) AS recoupments
      FROM recovery_case rc
      JOIN claim cl ON cl.claim_id = rc.claim_id
+     -- The client's attribution policy is part of the arithmetic, not a
+     -- post-filter: the window and the unallocated switch change which
+     -- remittance rows are even summed.
+     JOIN client cli ON cli.client_id = rc.client_id
      JOIN LATERAL (
        SELECT max(submitted_at) AS submitted_at FROM appeal_packet
        WHERE case_id = rc.case_id AND submitted_at IS NOT NULL AND deleted_at IS NULL
      ) ap ON ap.submitted_at IS NOT NULL
+     JOIN LATERAL (
+       SELECT
+         COALESCE(sum(rl.paid_amount)
+           FILTER (WHERE r.created_at <= ap.submitted_at), 0) AS pre_appeal_paid,
+         COALESCE(sum(rl.paid_amount)
+           FILTER (WHERE r.created_at > ap.submitted_at AND ${withinWindow('r')}
+                     AND NOT rl.is_reversal), 0)
+           AS gross_post_appeal_paid,
+         COALESCE(sum(rl.paid_amount)
+           FILTER (WHERE r.created_at > ap.submitted_at AND ${withinWindow('r')}
+                     AND NOT rl.is_reversal
+                     AND rc.claim_line_id IS NOT NULL AND (${UNALLOCATED})), 0)
+           AS unallocated_paid,
+         -- Reversals are NEVER windowed out. A takeback that lands late is
+         -- still the payer removing money we credited; dropping it because a
+         -- window closed would leave a recovery on the books that no longer
+         -- exists, which is the one error direction a customer notices.
+         COALESCE(-sum(rl.paid_amount)
+           FILTER (WHERE r.created_at > ap.submitted_at AND rl.is_reversal), 0) AS reversals,
+         (SELECT rl2.remittance_id
+          FROM remittance_line rl2
+          JOIN remittance r2 ON r2.remittance_id = rl2.remittance_id
+          WHERE rl2.tenant_id = rc.tenant_id AND r2.created_at > ap.submitted_at
+            AND ${withinWindow('r2')}
+            AND ((rc.claim_line_id IS NOT NULL
+                  AND (rl2.claim_line_id = rc.claim_line_id
+                       OR (rl2.claim_line_id IS NULL AND rl2.claim_id = rc.claim_id)))
+                 OR (rc.claim_line_id IS NULL AND rl2.claim_id = rc.claim_id))
+          ORDER BY r2.check_date DESC NULLS LAST, r2.created_at DESC
+          LIMIT 1) AS remittance_id
+       FROM remittance_line rl
+       JOIN remittance r ON r.remittance_id = rl.remittance_id
+       WHERE rl.tenant_id = rc.tenant_id AND (${ATTRIBUTION_SCOPE})
+     ) att ON true
+     LEFT JOIN LATERAL (
+       -- PLB takebacks referencing this claim after the appeal went out.
+       SELECT COALESCE(sum(pa.amount), 0) AS recoupments
+       FROM remittance_provider_adjustment pa
+       JOIN remittance r3 ON r3.remittance_id = pa.remittance_id
+       WHERE pa.tenant_id = rc.tenant_id AND pa.claim_id = rc.claim_id
+         AND r3.created_at > ap.submitted_at
+         AND pa.category IN ('recoupment', 'forwarding_balance', 'refund', 'penalty')
+     ) plb ON true
      WHERE rc.tenant_id = $1 AND ($2::uuid IS NULL OR rc.client_id = $2)
-       AND rc.status IN ('submitted', 'pending_payer') AND rc.deleted_at IS NULL`,
+       AND rc.status IN ('submitted', 'pending_payer', 'won') AND rc.deleted_at IS NULL`,
     [tenantId, clientId]);
 
-  const out: ReconInner = { matched: 0, won: 0, partial: 0, recovered: 0, caseIds: [] };
-  for (const c of rows.rows) {
-    const newPaid = r2(Number(c.post_appeal_paid) - Number(c.already_recovered));
-    if (newPaid <= 0.005) continue;
+  const out: ReconInner = {
+    matched: 0, won: 0, partial: 0, recovered: 0, recouped: 0, clawedBack: 0, caseIds: [],
+  };
 
-    const gap = r2(Number(c.recovery_opportunity) - Number(c.already_recovered));
-    const gapClosed = newPaid >= gap - 0.005;
+  for (const c of rows.rows) {
+    const alreadyRecovered = Number(c.already_recovered);
+    const gross = Number(c.gross_post_appeal_paid);
+    const unallocated = Number(c.unallocated_paid);
+    const reversals = Number(c.reversals);
+    const recoupments = Number(c.recoupments);
+    const basis: string = c.policy_basis ?? 'incremental_net';
+    // 'gross_post_appeal' credits every dollar that arrived after submission.
+    // It over-credits a reverse-and-reissue by construction, which is why it
+    // is opt-in — but some contracts are written that way and billing on a
+    // basis the contract does not say is worse than billing generously.
+    // Recoupments are netted under both: a PLB takeback is not payment.
+    const netAttributable = basis === 'gross_post_appeal'
+      ? r2(gross - recoupments)
+      : r2(gross - reversals - recoupments);
+    const delta = r2(netAttributable - alreadyRecovered);
+    const scope = c.claim_line_id ? 'claim_line' : 'claim';
+    const minAmount = Number(c.policy_min_amount ?? 0);
+
+    if (Math.abs(delta) <= 0.005) continue;
+    // Movement below the client's floor is noise — a rounding correction, a
+    // few cents of interest — and is left to accumulate rather than opening a
+    // billable event for it. A takeback is never suppressed this way.
+    if (delta > 0 && minAmount > 0 && delta < minAmount) continue;
+
+    if (delta < 0) {
+      // A negative delta is only a takeback when the payer actually took
+      // something back. Without a reversal or a recoupment on the attributed
+      // scope it is a bookkeeping difference — most often a manual match
+      // recorded on a basis this arithmetic cannot see — and inventing a
+      // clawback from it would erase a person's verified work.
+      if (reversals <= 0.005 && recoupments <= 0.005) continue;
+      await recordClawback(pool, tenantId, c, scope, Number(c.auto_recovered), delta, out);
+      continue;
+    }
+
+    const gap = r2(Number(c.recovery_opportunity) - alreadyRecovered);
+    const gapClosed = delta >= gap - 0.005;
 
     await pool.query(
       `INSERT INTO payment_event
-         (tenant_id, case_id, remittance_id, claim_id, amount_recovered, payment_date,
-          matched_automatically, notes)
-       VALUES ($1, $2, $3, $4, $5, CURRENT_DATE, true, $6)`,
-      [tenantId, c.case_id, c.remittance_id, c.claim_id, newPaid,
-       gapClosed ? 'Post-appeal payment closed the recovery gap'
-                 : `Partial recovery: ${usd(newPaid)} of ${usd(gap)} gap`]);
+         (tenant_id, case_id, claim_line_id, remittance_id, claim_id, amount_recovered,
+          payment_date, matched_automatically, attribution_basis, attribution_scope,
+          pre_appeal_paid, gross_post_appeal_paid, unallocated_paid, reversals_netted,
+          recoupments_netted, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE, true, $14, $7,
+               $8, $9, $10, $11, $12, $13)`,
+      [tenantId, c.case_id, c.claim_line_id, c.remittance_id, c.claim_id, delta, scope,
+       Number(c.pre_appeal_paid), gross, unallocated, reversals, recoupments,
+       attributionNote(gross, unallocated, reversals, recoupments, alreadyRecovered,
+         gapClosed, gap, delta, basis, c.policy_window_days), basis]);
 
-    if (gapClosed) {
+    if (gapClosed && c.status !== 'won') {
       await pool.query(
         `UPDATE recovery_case SET status = 'won' WHERE case_id = $1`, [c.case_id]);
       out.won += 1;
-    } else {
+    } else if (!gapClosed) {
       out.partial += 1;
     }
     await pool.query(
       `INSERT INTO case_action (tenant_id, case_id, action_type, performed_by_system, notes)
        VALUES ($1, $2, 'payment_received', true, $3)`,
       [tenantId, c.case_id,
-       `${gapClosed ? 'Recovery gap closed' : 'Partial recovery logged'}: ${usd(newPaid)} `
-       + `received after appeal${gapClosed ? ' — case marked won' : `; ${usd(r2(gap - newPaid))} still open`}`]);
+       `${gapClosed ? 'Recovery gap closed' : 'Partial recovery logged'}: ${usd(delta)} `
+       + `attributed after appeal${gapClosed ? ' — case marked won' : `; ${usd(r2(gap - delta))} still open`}`
+       + attributionSuffix(reversals, recoupments, unallocated)]);
 
     if (c.assigned_to_user_id) {
       await createNotification(pool, {
         tenantId, userId: c.assigned_to_user_id, type: 'payment_received',
-        title: `${usd(newPaid)} recovered on case ${c.claim_number_internal}`
+        title: `${usd(delta)} recovered on case ${c.claim_number_internal}`
           + (gapClosed ? ' — case won' : ' (partial)'),
         caseId: c.case_id,
       });
     }
 
     out.matched += 1;
-    out.recovered = r2(out.recovered + newPaid);
+    out.recovered = r2(out.recovered + delta);
     out.caseIds.push(c.case_id);
   }
+
+  // Everything this pass attributed or reversed becomes a ledger entry, along
+  // with anything a person matched by hand since the last run. Appending here
+  // rather than at invoice time means the billable record exists from the
+  // moment the money moved, not from the moment somebody asked for a bill.
+  await syncUsageLedger(pool, tenantId, clientId);
   return out;
+}
+
+/**
+ * The payer took cash back after we credited a recovery. Only what was
+ * actually credited can be reversed out; a takeback on a case that never had
+ * recovery attributed to it is recorded and escalated but never becomes a
+ * negative recovery line.
+ */
+async function recordClawback(
+  pool: PoolLike, tenantId: UUID, c: any, scope: string,
+  autoRecovered: number, delta: number, out: ReconInner,
+): Promise<void> {
+  // Under 'flag_only' the takeback is recorded and escalated but the credited
+  // figure is left alone for a person to decide. Some contracts require that,
+  // because reversing a recovery moves an invoice that has already gone out
+  // and that is not a decision to make automatically at 2am.
+  const autoReverse = (c.policy_clawback ?? 'auto') === 'auto';
+  const reversible = autoReverse
+    ? r2(Math.max(0, Math.min(autoRecovered, Math.abs(delta))))
+    : 0;
+
+  // Nothing is written under flag_only, so the negative delta is still there
+  // tomorrow and every night after. Escalating the same takeback once is the
+  // point; escalating it nightly until somebody acts is how a real alert gets
+  // filtered into a folder nobody reads.
+  if (reversible <= 0.005) {
+    const seen = await pool.query(
+      `SELECT 1 FROM case_action
+       WHERE tenant_id = $1 AND case_id = $2 AND action_type = 'payment_recouped'
+         AND notes LIKE $3 LIMIT 1`,
+      [tenantId, c.case_id, `%${usd(Math.abs(delta))} taken back%`]);
+    if (seen.rows.length > 0) {
+      out.recouped += 1;
+      return;
+    }
+  }
+  const detail =
+    `${usd(Math.abs(delta))} taken back after appeal on case ${c.claim_number_internal}`
+    + attributionSuffix(Number(c.reversals), Number(c.recoupments), Number(c.unallocated_paid));
+
+  if (reversible > 0.005) {
+    await pool.query(
+      `INSERT INTO payment_event
+         (tenant_id, case_id, claim_line_id, remittance_id, claim_id, amount_recovered,
+          payment_date, matched_automatically, attribution_basis, attribution_scope,
+          pre_appeal_paid, gross_post_appeal_paid, unallocated_paid, reversals_netted,
+          recoupments_netted, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE, true, $14, $7,
+               $8, $9, $10, $11, $12, $13)`,
+      [tenantId, c.case_id, c.claim_line_id, c.remittance_id, c.claim_id, -reversible, scope,
+       Number(c.pre_appeal_paid), Number(c.gross_post_appeal_paid),
+       Number(c.unallocated_paid), Number(c.reversals), Number(c.recoupments),
+       `Recovery reversed: ${detail}. Previously attributed ${usd(autoRecovered)}.`,
+       c.policy_basis ?? 'incremental_net']);
+    out.clawedBack = r2(out.clawedBack + reversible);
+    out.recovered = r2(out.recovered - reversible);
+
+    // Recovery that was taken back is not a win. Reopening is the honest
+    // state: the money is gone and somebody has to work it again.
+    if (c.status === 'won'
+        && r2(Number(c.already_recovered) - reversible) < Number(c.recovery_opportunity)) {
+      await pool.query(
+        `UPDATE recovery_case SET status = 'pending_payer' WHERE case_id = $1`, [c.case_id]);
+    }
+  }
+
+  await pool.query(
+    `INSERT INTO case_action (tenant_id, case_id, action_type, performed_by_system, notes)
+     VALUES ($1, $2, 'payment_recouped', true, $3)`,
+    [tenantId, c.case_id,
+     reversible > 0.005
+       ? `${detail}. ${usd(reversible)} of previously attributed recovery reversed out.`
+       : autoReverse
+         ? `${detail}. No automatically attributed recovery to reverse — `
+           + 'verify the cash against the payer remittance.'
+         : `${detail}. This client's clawback policy is flag-only, so `
+           + `${usd(autoRecovered)} of attributed recovery has been LEFT STANDING — `
+           + 'confirm the takeback and adjust it by hand.']);
+
+  if (c.assigned_to_user_id) {
+    await createNotification(pool, {
+      tenantId, userId: c.assigned_to_user_id, type: 'system_alert', severity: 'urgent',
+      title: `Payer took back ${usd(Math.abs(delta))} on case ${c.claim_number_internal}`,
+      caseId: c.case_id,
+    });
+  }
+
+  out.recouped += 1;
+  out.caseIds.push(c.case_id);
+}
+
+function attributionSuffix(
+  reversals: number, recoupments: number, unallocated: number,
+): string {
+  const parts: string[] = [];
+  if (Math.abs(reversals) > 0.005) parts.push(`${usd(reversals)} reversed`);
+  if (Math.abs(recoupments) > 0.005) parts.push(`${usd(recoupments)} recouped`);
+  const netted = parts.length ? ` (net of ${parts.join(' and ')})` : '';
+  return netted + (Math.abs(unallocated) > 0.005
+    ? ` — includes ${usd(unallocated)} of payment the payer did not resolve to a service line`
+    : '');
+}
+
+function attributionNote(
+  gross: number, unallocated: number, reversals: number, recoupments: number,
+  alreadyRecovered: number, gapClosed: boolean, gap: number, delta: number,
+  basis: string, windowDays: number | null,
+): string {
+  // The basis and any window are named on the line itself. A customer looking
+  // at a figure that excludes money they can see on their own remittance needs
+  // to be told which rule excluded it, not left to work it out.
+  const terms = `${basis === 'gross_post_appeal' ? 'gross post-appeal' : 'incremental net'}`
+    + `${windowDays ? `, within ${windowDays} days of submission` : ''}`;
+  return `${gapClosed ? 'Post-appeal payment closed the recovery gap' : `Partial recovery: ${usd(delta)} of ${usd(gap)} gap`}. `
+    + `Basis: ${terms}. `
+    + `Attribution: ${usd(gross)} paid after submission`
+    + `${Math.abs(unallocated) > 0.005 ? ` (${usd(unallocated)} not resolved to a service line)` : ''}`
+    + `${Math.abs(reversals) > 0.005 ? `, less ${usd(reversals)} reversed` : ''}`
+    + `${Math.abs(recoupments) > 0.005 ? `, less ${usd(recoupments)} recouped` : ''}`
+    + `${alreadyRecovered > 0.005 ? `, less ${usd(alreadyRecovered)} already attributed` : ''}.`;
 }
 
 export async function runPaymentReconciliation(
@@ -401,7 +694,7 @@ export async function runPaymentReconciliation(
       for (const caseId of out.caseIds) {
         await processTrigger(pool, { trigger: 'payment_received', tenantId: params.tenantId, caseId });
       }
-      return { ...out, recordsProcessed: out.matched };
+      return { ...out, recordsProcessed: out.matched + out.recouped };
     });
 }
 

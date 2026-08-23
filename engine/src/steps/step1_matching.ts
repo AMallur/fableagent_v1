@@ -150,8 +150,18 @@ function addRemit(map: Map<string, RemitLineInput[]>, claimId: string, r: RemitL
  * denied  — nothing paid and at least one recognized denial CARC
  * paid    — any payment posted (Step 3 refines to 'underpaid' on variance)
  * accepted— remit received, zero paid, no denial code (e.g. applied to deductible)
+ *
+ * Reversal entries (CLP02 = 22) are excluded. A reversal undoes an earlier
+ * adjudication rather than reporting a new one: reading its negative amounts
+ * as a fresh result would flip a legitimately paid claim to 'accepted' or
+ * 'denied'. When a reversal is the ONLY thing received for a claim the status
+ * is left alone — the reversal is surfaced in the run summary for a human,
+ * which is the honest outcome given the claim status vocabulary has no term
+ * for "the payer took the money back".
  */
-function statusFromRemits(remits: RemitLineInput[]): ClaimStatus | null {
+function statusFromRemits(allRemits: RemitLineInput[]): ClaimStatus | null {
+  const remits = allRemits.filter((r) => !r.isReversal);
+  if (remits.length === 0) return null;
   const totalPaid = remits.reduce((s, r) => s + (r.paidAmount ?? 0), 0);
   const hasDenial = remits.some((r) => {
     const adjustments = r.adjustments?.length ? r.adjustments

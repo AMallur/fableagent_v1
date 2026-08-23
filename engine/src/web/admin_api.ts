@@ -29,7 +29,7 @@ const iso = (v: unknown): string | null => {
 const when = (v: unknown): string | null =>
   v == null ? null : (v instanceof Date ? v.toISOString() : String(v));
 
-const err = (message: string, status: number) => Object.assign(new Error(message), { status });
+export const err = (message: string, status: number) => Object.assign(new Error(message), { status });
 
 export function requireTenantAdmin(sess: Session): void {
   if (!['super_admin', 'tenant_admin'].includes(sess.role)) {
@@ -51,7 +51,7 @@ export function assertClientAccess(sess: Session, s: Scope, clientId: UUID): voi
   if (sess.clientId !== clientId) throw err('client not accessible', 403);
 }
 
-async function adminAudit(
+export async function adminAudit(
   db: Queryable, sess: Session, action: string, entityType: string,
   entityId: UUID | null, detail: object,
 ): Promise<void> {
@@ -312,6 +312,9 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
     `SELECT client_id, client_name, tax_id, npi_group, specialty, state, address,
             timezone, nightly_run_time::text AS nightly_run_time, ingest_folder,
             status, subscription_status, features, baa_acknowledged_at,
+            era_balance_policy, era_balance_tolerance,
+            ncci_bundling_policy, attribution_basis, attribution_window_days,
+            attribution_min_amount, attribution_include_unallocated, clawback_policy,
             recovery_alert_threshold, appeal_review_threshold, contract_effective_date,
             (SELECT cmc.medicare_locality FROM client_medicare_config cmc
              WHERE cmc.tenant_id = client.tenant_id
@@ -324,6 +327,7 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
   const payers = await db.query(
     `SELECT py.payer_id, py.payer_name, py.payer_type, py.payer_id_code,
             py.timely_filing_limit_days, py.appeal_deadline_days, py.portal_url,
+            py.payment_reduction_percent, py.bundling_edit_source,
             py.tenant_id AS payer_tenant_id,
             cpc.autopilot_enabled, cpc.review_threshold, cpc.min_case_threshold
      FROM payer py
@@ -335,7 +339,7 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
 
   const contracts = await db.query(
     `SELECT ct.contract_id, ct.effective_date, ct.expiration_date, ct.fee_schedule_type,
-            ct.status, ct.validation_report, ct.approved_at,
+            ct.status, ct.validation_report, ct.approved_at, ct.apply_lesser_of_billed,
             py.payer_name,
             (SELECT count(*)::int FROM contract_line l
              WHERE l.contract_id = ct.contract_id AND l.deleted_at IS NULL) AS lines
@@ -373,11 +377,28 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
       alertThreshold: r.recovery_alert_threshold == null ? null : num(r.recovery_alert_threshold),
       reviewThreshold: r.appeal_review_threshold == null ? null : num(r.appeal_review_threshold),
       medicareLocality: r.medicare_locality,
+      eraBalancePolicy: r.era_balance_policy,
+      eraBalanceTolerance: num(r.era_balance_tolerance),
+      ncciBundlingPolicy: r.ncci_bundling_policy,
+      // How a recovered dollar is counted for this client — a commercial term,
+      // so it is configuration rather than an engineering constant.
+      attributionBasis: r.attribution_basis,
+      attributionWindowDays: r.attribution_window_days == null
+        ? null : Number(r.attribution_window_days),
+      attributionMinAmount: num(r.attribution_min_amount),
+      attributionIncludeUnallocated: r.attribution_include_unallocated !== false,
+      clawbackPolicy: r.clawback_policy,
     },
     payers: payers.rows.map((p) => ({
       payerId: p.payer_id, name: p.payer_name, type: p.payer_type, code: p.payer_id_code,
       timelyFilingDays: p.timely_filing_limit_days, appealDeadlineDays: p.appeal_deadline_days,
       portalUrl: p.portal_url,
+      // Sequestration and equivalents: withheld from the payment after
+      // adjudication, so it is not an underpayment.
+      paymentReductionPercent: num(p.payment_reduction_percent),
+      // Whether this payer adjudicates bundling on the CMS NCCI tables or its
+      // own edits — it decides what the absence of a CMS edit proves.
+      bundlingEditSource: p.bundling_edit_source ?? 'ncci',
       editable: p.payer_tenant_id != null,   // shared master payers are read-only
       autopilot: p.autopilot_enabled ?? false,
       reviewThreshold: p.review_threshold == null ? null : num(p.review_threshold),
@@ -387,6 +408,7 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
       contractId: x.contract_id, payerName: x.payer_name,
       effectiveDate: iso(x.effective_date), expirationDate: iso(x.expiration_date),
       feeScheduleType: x.fee_schedule_type, lines: x.lines, status: x.status,
+      applyLesserOfBilled: x.apply_lesser_of_billed !== false,
       validationReport: x.validation_report ?? [], approvedAt: when(x.approved_at),
     })),
     documents: docs.rows.map((d) => ({
@@ -423,7 +445,75 @@ export async function updateClientSettings(
     state: 'state', timezone: 'timezone', nightlyRunTime: 'nightly_run_time',
     alertThreshold: 'recovery_alert_threshold', reviewThreshold: 'appeal_review_threshold',
     ingestFolder: 'ingest_folder',
+    eraBalancePolicy: 'era_balance_policy', eraBalanceTolerance: 'era_balance_tolerance',
+    ncciBundlingPolicy: 'ncci_bundling_policy',
+    attributionBasis: 'attribution_basis',
+    attributionWindowDays: 'attribution_window_days',
+    attributionMinAmount: 'attribution_min_amount',
+    attributionIncludeUnallocated: 'attribution_include_unallocated',
+    clawbackPolicy: 'clawback_policy',
   };
+  // Validated here rather than left to the column CHECK so a bad value is a
+  // 400 the operator can read, not a database error.
+  if ('eraBalancePolicy' in input
+      && !['strict', 'warn'].includes(String(input.eraBalancePolicy))) {
+    throw err("eraBalancePolicy must be 'strict' or 'warn'", 400);
+  }
+  if ('eraBalanceTolerance' in input) {
+    // The column is NOT NULL; a cleared form field means "no tolerance",
+    // which is zero, not null.
+    if (input.eraBalanceTolerance === '' || input.eraBalanceTolerance == null) {
+      input = { ...input, eraBalanceTolerance: 0 };
+    }
+    const tolerance = Number(input.eraBalanceTolerance);
+    if (!Number.isFinite(tolerance) || tolerance < 0 || tolerance > 100) {
+      throw err('eraBalanceTolerance must be between 0 and 100 dollars', 400);
+    }
+  }
+  // These four change what a recovered dollar means and therefore what a
+  // customer is invoiced, so a typo has to be a readable 400 rather than a
+  // constraint violation — or worse, a silently accepted null.
+  const enums: Array<[string, string[]]> = [
+    ['ncciBundlingPolicy', ['advisory', 'suppress_unappealable']],
+    ['attributionBasis', ['incremental_net', 'gross_post_appeal']],
+    ['clawbackPolicy', ['auto', 'flag_only']],
+  ];
+  for (const [key, allowed] of enums) {
+    if (key in input && !allowed.includes(String(input[key]))) {
+      throw err(`${key} must be one of ${allowed.join(', ')}`, 400);
+    }
+  }
+  if ('attributionWindowDays' in input) {
+    // Cleared means "no window", which is null — not zero, which would
+    // attribute nothing at all.
+    if (input.attributionWindowDays === '' || input.attributionWindowDays == null) {
+      input = { ...input, attributionWindowDays: null };
+    } else {
+      const days = Number(input.attributionWindowDays);
+      if (!Number.isInteger(days) || days < 1 || days > 3650) {
+        throw err('attributionWindowDays must be a whole number of days from 1 to 3650, '
+          + 'or blank for no window', 400);
+      }
+    }
+  }
+  if ('attributionMinAmount' in input) {
+    if (input.attributionMinAmount === '' || input.attributionMinAmount == null) {
+      input = { ...input, attributionMinAmount: 0 };
+    }
+    const min = Number(input.attributionMinAmount);
+    if (!Number.isFinite(min) || min < 0) {
+      throw err('attributionMinAmount must be zero or a positive dollar amount', 400);
+    }
+  }
+  if ('attributionIncludeUnallocated' in input) {
+    input = {
+      ...input,
+      attributionIncludeUnallocated:
+        input.attributionIncludeUnallocated === true
+        || input.attributionIncludeUnallocated === 'true',
+    };
+  }
+
   const sets: string[] = [];
   const params: unknown[] = [clientId, s.tenantId];
   for (const [key, col] of Object.entries(fields)) {
@@ -503,9 +593,20 @@ export async function upsertPayerConfig(
   input: { payerId: UUID; autopilot?: boolean; reviewThreshold?: number | null;
            minCaseThreshold?: number | null;
            timelyFilingDays?: number | null; appealDeadlineDays?: number | null;
-           portalUrl?: string | null },
+           portalUrl?: string | null; paymentReductionPercent?: number | null;
+           bundlingEditSource?: 'ncci' | 'proprietary' | null },
 ) {
   assertClientAccess(sess, s, clientId);
+  if (input.bundlingEditSource != null
+      && !['ncci', 'proprietary'].includes(String(input.bundlingEditSource))) {
+    throw err("bundlingEditSource must be 'ncci' or 'proprietary'", 400);
+  }
+  if (input.paymentReductionPercent != null) {
+    const pct = Number(input.paymentReductionPercent);
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+      throw err('paymentReductionPercent must be between 0 and 100', 400);
+    }
+  }
   await db.query(
     `INSERT INTO client_payer_config (tenant_id, client_id, payer_id, autopilot_enabled,
                                       review_threshold, min_case_threshold)
@@ -519,20 +620,26 @@ export async function upsertPayerConfig(
 
   // payer-level fields are editable only on tenant-owned payers
   if (input.timelyFilingDays !== undefined || input.appealDeadlineDays !== undefined
-      || input.portalUrl !== undefined) {
+      || input.portalUrl !== undefined || input.paymentReductionPercent !== undefined
+      || input.bundlingEditSource !== undefined) {
     const updated = await db.query(
       `UPDATE payer SET
          timely_filing_limit_days = COALESCE($2, timely_filing_limit_days),
          appeal_deadline_days = COALESCE($3, appeal_deadline_days),
-         portal_url = COALESCE($4, portal_url)
+         portal_url = COALESCE($4, portal_url),
+         payment_reduction_percent = COALESCE($6, payment_reduction_percent),
+         bundling_edit_source = COALESCE($7, bundling_edit_source)
        WHERE payer_id = $1 AND tenant_id = $5 RETURNING payer_id`,
       [input.payerId, input.timelyFilingDays ?? null, input.appealDeadlineDays ?? null,
-       input.portalUrl ?? null, s.tenantId]);
+       input.portalUrl ?? null, s.tenantId, input.paymentReductionPercent ?? null,
+       input.bundlingEditSource ?? null]);
     if (!updated.rows[0]) {
       const shared = await db.query(
         `SELECT 1 FROM payer WHERE payer_id = $1 AND tenant_id IS NULL`, [input.payerId]);
       if (shared.rows[0]) {
-        throw err('this payer is a shared master record — filing/deadline/portal fields are read-only', 409);
+        throw err(
+          'this payer is a shared master record — filing, deadline, portal, '
+          + 'payment-reduction and bundling-edit fields are read-only', 409);
       }
     }
   }
@@ -563,7 +670,7 @@ export async function createTenantPayer(
 export async function createContract(
   pool: PoolLike, sess: Session, s: Scope, clientId: UUID,
   input: { payerId: UUID; effectiveDate: string; expirationDate?: string | null;
-           feeScheduleType: string;
+           feeScheduleType: string; applyLesserOfBilled?: boolean;
            lines?: Array<{ procedureCode: string; modifier?: string | null;
                            allowedAmount?: number | null; percentOfMedicare?: number | null }> },
 ) {
@@ -581,10 +688,14 @@ export async function createContract(
     const d = validation.normalized;
     const inserted = await db.query(
       `INSERT INTO contract (tenant_id, client_id, payer_id, effective_date, expiration_date,
-                             fee_schedule_type, status, validation_report)
-       VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7) RETURNING contract_id`,
+                             fee_schedule_type, status, validation_report,
+                             apply_lesser_of_billed)
+       VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8) RETURNING contract_id`,
       [s.tenantId, clientId, d.payerId, d.effectiveDate,
-       d.expirationDate ?? null, d.feeScheduleType, JSON.stringify(validation.issues)]);
+       d.expirationDate ?? null, d.feeScheduleType, JSON.stringify(validation.issues),
+       // The near-universal term. Turned off only for a contract that really
+       // does pay the schedule regardless of the charge.
+       input.applyLesserOfBilled !== false]);
     const contractId: UUID = inserted.rows[0].contract_id;
     for (const l of d.lines) {
       await db.query(
@@ -961,6 +1072,12 @@ export async function revokeSftpCredentials(
 // BILLING & SUBSCRIPTION
 // ============================================================================
 
+/**
+ * Legacy self-serve tiers. Retained only so an existing tenant's
+ * subscription_tier still renders; the amount actually invoiced comes from the
+ * tenant's pricing_plan (see web/billing.ts), because recovery work is sold on
+ * contingency and a fixed per-case table cannot express that.
+ */
 export const PLAN_PRICING: Record<string, { base: number; perCase: number }> = {
   standard: { base: 499, perCase: 4 },
   professional: { base: 1499, perCase: 3 },
@@ -983,9 +1100,14 @@ export async function billingSummary(db: Queryable, sess: Session, s: Scope, cli
         WHERE rc.client_id = $1 AND pe.payment_date >= date_trunc('month', now())) AS recovered`,
     [clientId]);
   const invoices = await db.query(
-    `SELECT invoice_id, period_start, period_end, plan, claims_processed, cases_created,
-            amount_recovered, amount_due, status
+    `SELECT invoice_id, invoice_number, period_start, period_end, plan,
+            claims_processed, cases_created, amount_recovered, attributed_recovery,
+            base_fee, case_fee_total, contingency_percent, contingency_fee,
+            amount_due, status, issued_at
      FROM invoice WHERE client_id = $1 ORDER BY period_start DESC LIMIT 24`, [clientId]);
+  const { resolvePricingPlan } = await import('./billing.ts');
+  const pricingPlan = await resolvePricingPlan(
+    db, s.tenantId, clientId, new Date().toISOString().slice(0, 10));
   const tier = plan.rows[0]?.subscription_tier ?? 'standard';
   return {
     plan: tier,
@@ -997,55 +1119,26 @@ export async function billingSummary(db: Queryable, sess: Session, s: Scope, cli
       casesCreated: usage.rows[0].cases,
       amountRecovered: r2(num(usage.rows[0].recovered)),
     },
+    // The agreed commercial terms. Null means no plan is on file for this
+    // client, and an invoice generated now would bill nothing but usage.
+    pricingPlan,
     invoices: invoices.rows.map((i) => ({
-      invoiceId: i.invoice_id, periodStart: iso(i.period_start), periodEnd: iso(i.period_end),
+      invoiceId: i.invoice_id, invoiceNumber: i.invoice_number,
+      periodStart: iso(i.period_start), periodEnd: iso(i.period_end),
       plan: i.plan, claimsProcessed: i.claims_processed, casesCreated: i.cases_created,
-      amountRecovered: r2(num(i.amount_recovered)), amountDue: r2(num(i.amount_due)),
-      status: i.status,
+      amountRecovered: r2(num(i.amount_recovered)),
+      attributedRecovery: r2(num(i.attributed_recovery)),
+      baseFee: r2(num(i.base_fee)), caseFeeTotal: r2(num(i.case_fee_total)),
+      contingencyPercent: num(i.contingency_percent),
+      contingencyFee: r2(num(i.contingency_fee)),
+      amountDue: r2(num(i.amount_due)),
+      status: i.status, issuedAt: i.issued_at,
     })),
   };
 }
 
-export async function generateInvoice(
-  db: Queryable, sess: Session, s: Scope, clientId: UUID, month: string, // 'YYYY-MM'
-) {
-  requireAnyAdmin(sess);
-  assertClientAccess(sess, s, clientId);
-  if (!/^\d{4}-\d{2}$/.test(month)) throw err('month must be YYYY-MM', 400);
-  const start = `${month}-01`;
-  const plan = await db.query(
-    `SELECT t.subscription_tier FROM client c JOIN tenant t ON t.tenant_id = c.tenant_id
-     WHERE c.client_id = $1`, [clientId]);
-  const tier = plan.rows[0]?.subscription_tier ?? 'standard';
-  const pricing = PLAN_PRICING[tier] ?? PLAN_PRICING.standard;
-
-  const usage = await db.query(
-    `SELECT
-       (SELECT count(*)::int FROM claim WHERE client_id = $1
-        AND created_at >= $2::date AND created_at < $2::date + interval '1 month') AS claims,
-       (SELECT count(*)::int FROM recovery_case WHERE client_id = $1
-        AND created_at >= $2::date AND created_at < $2::date + interval '1 month') AS cases,
-       (SELECT COALESCE(sum(pe.amount_recovered), 0) FROM payment_event pe
-        JOIN recovery_case rc ON rc.case_id = pe.case_id
-        WHERE rc.client_id = $1 AND pe.payment_date >= $2::date
-          AND pe.payment_date < $2::date + interval '1 month') AS recovered`,
-    [clientId, start]);
-  const u = usage.rows[0];
-  const amountDue = r2(pricing.base + u.cases * pricing.perCase);
-
-  const inserted = await db.query(
-    `INSERT INTO invoice (tenant_id, client_id, period_start, period_end, plan,
-                          claims_processed, cases_created, amount_recovered, amount_due)
-     VALUES ($1, $2, $3::date, ($3::date + interval '1 month' - interval '1 day')::date,
-             $4, $5, $6, $7, $8)
-     ON CONFLICT (client_id, period_start) DO UPDATE SET
-       claims_processed = $5, cases_created = $6, amount_recovered = $7, amount_due = $8
-     RETURNING invoice_id`,
-    [s.tenantId, clientId, start, tier, u.claims, u.cases, num(u.recovered), amountDue]);
-  await adminAudit(db, sess, 'invoice_generated', 'invoice', inserted.rows[0].invoice_id,
-    { clientId, month, amountDue });
-  return { ok: true, invoiceId: inserted.rows[0].invoice_id, amountDue };
-}
+// generateInvoice moved to web/billing.ts, where the contingency terms, the
+// per-recovery invoice lines and the issued-invoice immutability rules live.
 
 export async function changePlan(db: Queryable, sess: Session, s: Scope, tier: string) {
   requireTenantAdmin(sess);

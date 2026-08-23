@@ -33,15 +33,29 @@ facts or missing documentation.
 
 1. Create the tenant and client; require admin MFA and acknowledge the BAA.
 2. Restrict users to named pilot participants and the pilot client.
-3. Configure payer IDs/deadlines and leave autopilot disabled.
+3. Configure payer IDs/deadlines and leave autopilot disabled. Set
+   `payment_reduction_percent` to 2.000 on any Medicare or Medicare Advantage
+   payer in scope — sequestration is withheld from every payment and is not an
+   underpayment. Confirm whether each contract pays the lesser of billed
+   charges or the schedule regardless, and set `apply_lesser_of_billed` to
+   match; the default (lesser-of) is the near-universal term.
+3a. Establish for each payer in scope whether the pilot data includes secondary
+   claims. If it does, the 837 must carry SBR01 and the COB payer-paid amount
+   (`AMT*D`, or `SVD02` per line) — without them expected payer liability falls
+   back to the remit's OA-23, and to the full allowed amount if there is none.
 4. Import/version external references and set the client CMS locality only if
    percent-of-Medicare pricing is in scope.
 5. Enter the contract as structured lines, resolve every validation error,
    have the customer contract owner compare a sample to the signed document,
    then activate it. Draft/rejected contracts never price claims.
-6. Preview each EDI file. Structural/version errors stop ingestion. Preserve
-   the source files and hashes outside FableAgent under the agreed retention
-   policy.
+6. Preview each EDI file. Structural/version errors stop ingestion, and so
+   does an 835 that does not satisfy the X12 balancing rules — take an
+   out-of-balance check back to the trading partner rather than relaxing the
+   policy, and set a per-client tolerance only for a rounding quirk you have
+   documented. Confirm with the customer what any provider-level adjustments
+   (PLB recoupments, forwarding balances, interest) in the sample represent
+   before treating the check totals as understood. Preserve the source files
+   and hashes outside FableAgent under the agreed retention policy.
 7. Run `npm run benchmark:pilot` as a technical smoke test. It is synthetic
    and must never be shown as customer recovery evidence.
 
