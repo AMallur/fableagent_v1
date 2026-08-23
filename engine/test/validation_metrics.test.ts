@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { describe, it } from 'node:test';
 import { calculateValidationMetrics, type ValidationInput } from '../src/pilot/validation_metrics.ts';
 
@@ -129,5 +130,15 @@ describe('external validation metrics', () => {
       patientName: 'not allowed',
     } as unknown as ValidationInput;
     assert.throws(() => calculateValidationMetrics(extraField), /patientName is not allowed/);
+  });
+
+  it('keeps the published de-identified example executable', async () => {
+    const url = new URL('../../docs/examples/external_validation.example.json', import.meta.url);
+    const example = JSON.parse(await readFile(url, 'utf8')) as ValidationInput;
+    const metrics = calculateValidationMetrics(example);
+    assert.equal(metrics.studyId, 'pilot-001');
+    assert.equal(metrics.precision, 0.5);
+    assert.equal(metrics.excluded, 1);
+    assert.equal(metrics.recall, null);
   });
 });
