@@ -19,6 +19,7 @@
     "scheduler": "node src/cli.ts schedule",
     "test:sftp": "node --test test/sftp_integration.test.ts",
     "benchmark:pilot": "node scripts/run_pilot_benchmark.ts",
+    "validation:external": "node scripts/run_external_validation.ts",
     "evidence:manifest": "node scripts/build_evidence_manifest.ts"
   },
   "dependencies": {
