@@ -140,8 +140,8 @@ describe('usage ledger and attribution policy',
         `INSERT INTO tenant (tenant_id, tenant_name, tenant_type)
          VALUES ($1,'Ledger Tenant','billing_company')`, [T]);
       await pool.query(
-        `INSERT INTO client (client_id, tenant_id, client_name, npi_group, subscription_status)
-         VALUES ($1,$2,'Ledger Group','1234567890','active')`, [C, T]);
+        `INSERT INTO client (client_id, tenant_id, client_name, npi_group, subscription_status, operating_mode)
+         VALUES ($1,$2,'Ledger Group','1234567890','active','live')`, [C, T]);
       await pool.query(
         `INSERT INTO app_user (user_id, tenant_id, email, first_name, last_name, role, password_hash)
          VALUES ($1,$2,'admin@ledger.test','A','Dmin','tenant_admin','x')`, [U, T]);
@@ -152,6 +152,9 @@ describe('usage ledger and attribution policy',
         `INSERT INTO pricing_plan (tenant_id, client_id, plan_name, effective_date,
                                    contingency_percent)
          VALUES ($1,$2,'Contingency only','2026-01-01',20)`, [T, C]);
+      await pool.query(
+        `UPDATE pricing_plan SET agreement_reference = 'MSA-TEST-001',
+           agreement_executed_on = '2026-01-01' WHERE tenant_id = $1`, [T]);
       await pool.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [T]);
     });
 

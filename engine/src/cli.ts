@@ -23,7 +23,7 @@ import path from 'node:path';
 const [command, ...rest] = process.argv.slice(2);
 const COMMANDS = ['detect', 'appeals', 'queue', 'ingest-835', 'ingest-837',
   'schedule', 'nightly', 'monitor', 'reconcile', 'reconcile-deliveries', 'weekly',
-  'sftp-server', 'create-tenant', 'reference-import'];
+  'sftp-server', 'create-tenant', 'reference-import', 'preflight'];
 
 if (!command || !COMMANDS.includes(command)) {
   console.error(`usage: node src/cli.ts <${COMMANDS.join('|')}> --tenant <uuid> [options]`);
@@ -267,6 +267,33 @@ try {
         tenantId: values.tenant, clientId: values.client, asOf: values['as-of'],
       });
       console.log(JSON.stringify(out, null, 2));
+      break;
+    }
+
+    case 'preflight': {
+      // Exits non-zero when a blocking check fails, so a deployment pipeline
+      // or a runbook step can gate on it rather than on somebody reading it.
+      if (!values.client) { console.error('preflight: --client required'); process.exit(2); }
+      const { assessGoLive } = await import('./integration/golive.ts');
+      const report = await assessGoLive(runtimePool, values.tenant, values.client);
+
+      if (values.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        const mark = (c: { status: string; severity: string }) =>
+          (c.status === 'pass' ? 'PASS' : c.severity === 'block' ? 'BLOCK' : c.severity.toUpperCase());
+        console.log(`\n${report.clientName} — currently ${report.operatingMode}\n`);
+        let group = '';
+        for (const c of report.checks) {
+          if (c.group !== group) { group = c.group; console.log(`  [${group.replace(/_/g, ' ')}]`); }
+          console.log(`    ${mark(c).padEnd(5)}  ${c.title}: ${c.detail}`);
+          if (c.remedy) console.log(`           → ${c.remedy}`);
+        }
+        console.log(
+          `\n  ${report.cleared ? 'CLEARED for live operation' : 'NOT CLEARED'}`
+          + ` — ${report.blockingFailures} blocking, ${report.warnings} warning(s)\n`);
+      }
+      if (!report.cleared) process.exit(1);
       break;
     }
   }

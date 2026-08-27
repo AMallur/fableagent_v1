@@ -490,10 +490,30 @@ export async function issueInvoice(
 ) {
   requireTenantAdmin(sess);
   const row = await db.query(
-    `SELECT client_id, status, period_start FROM invoice
-     WHERE invoice_id = $1 AND tenant_id = $2`, [invoiceId, s.tenantId]);
+    `SELECT i.client_id, i.status, i.period_start, i.pricing_plan_id, i.amount_due,
+            c.operating_mode, c.client_name,
+            pp.agreement_reference
+     FROM invoice i
+     JOIN client c ON c.tenant_id = i.tenant_id AND c.client_id = i.client_id
+     LEFT JOIN pricing_plan pp ON pp.pricing_plan_id = i.pricing_plan_id
+     WHERE i.invoice_id = $1 AND i.tenant_id = $2`, [invoiceId, s.tenantId]);
   if (!row.rows[0]) throw err('invoice not found', 404);
   assertClientAccess(sess, s, row.rows[0].client_id);
+
+  // Two commercial gates, both deliberately at ISSUE rather than at generate:
+  // computing what a bill would be is useful during a pilot, but sending one
+  // is the irreversible act.
+  if (row.rows[0].operating_mode !== 'live') {
+    throw err(
+      `${row.rows[0].client_name} is in shadow mode; an invoice cannot be issued until the `
+      + 'client is cleared for live operation', 409);
+  }
+  if (Number(row.rows[0].amount_due) > 0 && !row.rows[0].agreement_reference) {
+    throw err(
+      'the pricing plan behind this invoice names no executed agreement; record the order '
+      + 'form or amendment reference before charging against recovered cash', 409);
+  }
+
   if (row.rows[0].status !== 'draft') {
     throw err(`invoice is already ${row.rows[0].status}`, 409);
   }

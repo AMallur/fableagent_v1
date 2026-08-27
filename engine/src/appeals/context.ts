@@ -48,7 +48,13 @@ export async function loadAppealContexts(
             pr.name AS provider_name, pr.npi_individual,
             draft.packet_id AS draft_packet_id,
             COALESCE(pkts.n, 0) AS prior_packet_count,
-            COALESCE(cpc.autopilot_enabled, false) AS autopilot_enabled,
+            -- Shadow mode overrides autopilot entirely. A client in shadow
+            -- has packets prepared for review but nothing is ever transmitted
+            -- to a payer, which is the whole point of the posture: the first
+            -- weeks of an engagement are for comparing findings against the
+            -- provider's own billers, not for irreversible action.
+            (COALESCE(cpc.autopilot_enabled, false)
+             AND app.client_is_live(c.tenant_id, c.client_id)) AS autopilot_enabled,
             COALESCE(hist.n, 0) AS prior_category_case_count
      FROM recovery_case rc
      JOIN client c    ON c.client_id = rc.client_id
