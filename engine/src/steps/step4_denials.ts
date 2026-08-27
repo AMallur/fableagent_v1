@@ -63,22 +63,54 @@ function recoveryAmount(
   return round2(Math.max(0, basis - paid));
 }
 
+/**
+ * Was a sibling line on this claim paid?
+ *
+ * A CO-97 asserts the service is included in the payment for another one, so
+ * the answer decides whether the denial is a bundling case at all — and
+ * therefore whether the CMS NCCI tables are ever consulted.
+ *
+ * `claim_line.paid_amount` alone is not enough. It is the state of the
+ * database BEFORE this run, and a single 835 normally adjudicates the whole
+ * claim: it pays line 1 and denies line 2 in the same file. Reading only the
+ * stored amount meant that on the first pass no sibling looked paid, the
+ * denial classified as plain coding, and the edit tables were never opened.
+ * So this run's own matched remittance lines count too.
+ */
+function paidSiblingCodes(
+  claim: MatchedLine['claim'], claimLine: MatchedLine['claimLine'],
+  matchedLines: MatchedLine[],
+): string[] {
+  const codes = new Set<string>();
+  for (const m of matchedLines) {
+    if (m.claim.claimId !== claim.claimId) continue;
+    if (m.claimLine.claimLineId === claimLine.claimLineId) continue;
+    // A reversal carries a negative amount and takes cash back; it is not
+    // evidence that a sibling was paid.
+    if (m.remitLine.isReversal) continue;
+    if ((m.remitLine.paidAmount ?? 0) > 0) codes.add(m.claimLine.procedureCode);
+  }
+  for (const l of claim.lines) {
+    if (l.claimLineId === claimLine.claimLineId) continue;
+    if ((l.paidAmount ?? 0) > 0) codes.add(l.procedureCode);
+  }
+  return [...codes];
+}
+
 export function candidatesFromDenials(
-  input: EngineInput, routes: DenialRoute[],
+  input: EngineInput, routes: DenialRoute[], matchedLines: MatchedLine[] = [],
 ): CaseCandidate[] {
   return routes.map((route) => {
     const { matched, pricing, normalizedCode } = route;
     const { claim, claimLine, remitLine } = matched;
-    const siblingLinePaid = claim.lines.some(
-      (l) => l.claimLineId !== claimLine.claimLineId && (l.paidAmount ?? 0) > 0,
-    ) || false;
-    const cls = classifyDenial(normalizedCode, { siblingLinePaid });
+    const siblingCodes = paidSiblingCodes(claim, claimLine, matchedLines);
+    const cls = classifyDenial(normalizedCode, { siblingLinePaid: siblingCodes.length > 0 });
     const paid = remitLine.paidAmount ?? claimLine.paidAmount ?? 0;
 
     // A bundling denial is the one denial where the payer's own rulebook is
     // public. Consult it before telling a biller to go and appeal.
     const ncci = cls.category === 'bundling'
-      ? evaluateNcci(input, claim, claimLine) : undefined;
+      ? evaluateNcci(input, claim, claimLine, siblingCodes) : undefined;
     const policy = input.ncciBundlingPolicyByClient?.[claim.clientId] ?? 'advisory';
     const suppressed = ncci?.finding === 'never_separately_payable'
       && policy === 'suppress_unappealable';

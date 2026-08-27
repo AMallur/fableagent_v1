@@ -24,6 +24,7 @@ import {
   adminAudit, assertClientAccess, err, requireAnyAdmin, requireTenantAdmin,
 } from './admin_api.ts';
 import { clientLedger, invoiceLedger, syncUsageLedger } from './usage_ledger.ts';
+import { canTransact, withTenantTransaction, type Connectable } from '../db/tx.ts';
 
 const r2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100;
 const num = (v: unknown): number => (v == null ? 0 : Number(v));
@@ -127,6 +128,23 @@ export interface PricingPlanInput {
 }
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const DATE_MONTH = /^\d{4}-\d{2}$/;
+
+/**
+ * Run a money-moving sequence atomically.
+ *
+ * Every production caller passes a real pool, so the transaction is real. A
+ * few tests and internal callers hand in a bare Queryable; rather than fail
+ * closed on them, this degrades to running the body directly — which is what
+ * the code did before transactions existed. The distinction is explicit here
+ * so nobody mistakes the fallback for the guarantee.
+ */
+async function inTenantTransaction<T>(
+  db: Queryable, tenantId: UUID, fn: (tx: Queryable) => Promise<T>,
+): Promise<T> {
+  if (canTransact(db)) return withTenantTransaction(db as Connectable, tenantId, fn);
+  return fn(db);
+}
 
 export async function createPricingPlan(
   db: Queryable, sess: Session, s: Scope, input: PricingPlanInput,
@@ -362,13 +380,19 @@ async function computeInvoice(
  * Create or refresh the DRAFT invoice for a month. An invoice that has already
  * been issued is never touched — the database enforces that too; this is the
  * readable error rather than a trigger exception.
+ *
+ * Every write runs in ONE transaction. Releasing this draft's ledger rows and
+ * re-claiming them are two halves of a single act: a failure in between would
+ * leave the invoice asserting totals for recoveries the ledger shows as
+ * unbilled, and the next period would bill the customer for them a second
+ * time. That is the one outcome a bill-once ledger may never produce.
  */
 export async function generateInvoice(
   db: Queryable, sess: Session, s: Scope, clientId: UUID, month: string,
 ) {
   requireAnyAdmin(sess);
   assertClientAccess(sess, s, clientId);
-  if (!/^\d{4}-\d{2}$/.test(month)) throw err('month must be YYYY-MM', 400);
+  if (!DATE_MONTH.test(month)) throw err('month must be YYYY-MM', 400);
   const periodStart = `${month}-01`;
 
   // A voided invoice is history, not an obstacle: the period is re-invoiceable
@@ -390,55 +414,66 @@ export async function generateInvoice(
   const draftId: UUID | null = existing.rows[0]?.invoice_id ?? null;
   const computed = await computeInvoice(db, s.tenantId, clientId, month, draftId);
 
-  const invoiceId: UUID = existing.rows[0]?.invoice_id ?? (await db.query(
-    `INSERT INTO invoice (tenant_id, client_id, period_start, period_end, plan, status)
-     VALUES ($1, $2, $3::date, $4::date, $5, 'draft') RETURNING invoice_id`,
-    [s.tenantId, clientId, computed.periodStart, computed.periodEnd,
-     computed.plan?.planName ?? 'unpriced'])).rows[0].invoice_id;
+  const invoiceId: UUID = await inTenantTransaction(db, s.tenantId, async (tx) => {
+    const id: UUID = draftId ?? (await tx.query(
+      `INSERT INTO invoice (tenant_id, client_id, period_start, period_end, plan, status)
+       VALUES ($1, $2, $3::date, $4::date, $5, 'draft') RETURNING invoice_id`,
+      [s.tenantId, clientId, computed.periodStart, computed.periodEnd,
+       computed.plan?.planName ?? 'unpriced'])).rows[0].invoice_id;
 
-  await db.query(
-    `UPDATE invoice SET
-       period_end = $2::date, plan = $3, pricing_plan_id = $4,
-       claims_processed = $5, cases_created = $6, amount_recovered = $7,
-       attributed_recovery = $8, base_fee = $9, case_fee_total = $10,
-       contingency_percent = $11, contingency_fee = $12,
-       minimum_applied = $13, maximum_applied = $14, amount_due = $15
-     WHERE invoice_id = $1`,
-    [invoiceId, computed.periodEnd, computed.plan?.planName ?? 'unpriced',
-     computed.plan?.pricingPlanId ?? null,
-     computed.claimsProcessed, computed.casesCreated, computed.amountRecovered,
-     computed.attributedRecovery, computed.baseFee, computed.caseFeeTotal,
-     computed.contingencyPercent, computed.contingencyFee,
-     computed.minimumApplied, computed.maximumApplied, computed.amountDue]);
+    await tx.query(
+      `UPDATE invoice SET
+         period_end = $2::date, plan = $3, pricing_plan_id = $4,
+         claims_processed = $5, cases_created = $6, amount_recovered = $7,
+         attributed_recovery = $8, base_fee = $9, case_fee_total = $10,
+         contingency_percent = $11, contingency_fee = $12,
+         minimum_applied = $13, maximum_applied = $14, amount_due = $15
+       WHERE invoice_id = $1`,
+      [id, computed.periodEnd, computed.plan?.planName ?? 'unpriced',
+       computed.plan?.pricingPlanId ?? null,
+       computed.claimsProcessed, computed.casesCreated, computed.amountRecovered,
+       computed.attributedRecovery, computed.baseFee, computed.caseFeeTotal,
+       computed.contingencyPercent, computed.contingencyFee,
+       computed.minimumApplied, computed.maximumApplied, computed.amountDue]);
 
-  // Rebuild the draft's lines from scratch. Releasing everything it held
-  // first means a recovery that is no longer billable — its event superseded,
-  // its period moved — is let go rather than left claimed by an invoice that
-  // no longer charges for it.
-  await db.query(`DELETE FROM invoice_line WHERE invoice_id = $1`, [invoiceId]);
-  await db.query(
-    `UPDATE usage_event SET invoice_id = NULL WHERE invoice_id = $1 AND tenant_id = $2`,
-    [invoiceId, s.tenantId]);
+    // Rebuild the draft's lines from scratch. Releasing everything it held
+    // first means a recovery that is no longer billable — its event
+    // superseded, its period moved — is let go rather than left claimed by an
+    // invoice that no longer charges for it.
+    await tx.query(`DELETE FROM invoice_line WHERE invoice_id = $1`, [id]);
+    await tx.query(
+      `UPDATE usage_event SET invoice_id = NULL WHERE invoice_id = $1 AND tenant_id = $2`,
+      [id, s.tenantId]);
 
-  for (const line of computed.lines) {
-    // Claim the ledger row for this invoice. The database refuses to move a
-    // row that another invoice already holds, so two overlapping generations
-    // cannot bill the same recovery twice.
-    await db.query(
-      `UPDATE usage_event SET invoice_id = $1
-       WHERE usage_event_id = $2 AND tenant_id = $3 AND invoice_id IS NULL`,
-      [invoiceId, line.usageEventId, s.tenantId]);
-    await db.query(
-      `INSERT INTO invoice_line
-         (tenant_id, invoice_id, usage_event_id, payment_event_id, case_id, claim_id,
-          claim_number, payer_name, payment_date, amount_recovered,
-          contingency_percent, fee, attribution_basis)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10,$11,$12,$13)`,
-      [s.tenantId, invoiceId, line.usageEventId, line.paymentEventId, line.caseId,
-       line.claimId, line.claimNumber, line.payerName, line.paymentDate,
-       line.amountRecovered, computed.contingencyPercent, line.fee,
-       line.attributionBasis]);
-  }
+    for (const line of computed.lines) {
+      // Claim the ledger row for this invoice. The database refuses to move a
+      // row another invoice already holds, so two overlapping generations
+      // cannot bill the same recovery twice.
+      const claimed = await tx.query(
+        `UPDATE usage_event SET invoice_id = $1
+         WHERE usage_event_id = $2 AND tenant_id = $3 AND invoice_id IS NULL
+         RETURNING usage_event_id`,
+        [id, line.usageEventId, s.tenantId]);
+      if (claimed.rows.length === 0) {
+        // Another invoice took it between the read and the write. Abort the
+        // whole bill rather than issue one that silently omits a line.
+        throw err(
+          `recovery ${line.usageEventId} was claimed by another invoice while this `
+          + 'one was being generated; regenerate to pick up the current position', 409);
+      }
+      await tx.query(
+        `INSERT INTO invoice_line
+           (tenant_id, invoice_id, usage_event_id, payment_event_id, case_id, claim_id,
+            claim_number, payer_name, payment_date, amount_recovered,
+            contingency_percent, fee, attribution_basis)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10,$11,$12,$13)`,
+        [s.tenantId, id, line.usageEventId, line.paymentEventId, line.caseId,
+         line.claimId, line.claimNumber, line.payerName, line.paymentDate,
+         line.amountRecovered, computed.contingencyPercent, line.fee,
+         line.attributionBasis]);
+    }
+    return id;
+  });
 
   await adminAudit(db, sess, 'invoice_generated', 'invoice', invoiceId, {
     clientId, month, amountDue: computed.amountDue,
@@ -463,15 +498,20 @@ export async function issueInvoice(
     throw err(`invoice is already ${row.rows[0].status}`, 409);
   }
 
-  const seq = await db.query(
-    `SELECT count(*)::int + 1 AS n FROM invoice
-     WHERE tenant_id = $1 AND invoice_number IS NOT NULL`, [s.tenantId]);
-  const invoiceNumber = `INV-${String(iso(row.rows[0].period_start)).slice(0, 7).replace('-', '')}`
-    + `-${String(seq.rows[0].n).padStart(5, '0')}`;
-
-  await db.query(
-    `UPDATE invoice SET status = 'issued', issued_at = now(), invoice_number = $2
-     WHERE invoice_id = $1`, [invoiceId, invoiceNumber]);
+  // Reading the sequence and consuming it must not be separable: two issues
+  // racing would otherwise compute the same number, and the unique index would
+  // reject one of them after its status had already moved to issued.
+  const invoiceNumber: string = await inTenantTransaction(db, s.tenantId, async (tx) => {
+    const seq = await tx.query(
+      `SELECT count(*)::int + 1 AS n FROM invoice
+       WHERE tenant_id = $1 AND invoice_number IS NOT NULL`, [s.tenantId]);
+    const number = `INV-${String(iso(row.rows[0].period_start)).slice(0, 7).replace('-', '')}`
+      + `-${String(seq.rows[0].n).padStart(5, '0')}`;
+    await tx.query(
+      `UPDATE invoice SET status = 'issued', issued_at = now(), invoice_number = $2
+       WHERE invoice_id = $1`, [invoiceId, number]);
+    return number;
+  });
   await adminAudit(db, sess, 'invoice_issued', 'invoice', invoiceId, { invoiceNumber });
   return { ok: true as const, invoiceId, invoiceNumber };
 }
@@ -490,17 +530,24 @@ export async function voidInvoice(
   assertClientAccess(sess, s, row.rows[0].client_id);
   if (row.rows[0].status === 'void') throw err('invoice is already void', 409);
 
-  await db.query(
-    `UPDATE invoice SET status = 'void', voided_at = now(), voided_reason = $2
-     WHERE invoice_id = $1`, [invoiceId, reason.trim()]);
-  // The invoice row keeps its frozen totals as the record of what was charged;
-  // its LINES go, and the ledger rows they held are released so a corrected
-  // invoice can bill the same recoveries. The ledger itself is untouched —
-  // nothing that happened stops having happened because a bill was wrong.
-  await db.query(`DELETE FROM invoice_line WHERE invoice_id = $1`, [invoiceId]);
-  await db.query(
-    `UPDATE usage_event SET invoice_id = NULL WHERE invoice_id = $1 AND tenant_id = $2`,
-    [invoiceId, s.tenantId]);
+  // One transaction: voiding the bill and releasing what it held are the same
+  // act. Half of it would leave recoveries claimed by a dead invoice and so
+  // permanently unbillable — the mirror image of double-billing, and just as
+  // wrong.
+  await inTenantTransaction(db, s.tenantId, async (tx) => {
+    await tx.query(
+      `UPDATE invoice SET status = 'void', voided_at = now(), voided_reason = $2
+       WHERE invoice_id = $1`, [invoiceId, reason.trim()]);
+    // The invoice row keeps its frozen totals as the record of what was
+    // charged; its LINES go, and the ledger rows they held are released so a
+    // corrected invoice can bill the same recoveries. The ledger itself is
+    // untouched — nothing that happened stops having happened because a bill
+    // was wrong.
+    await tx.query(`DELETE FROM invoice_line WHERE invoice_id = $1`, [invoiceId]);
+    await tx.query(
+      `UPDATE usage_event SET invoice_id = NULL WHERE invoice_id = $1 AND tenant_id = $2`,
+      [invoiceId, s.tenantId]);
+  });
   await adminAudit(db, sess, 'invoice_voided', 'invoice', invoiceId, { reason: reason.trim() });
   return { ok: true as const, invoiceId };
 }

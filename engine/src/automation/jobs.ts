@@ -374,12 +374,25 @@ const ATTRIBUTION_SCOPE = `
  * Payment landing a year after an appeal went out is rarely that appeal's
  * doing, and billing a contingency on it is the kind of thing a customer
  * audits and then disputes. attribution_window_days is how long after
- * submission a remittance still counts; NULL (the default) is the previous
- * behavior of no limit at all, so no existing client's numbers move.
+ * submission a remittance still counts; NULL (the default) is no limit at all,
+ * so a client who has not set one sees no change.
+ *
+ * Measured against the payer's CHECK DATE, not our ingestion timestamp. The
+ * window is a commercial term about when the money actually moved, and
+ * created_at only records when we happened to load the file — so a client
+ * backfilling a year of remittances would stamp them all with today and
+ * defeat the window entirely, while a file loaded late would push a timely
+ * payment out of range. check_date is the real-world fact; created_at is the
+ * documented fallback for the rare 835 that omits BPR16.
+ *
+ * Note the asymmetry with the post-appeal test above, which deliberately stays
+ * on created_at: "did this arrive after we appealed" is a question about our
+ * knowledge, and a payer can legitimately cut a check dated before an appeal
+ * that we only receive afterwards.
  */
 const WITHIN_WINDOW = `(cli.attribution_window_days IS NULL
-  OR $ALIAS.created_at <= ap.submitted_at
-       + make_interval(days => cli.attribution_window_days))`;
+  OR COALESCE($ALIAS.check_date, $ALIAS.created_at::date)
+       <= (ap.submitted_at + make_interval(days => cli.attribution_window_days))::date)`;
 const withinWindow = (alias: string) => WITHIN_WINDOW.replaceAll('$ALIAS', alias);
 
 async function reconcilePaymentsInner(
