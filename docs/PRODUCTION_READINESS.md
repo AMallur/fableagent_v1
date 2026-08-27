@@ -31,6 +31,29 @@ Automated gates prove implementation properties for the tested release. They
 do not create customer validation, HIPAA attestation, trading-partner
 certification, or recovered-revenue evidence.
 
+## The go-live gate is executable
+
+Before a client processes anything in live operation, run:
+
+```sh
+node src/cli.ts preflight --client <client-id>
+```
+
+It composes the deployment's own runtime readiness with the per-client
+commercial and clinical prerequisites — executed agreement behind the pricing
+plan, an attribution basis matching what the customer signed, approved
+contracts, payer activation, reference-data currency — and **exits non-zero
+while anything blocking fails**, so a runbook or pipeline can gate on it rather
+than on somebody reading a checklist. Every failing check names its remedy, and
+each run is recorded in `go_live_check` as evidence of what was true when
+somebody pressed the button.
+
+New clients start in **shadow mode**: the platform ingests, detects, prices and
+prepares appeal packets, and transmits nothing to any payer while no invoice can
+be issued. That is the intended posture for a first engagement — see
+`commercial/pilot_protocol.md`. Moving to live requires a clean preflight and is
+recorded against the approver.
+
 ## Required external gates
 
 These cannot be supplied by source code and must be completed for each live

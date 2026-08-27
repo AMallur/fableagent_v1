@@ -290,6 +290,7 @@ export const CLIENT_ADMIN_BODY = `
       agreement, not to make a number look better &mdash; every setting here is
       reproduced on the invoice.</div>
     <button class="btn primary" id="save-profile">Save profile</button>
+    <div id="golive-panel" style="margin-top:14px"></div>
     <div id="sub-panel" style="margin-top:14px"></div>
   </div>
   <div class="panel"><h2>Payer configuration</h2>
@@ -368,6 +369,59 @@ async function load() {
   $$('#profile [data-f]').forEach((el) => {
     if (el.type === 'checkbox') el.checked = c[el.dataset.f] === true;
     else el.value = c[el.dataset.f] ?? '';
+  });
+
+  const modeBadge = c.operatingMode === 'live'
+    ? '<span class="pill" style="background:#e2eee5;color:#2c6142">Live</span>'
+    : '<span class="pill" style="background:#f6edd8;color:#7e5a0c">Shadow &mdash; nothing is transmitted or billed</span>';
+  $('#golive-panel').innerHTML = '<h2>Operating mode</h2>' +
+    '<div class="filters" style="align-items:center">' + modeBadge +
+    '<button class="btn small" id="golive-check">Run go-live preflight</button>' +
+    (c.operatingMode === 'live'
+      ? '<button class="btn small danger" id="golive-stop">Return to shadow</button>'
+      : '<button class="btn small primary" id="golive-start">Go live</button>') +
+    '</div>' +
+    (c.goLiveAt ? '<div class="sub">Live since ' + fmtDate(c.goLiveAt) + '</div>' : '') +
+    '<div id="golive-out" style="margin-top:8px"></div>';
+
+  const renderPreflight = (r) => {
+    const icon = (x) => x.status === 'pass' ? '<span style="color:#2c6142">PASS</span>'
+      : x.severity === 'block' ? '<span class="deadline-red"><b>BLOCK</b></span>'
+      : '<span style="color:#7e5a0c">' + x.severity.toUpperCase() + '</span>';
+    return '<div class="sub" style="margin-bottom:6px">' +
+      (r.cleared ? '<b style="color:#2c6142">Cleared for live operation</b>'
+                 : '<b class="deadline-red">Not cleared</b>') +
+      ' &mdash; ' + r.blockingFailures + ' blocking, ' + r.warnings + ' warning(s)</div>' +
+      '<table class="data"><tbody>' +
+      r.checks.map((x) => '<tr><td style="width:70px">' + icon(x) + '</td>' +
+        '<td><b>' + esc(x.title) + '</b><br><span class="sub">' + esc(x.detail) +
+        (x.remedy ? '<br>&rarr; ' + esc(x.remedy) : '') + '</span></td></tr>').join('') +
+      '</tbody></table>';
+  };
+
+  $('#golive-check').addEventListener('click', async () => {
+    try {
+      const r = await api('/api/admin/clients/' + clientId + '/go-live');
+      $('#golive-out').innerHTML = renderPreflight(r);
+    } catch (e) { toast(e.message, true); }
+  });
+  if ($('#golive-start')) $('#golive-start').addEventListener('click', async () => {
+    if (!confirm('Go live? The platform will begin transmitting to payers under this '
+      + 'client\'s configuration and invoices may be issued.')) return;
+    try {
+      await api('/api/admin/clients/' + clientId + '/operating-mode',
+        { method: 'POST', body: JSON.stringify({ operatingMode: 'live' }) });
+      toast('client is live'); load();
+    } catch (e) { toast(e.message, true); }
+  });
+  if ($('#golive-stop')) $('#golive-stop').addEventListener('click', async () => {
+    const reason = prompt('Why is this client returning to shadow mode?');
+    if (reason === null) return;
+    try {
+      await api('/api/admin/clients/' + clientId + '/operating-mode',
+        { method: 'POST', body: JSON.stringify({ operatingMode: 'shadow', reason }) });
+      toast('client returned to shadow; nothing further is transmitted'); load();
+    } catch (e) { toast(e.message, true); }
   });
 
   $('#sub-panel').innerHTML = '<h2>Subscription &amp; features</h2>' +
@@ -535,7 +589,9 @@ async function loadBilling() {
         (i.contingencyPercent ? ' <span class="sub">(' + i.contingencyPercent + '%)</span>' : '') + '</td>' +
       '<td class="num"><b>' + usd(i.amountDue) + '</b></td>' +
       '<td>' + stBadge(i.status) + '</td>' +
-      '<td>' + (i.status === 'draft'
+      '<td><a class="btn small" target="_blank" rel="noopener" href="/api/admin/invoices/' +
+        i.invoiceId + '/statement">Statement</a> ' +
+        (i.status === 'draft'
         ? '<button class="btn small inv-issue" data-id="' + i.invoiceId + '">Issue</button>'
         : i.status === 'void' ? ''
         : '<button class="btn small danger inv-void" data-id="' + i.invoiceId + '">Void</button>') +

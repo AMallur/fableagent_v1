@@ -624,6 +624,49 @@ refuses every update except `invoice_id`, and refuses deletion outright.
 lines; `GET /api/admin/clients/:id/billing/ledger` shows a client's whole
 billable history, billed and not yet billed.
 
+## Going live
+
+A new client is created in **shadow mode**: everything is ingested, detected,
+priced and prepared, and nothing is transmitted to a payer or billed. It is the
+honest posture for a first engagement, and it is a property of the client
+(`client.operating_mode`) enforced through `app.client_is_live()` in both the
+appeal path and at invoice issue — not a convention somebody has to remember.
+
+`node src/cli.ts preflight --client <id>` runs the go-live gate and exits
+non-zero while anything blocking fails. It composes the existing runtime
+readiness inspection and per-payer activation with the commercial prerequisites:
+
+| Blocking | Why |
+|---|---|
+| BAA acknowledged | No PHI processing without it |
+| Subscription active or trial | A suspended client is not processed |
+| Pricing terms in force | A client with no plan invoices nothing |
+| Executed agreement named on the plan | A contingency charged against somebody's cash has to point at a document they signed — `issueInvoice` refuses without it |
+| Attribution basis matches the agreement | The measurement and the fee must describe the same thing |
+| Approved, unexpired contract | Otherwise pricing is a Medicare proxy and every variance is an estimate |
+| At least one payer cleared for detection | The platform fails closed here on purpose |
+
+Warnings cover reference-data currency (NCCI, CARC/RARC), Medicare locality, and
+the financial-control posture. Every check names a remedy. Each run is recorded
+in `go_live_check`; going live records the approver and the preflight relied on.
+
+## Statements and evidence
+
+- `GET /api/admin/invoices/:id/statement` renders the document a practice
+  manager receives: self-contained HTML with no external assets, so it survives
+  a hospital network and prints cleanly. Every line names the claim, payer,
+  check date, what moved and the fee derived from it; a negative line is shown
+  as money the payer took back. Drafts are watermarked.
+- `GET /api/admin/clients/:id/evidence-pack?from=&to=` assembles what an auditor
+  is given: the append-only ledger, the invoices, the go-live decisions, the
+  configuration in force and the audit trail, under a SHA-256 the recipient can
+  recompute with `evidencePackHash` to confirm their copy is unaltered. The pack
+  states its own limits — it is not a signature, and it evidences what the
+  platform recorded and charged, not the accuracy of payer adjudication.
+
+The commercial documents these support — order form, SLA, support policy,
+security questionnaire responses and the pilot protocol — live in `commercial/`.
+
 ## Commercial terms
 
 Recovery work is sold on contingency — a share of the money the client actually
