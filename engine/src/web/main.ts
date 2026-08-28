@@ -3,13 +3,13 @@ import { readFileSync } from 'node:fs';
 import { startServer } from './server.ts';
 import { pgSslConfig } from './db_ssl.ts';
 import { resolveDocumentStore } from '../appeals/storage.ts';
-import { databaseConnectionString } from '../db/connection.ts';
+import { databaseConnectionString, hardenPool } from '../db/connection.ts';
 
 const { default: pg } = await import('pg');
-const pool = new pg.Pool({
+const pool = hardenPool(new pg.Pool({
   connectionString: databaseConnectionString(),
   ssl: pgSslConfig(readFileSync),
-});
+}));
 
 const portArg = process.argv.indexOf('--port');
 const srv = await startServer(pool, {

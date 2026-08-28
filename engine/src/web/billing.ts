@@ -518,20 +518,53 @@ export async function issueInvoice(
     throw err(`invoice is already ${row.rows[0].status}`, 409);
   }
 
-  // Reading the sequence and consuming it must not be separable: two issues
-  // racing would otherwise compute the same number, and the unique index would
-  // reject one of them after its status had already moved to issued.
-  const invoiceNumber: string = await inTenantTransaction(db, s.tenantId, async (tx) => {
-    const seq = await tx.query(
-      `SELECT count(*)::int + 1 AS n FROM invoice
-       WHERE tenant_id = $1 AND invoice_number IS NOT NULL`, [s.tenantId]);
-    const number = `INV-${String(iso(row.rows[0].period_start)).slice(0, 7).replace('-', '')}`
-      + `-${String(seq.rows[0].n).padStart(5, '0')}`;
-    await tx.query(
-      `UPDATE invoice SET status = 'issued', issued_at = now(), invoice_number = $2
-       WHERE invoice_id = $1`, [invoiceId, number]);
-    return number;
-  });
+  // The draft check above is a read, so it cannot by itself stop a second
+  // caller: two sessions pressing Issue together both see 'draft' and both
+  // proceed. The transition therefore has to be conditional on the status the
+  // caller believed it was acting on, and "no row updated" is the refusal.
+  //
+  // Without that guard every racing caller succeeds: measured at 8 concurrent
+  // issues of one invoice, all 8 wrote, each overwriting issued_at — the date
+  // payment terms run from — and each appending an invoice_issued record to an
+  // audit log that is supposed to say what happened once.
+  //
+  // Two DIFFERENT invoices issued at the same instant is a separate race: both
+  // read the same count and compute the same number, and uq_invoice_number
+  // rejects the loser. That one is safe to retry, because the retry reads a
+  // count that now includes the winner.
+  const NUMBER_COLLISION = '23505';
+  let invoiceNumber: string | null = null;
+  let alreadyIssued = false;
+
+  for (let attempt = 0; attempt < 5 && invoiceNumber === null && !alreadyIssued; attempt += 1) {
+    try {
+      invoiceNumber = await inTenantTransaction(db, s.tenantId, async (tx) => {
+        const seq = await tx.query(
+          `SELECT count(*)::int + 1 AS n FROM invoice
+           WHERE tenant_id = $1 AND invoice_number IS NOT NULL`, [s.tenantId]);
+        const number = `INV-${String(iso(row.rows[0].period_start)).slice(0, 7).replace('-', '')}`
+          + `-${String(seq.rows[0].n).padStart(5, '0')}`;
+        const updated = await tx.query(
+          `UPDATE invoice SET status = 'issued', issued_at = now(), invoice_number = $2
+           WHERE invoice_id = $1 AND tenant_id = $3 AND status = 'draft'
+           RETURNING invoice_number`, [invoiceId, number, s.tenantId]);
+        if (updated.rows.length === 0) { alreadyIssued = true; return null; }
+        return number;
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code !== NUMBER_COLLISION) throw error;
+      // Another invoice took this number in the moment between the count and
+      // the write. Nothing about this invoice changed; go round again.
+    }
+  }
+
+  if (alreadyIssued) {
+    throw err('invoice is no longer a draft; another session issued it first', 409);
+  }
+  if (invoiceNumber === null) {
+    throw err('could not allocate an invoice number; try again', 503);
+  }
+
   await adminAudit(db, sess, 'invoice_issued', 'invoice', invoiceId, { invoiceNumber });
   return { ok: true as const, invoiceId, invoiceNumber };
 }
@@ -554,10 +587,16 @@ export async function voidInvoice(
   // act. Half of it would leave recoveries claimed by a dead invoice and so
   // permanently unbillable — the mirror image of double-billing, and just as
   // wrong.
+  let voided = true;
   await inTenantTransaction(db, s.tenantId, async (tx) => {
-    await tx.query(
+    // Conditional for the same reason issuing is: the status read above cannot
+    // stop a second caller, and voiding twice would release the ledger rows a
+    // concurrent re-issue had just claimed.
+    const updated = await tx.query(
       `UPDATE invoice SET status = 'void', voided_at = now(), voided_reason = $2
-       WHERE invoice_id = $1`, [invoiceId, reason.trim()]);
+       WHERE invoice_id = $1 AND tenant_id = $3 AND status <> 'void'
+       RETURNING invoice_id`, [invoiceId, reason.trim(), s.tenantId]);
+    if (updated.rows.length === 0) { voided = false; return; }
     // The invoice row keeps its frozen totals as the record of what was
     // charged; its LINES go, and the ledger rows they held are released so a
     // corrected invoice can bill the same recoveries. The ledger itself is
@@ -568,6 +607,9 @@ export async function voidInvoice(
       `UPDATE usage_event SET invoice_id = NULL WHERE invoice_id = $1 AND tenant_id = $2`,
       [invoiceId, s.tenantId]);
   });
+
+  if (!voided) throw err('invoice is already void', 409);
+
   await adminAudit(db, sess, 'invoice_voided', 'invoice', invoiceId, { reason: reason.trim() });
   return { ok: true as const, invoiceId };
 }

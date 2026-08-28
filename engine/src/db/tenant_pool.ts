@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Queryable } from './snapshot.ts';
 import type { PoolLike } from '../service.ts';
 import type { UUID } from '../types.ts';
+import { absorbConnectionErrors } from './tx.ts';
 
 type Releasable = Queryable & { release(): void };
 
@@ -40,6 +41,9 @@ export class TenantContextPool implements PoolLike {
     if (!tenantId) return this.raw.query(text, params);
 
     const client = await this.raw.connect();
+    // A checked-out client whose backend dies emits 'error' with no listener,
+    // which ends the process rather than the request. See absorbConnectionErrors.
+    absorbConnectionErrors(client);
     try {
       await client.query('BEGIN');
       await client.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [tenantId]);
@@ -56,6 +60,7 @@ export class TenantContextPool implements PoolLike {
 
   async connect(): Promise<Releasable> {
     const client = await this.raw.connect();
+    absorbConnectionErrors(client);
     const tenantId = this.context.getStore();
     if (!tenantId) return client;
 

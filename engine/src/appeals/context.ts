@@ -34,7 +34,23 @@ export async function loadAppealContexts(
   if (scope.caseIds?.length) { params.push(scope.caseIds); filter += ` AND rc.case_id = ANY($${params.length})`; }
 
   const cases = await db.query(
-    `SELECT rc.case_id, rc.case_type, rc.denial_category, rc.denial_reason_code,
+    // How often this payer has denied for this reason before is a property of
+    // the tenant's whole case history, not of the case being scored. Asking it
+    // once per case — as a LATERAL correlated on rc — rescans every case the
+    // tenant has ever had, for every case in the run, so the appeal stage is
+    // O(open cases x all cases) and slows down for as long as the client keeps
+    // recovering. Measured at 5.7k cases that was a single 12.6s query, still
+    // climbing. Aggregating the histogram once is O(all cases).
+    `WITH category_history AS (
+       SELECT pcl.payer_id,
+              COALESCE(prior.denial_category, prior.case_type::text) AS category,
+              count(*) AS n
+       FROM recovery_case prior
+       JOIN claim pcl ON pcl.claim_id = prior.claim_id
+       WHERE prior.tenant_id = $1
+       GROUP BY pcl.payer_id, COALESCE(prior.denial_category, prior.case_type::text)
+     )
+     SELECT rc.case_id, rc.case_type, rc.denial_category, rc.denial_reason_code,
             rc.priority_level, rc.recovery_opportunity, rc.expected_amount,
             rc.paid_amount, rc.confidence_score, rc.deadline_date, rc.claim_line_id,
             rc.client_id, c.client_name, c.address AS client_address,
@@ -55,7 +71,10 @@ export async function loadAppealContexts(
             -- provider's own billers, not for irreversible action.
             (COALESCE(cpc.autopilot_enabled, false)
              AND app.client_is_live(c.tenant_id, c.client_id)) AS autopilot_enabled,
-            COALESCE(hist.n, 0) AS prior_category_case_count
+            -- The case being scored is itself in the histogram bucket, and the
+            -- correlated form this replaced excluded it with prior.case_id <>
+            -- rc.case_id, so one is subtracted to keep the count identical.
+            GREATEST(COALESCE(hist.n, 0) - 1, 0) AS prior_category_case_count
      FROM recovery_case rc
      JOIN client c    ON c.client_id = rc.client_id
      JOIN claim cl    ON cl.claim_id = rc.claim_id
@@ -77,15 +96,9 @@ export async function loadAppealContexts(
      ) pkts ON true
      LEFT JOIN client_payer_config cpc
        ON cpc.client_id = rc.client_id AND cpc.payer_id = cl.payer_id
-     LEFT JOIN LATERAL (
-       SELECT count(*) AS n FROM recovery_case prior
-       JOIN claim pcl ON pcl.claim_id = prior.claim_id
-       WHERE prior.tenant_id = rc.tenant_id
-         AND pcl.payer_id = cl.payer_id
-         AND prior.case_id <> rc.case_id
-         AND COALESCE(prior.denial_category, prior.case_type::text)
-             = COALESCE(rc.denial_category, rc.case_type::text)
-     ) hist ON true
+     LEFT JOIN category_history hist
+       ON hist.payer_id = cl.payer_id
+      AND hist.category = COALESCE(rc.denial_category, rc.case_type::text)
      WHERE rc.tenant_id = $1 ${filter}
        AND rc.status IN ('open', 'in_progress')
        AND rc.deleted_at IS NULL

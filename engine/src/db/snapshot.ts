@@ -56,27 +56,62 @@ export async function loadSnapshot(db: Queryable, scope: SnapshotScope): Promise
   );
 
   // ---- claims + lines + encounter context + available documents ------------
+  // The document types available to a claim are the union of two independent
+  // sets: documents held for the client as a whole (case_id IS NULL), which are
+  // identical for every claim that client has, and documents attached to a case
+  // on this specific claim.
+  //
+  // Computing that per claim — as a LATERAL correlated on cl.client_id once did
+  // — costs one scan of the client's entire document table per claim, so the
+  // run is O(claims x documents) and both factors grow for as long as the client
+  // stays with us. Measured on 12k claims and 21k documents that was a single
+  // 18.5s query doing 10M buffer hits, discarding 20,689 rows per claim to keep
+  // 2. Aggregating each set once and joining is O(claims + documents).
   const claims = await db.query(
-    `SELECT cl.claim_id, cl.client_id, cl.payer_id, cl.claim_type, cl.claim_status,
-            cl.claim_number_internal, cl.claim_number_payer, cl.submission_date,
-            cl.payer_sequence, cl.prior_payer_paid,
-            e.patient_id, e.date_of_service_start, e.place_of_service, e.authorization_number,
-            COALESCE(docs.doc_types, '{}') AS doc_types
-     FROM claim cl
-     JOIN encounter e ON e.encounter_id = cl.encounter_id
-     JOIN client c ON c.client_id = cl.client_id
-     LEFT JOIN LATERAL (
-       SELECT array_agg(DISTINCT d.document_type::text) AS doc_types
+    `WITH scoped_claim AS (
+       SELECT cl.claim_id, cl.client_id, cl.payer_id, cl.claim_type, cl.claim_status,
+              cl.claim_number_internal, cl.claim_number_payer, cl.submission_date,
+              cl.payer_sequence, cl.prior_payer_paid, cl.encounter_id
+       FROM claim cl
+       JOIN client c ON c.client_id = cl.client_id
+       WHERE cl.tenant_id = $1 ${clientFilter}
+         AND cl.deleted_at IS NULL
+         AND cl.claim_status <> 'closed'
+         AND cl.created_at > now() - make_interval(days => ${lookback})
+         AND app.client_payer_capability_enabled(cl.client_id, cl.payer_id, 'detection')
+     ),
+     client_doc AS (
+       SELECT d.client_id, array_agg(DISTINCT d.document_type::text) AS doc_types
        FROM document d
-       WHERE d.client_id = cl.client_id AND d.deleted_at IS NULL
-         AND (d.case_id IS NULL OR d.case_id IN
-              (SELECT rc.case_id FROM recovery_case rc WHERE rc.claim_id = cl.claim_id))
-     ) docs ON true
-     WHERE cl.tenant_id = $1 ${clientFilter}
-       AND cl.deleted_at IS NULL
-       AND cl.claim_status <> 'closed'
-       AND cl.created_at > now() - make_interval(days => ${lookback})
-       AND app.client_payer_capability_enabled(cl.client_id, cl.payer_id, 'detection')`,
+       WHERE d.deleted_at IS NULL
+         AND d.case_id IS NULL
+         AND d.client_id IN (SELECT DISTINCT client_id FROM scoped_claim)
+       GROUP BY d.client_id
+     ),
+     case_doc AS (
+       SELECT sc.claim_id, array_agg(DISTINCT d.document_type::text) AS doc_types
+       FROM scoped_claim sc
+       JOIN recovery_case rc ON rc.claim_id = sc.claim_id
+       JOIN document d ON d.case_id = rc.case_id
+       WHERE d.deleted_at IS NULL
+         AND d.client_id = sc.client_id
+       GROUP BY sc.claim_id
+     )
+     SELECT sc.claim_id, sc.client_id, sc.payer_id, sc.claim_type, sc.claim_status,
+            sc.claim_number_internal, sc.claim_number_payer, sc.submission_date,
+            sc.payer_sequence, sc.prior_payer_paid,
+            e.patient_id, e.date_of_service_start, e.place_of_service,
+            e.authorization_number,
+            COALESCE(
+              ARRAY(SELECT DISTINCT t FROM unnest(
+                COALESCE(cd.doc_types, '{}'::text[]) || COALESCE(kd.doc_types, '{}'::text[])
+              ) AS t ORDER BY t),
+              '{}'::text[]
+            ) AS doc_types
+     FROM scoped_claim sc
+     JOIN encounter e ON e.encounter_id = sc.encounter_id
+     LEFT JOIN client_doc cd ON cd.client_id = sc.client_id
+     LEFT JOIN case_doc  kd ON kd.claim_id  = sc.claim_id`,
     params,
   );
   const claimIds = claims.rows.map((r) => r.claim_id);
