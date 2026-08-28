@@ -89,8 +89,8 @@ describe('commercial terms', { skip: !url && 'TEST_DATABASE_URL not set' }, () =
       `INSERT INTO tenant (tenant_id, tenant_name, tenant_type)
        VALUES ($1,'Billing Tenant','billing_company')`, [T]);
     await pool.query(
-      `INSERT INTO client (client_id, tenant_id, client_name, npi_group, subscription_status)
-       VALUES ($1,$2,'Billed Group','1234567890','active')`, [C, T]);
+      `INSERT INTO client (client_id, tenant_id, client_name, npi_group, subscription_status, operating_mode)
+       VALUES ($1,$2,'Billed Group','1234567890','active','live')`, [C, T]);
     await pool.query(
       `INSERT INTO app_user (user_id, tenant_id, email, first_name, last_name, role, password_hash)
        VALUES ($1,$2,'admin@billing.test','A','Dmin','tenant_admin','x')`, [U, T]);
@@ -110,14 +110,19 @@ describe('commercial terms', { skip: !url && 'TEST_DATABASE_URL not set' }, () =
         `INSERT INTO pricing_plan (tenant_id, client_id, plan_name, effective_date,
                                    base_fee, contingency_percent)
          VALUES ($1, NULL, 'Tenant default', '2026-01-01', 500, 15)`, [T]);
+      await pool.query(
+        `UPDATE pricing_plan SET agreement_reference = 'MSA-TEST-001',
+           agreement_executed_on = '2026-01-01' WHERE tenant_id = $1`, [T]);
       const dflt = await resolvePricingPlan(pool, T, C, '2026-06-01');
       assert.equal(dflt!.planName, 'Tenant default');
       assert.equal(dflt!.contingencyPercent, 15);
 
       await pool.query(
         `INSERT INTO pricing_plan (tenant_id, client_id, plan_name, effective_date,
-                                   base_fee, contingency_percent, minimum_fee)
-         VALUES ($1, $2, 'Negotiated', '2026-03-01', 250, 25, 400)`, [T, C]);
+                                   base_fee, contingency_percent, minimum_fee,
+                                   agreement_reference, agreement_executed_on)
+         VALUES ($1, $2, 'Negotiated', '2026-03-01', 250, 25, 400,
+                 'MSA-TEST-001-A1', '2026-03-01')`, [T, C]);
       const specific = await resolvePricingPlan(pool, T, C, '2026-06-01');
       assert.equal(specific!.planName, 'Negotiated');
       assert.equal(specific!.contingencyPercent, 25);

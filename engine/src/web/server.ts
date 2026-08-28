@@ -769,6 +769,16 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     json(ctx, 200, await billing.previewInvoice(
       pool, ctx.session!, ctx.scope!, ctx.params[0], String(body.month ?? '')));
   });
+  // Go-live: preflight reports, the mode switch enforces it.
+  authed('GET', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/go-live$/, async (ctx) =>
+    json(ctx, 200, await admin.goLivePreflight(pool, ctx.session!, ctx.scope!, ctx.params[0])));
+  authed('POST', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/operating-mode$/, async (ctx) => {
+    const body = await readJson(ctx.req);
+    json(ctx, 200, await admin.setOperatingMode(
+      pool, ctx.session!, ctx.scope!, ctx.params[0],
+      String(body.operatingMode ?? ''), body.reason ? String(body.reason) : undefined));
+  });
+
   // The append-only record behind the bills, billed and not yet billed.
   authed('GET', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/billing\/ledger$/, async (ctx) => {
     const u = new URL(ctx.req.url ?? '', 'http://local');
@@ -779,6 +789,23 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
         unbilledOnly: u.searchParams.get('unbilledOnly') === 'true',
         limit: Number(u.searchParams.get('limit')) || undefined,
       }));
+  });
+  // The statement a customer receives, and the pack an auditor is given.
+  authed('GET', /^\/api\/admin\/invoices\/([0-9a-f-]{36})\/statement$/, async (ctx) => {
+    const { renderStatement } = await import('./statement.ts');
+    const out = await renderStatement(pool, ctx.session!, ctx.scope!, ctx.params[0]);
+    ctx.res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Disposition':
+        `inline; filename="statement-${out.invoiceNumber ?? 'draft'}.html"`,
+    });
+    ctx.res.end(out.html);
+  });
+  authed('GET', /^\/api\/admin\/clients\/([0-9a-f-]{36})\/evidence-pack$/, async (ctx) => {
+    const { buildEvidencePack } = await import('./statement.ts');
+    json(ctx, 200, await buildEvidencePack(
+      pool, ctx.session!, ctx.scope!, ctx.params[0],
+      ctx.url.searchParams.get('from') ?? '', ctx.url.searchParams.get('to') ?? ''));
   });
   authed('GET', /^\/api\/admin\/invoices\/([0-9a-f-]{36})$/, async (ctx) =>
     json(ctx, 200, await billing.invoiceDetail(pool, ctx.session!, ctx.scope!, ctx.params[0])));

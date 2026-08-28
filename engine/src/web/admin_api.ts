@@ -313,6 +313,7 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
             timezone, nightly_run_time::text AS nightly_run_time, ingest_folder,
             status, subscription_status, features, baa_acknowledged_at,
             era_balance_policy, era_balance_tolerance,
+            operating_mode, go_live_at, go_live_evidence,
             ncci_bundling_policy, attribution_basis, attribution_window_days,
             attribution_min_amount, attribution_include_unallocated, clawback_policy,
             recovery_alert_threshold, appeal_review_threshold, contract_effective_date,
@@ -379,6 +380,11 @@ export async function clientDetail(db: Queryable, sess: Session, s: Scope, clien
       medicareLocality: r.medicare_locality,
       eraBalancePolicy: r.era_balance_policy,
       eraBalanceTolerance: num(r.era_balance_tolerance),
+      // 'shadow' prepares everything and transmits nothing. New clients start
+      // here and stay until a go-live preflight clears them.
+      operatingMode: r.operating_mode,
+      goLiveAt: when(r.go_live_at),
+      goLiveEvidence: r.go_live_evidence,
       ncciBundlingPolicy: r.ncci_bundling_policy,
       // How a recovered dollar is counted for this client — a commercial term,
       // so it is configuration rather than an engineering constant.
@@ -1147,4 +1153,75 @@ export async function changePlan(db: Queryable, sess: Session, s: Scope, tier: s
     `UPDATE tenant SET subscription_tier = $2 WHERE tenant_id = $1`, [s.tenantId, tier]);
   await adminAudit(db, sess, 'plan_changed', 'tenant', s.tenantId, { tier });
   return { ok: true, plan: tier };
+}
+
+
+// ---------------------------------------------------------------------------
+// Going live
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the preflight for a client and record the result. Read-only: it reports
+ * what is true, and never changes the operating mode.
+ */
+export async function goLivePreflight(
+  db: Queryable, sess: Session, s: Scope, clientId: UUID,
+) {
+  requireAnyAdmin(sess);
+  assertClientAccess(sess, s, clientId);
+  const { assessGoLive, recordGoLiveCheck } = await import('../integration/golive.ts');
+  const report = await assessGoLive(db, s.tenantId, clientId);
+  const checkId = await recordGoLiveCheck(db, s.tenantId, report, sess.userId);
+  return { ...report, goLiveCheckId: checkId };
+}
+
+/**
+ * Move a client between shadow and live.
+ *
+ * Going live re-runs the preflight and refuses if anything blocking fails —
+ * the button cannot be used to skip the gate. Returning to shadow is always
+ * allowed: stopping is never something to make hard.
+ */
+export async function setOperatingMode(
+  db: Queryable, sess: Session, s: Scope, clientId: UUID,
+  mode: string, reason?: string,
+) {
+  requireTenantAdmin(sess);
+  assertClientAccess(sess, s, clientId);
+  if (!['shadow', 'live'].includes(mode)) {
+    throw err("operatingMode must be 'shadow' or 'live'", 400);
+  }
+
+  if (mode === 'shadow') {
+    await db.query(
+      `UPDATE client SET operating_mode = 'shadow', go_live_at = NULL
+       WHERE client_id = $1 AND tenant_id = $2`, [clientId, s.tenantId]);
+    await adminAudit(db, sess, 'client_shadow_mode', 'client', clientId,
+      { reason: reason ?? null });
+    return { ok: true as const, operatingMode: 'shadow' as const };
+  }
+
+  const { assessGoLive, recordGoLiveCheck } = await import('../integration/golive.ts');
+  const report = await assessGoLive(db, s.tenantId, clientId);
+  const checkId = await recordGoLiveCheck(db, s.tenantId, report, sess.userId);
+  if (!report.cleared) {
+    throw err(
+      `${report.blockingFailures} blocking check(s) must be resolved before `
+      + `${report.clientName} can go live: `
+      + report.checks.filter((x) => x.severity === 'block' && x.status === 'fail')
+        .map((x) => x.title).join('; '),
+      428);
+  }
+
+  await db.query(
+    `UPDATE client SET operating_mode = 'live', go_live_at = now(),
+       go_live_approved_by = $3, go_live_evidence = $4
+     WHERE client_id = $1 AND tenant_id = $2`,
+    [clientId, s.tenantId, sess.userId, checkId]);
+  await adminAudit(db, sess, 'client_went_live', 'client', clientId,
+    { goLiveCheckId: checkId, warnings: report.warnings, reason: reason ?? null });
+  return {
+    ok: true as const, operatingMode: 'live' as const,
+    goLiveCheckId: checkId, warnings: report.warnings,
+  };
 }

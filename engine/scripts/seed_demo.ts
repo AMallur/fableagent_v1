@@ -83,6 +83,7 @@ for (const table of [
   'onboarding_step', 'client_integration', 'sso_config', 'data_export_request',
   // usage_event is billing history and references invoice; it goes first so
   // the invoice rows that claimed it can follow.
+  'go_live_check',
   'invoice_line', 'usage_event', 'invoice',
   'rule_execution', 'automation_rule', 'notification_preference', 'notification',
   'email_outbox', 'dashboard_snapshot',
@@ -125,26 +126,34 @@ await q(`INSERT INTO tenant (tenant_id, tenant_name, tenant_type, subscription_t
            tenant_name = EXCLUDED.tenant_name, tenant_type = EXCLUDED.tenant_type,
            subscription_tier = EXCLUDED.subscription_tier, enforce_mfa = EXCLUDED.enforce_mfa,
            status = 'active', deleted_at = NULL, updated_at = now()`, [T]);
+// The demo portrays an established client, so it is explicitly 'live'. Real
+// new clients default to 'shadow' (migration 0028) and stay there until a
+// go-live preflight clears them.
 await q(`INSERT INTO client (client_id, tenant_id, client_name, tax_id, npi_group, specialty, state,
-                             address, recovery_alert_threshold, appeal_review_threshold)
+                             address, recovery_alert_threshold, appeal_review_threshold,
+                             operating_mode, go_live_at)
          VALUES ($1, $2, 'Alpha Orthopedic Group', '74-1234567', '1234567890', 'orthopedics', 'TX',
                  '{"line1":"100 Main St, Suite 400","city":"Austin","state":"TX","zip":"78701"}',
-                 25000, 4000)
+                 25000, 4000, 'live', now() - interval '90 days')
          ON CONFLICT (client_id) DO UPDATE SET
            client_name = EXCLUDED.client_name, tax_id = EXCLUDED.tax_id, npi_group = EXCLUDED.npi_group,
            specialty = EXCLUDED.specialty, state = EXCLUDED.state, address = EXCLUDED.address,
            recovery_alert_threshold = EXCLUDED.recovery_alert_threshold,
            appeal_review_threshold = EXCLUDED.appeal_review_threshold,
+           operating_mode = EXCLUDED.operating_mode, go_live_at = EXCLUDED.go_live_at,
            status = 'active', deleted_at = NULL, updated_at = now()`, [C, T]);
 // The commercial terms behind every invoice. RCM recovery is sold on
 // contingency, so the demo shows a real one: a small platform fee plus 22% of
 // what was actually recovered, with a floor.
 await q(`INSERT INTO pricing_plan (tenant_id, client_id, plan_name, effective_date,
                                    base_fee, per_case_fee, contingency_percent,
-                                   minimum_fee, contingency_basis, notes)
+                                   minimum_fee, contingency_basis, notes,
+                                   agreement_reference, agreement_executed_on,
+                                   agreed_attribution_basis)
          VALUES ($1, NULL, 'Recovery contingency 22%', CURRENT_DATE - 365,
                  750.00, 0, 22.000, 750.00, 'attributed',
-                 'Demo terms: platform fee plus 22% of attributed recovery, $750 minimum')
+                 'Demo terms: platform fee plus 22% of attributed recovery, $750 minimum',
+                 'DEMO-OF-2026-001', CURRENT_DATE - 400, 'incremental_net')
          ON CONFLICT DO NOTHING`, [T]);
 await q(`INSERT INTO client_medicare_config (tenant_id, client_id, medicare_locality)
          VALUES ($1, $2, 'DEMO')

@@ -119,16 +119,6 @@ function bypassModifiersOn(line: ClaimLineInput): string[] {
     .filter((m) => NCCI_BYPASS_MODIFIERS.has(m));
 }
 
-/**
- * Sibling lines on the claim that were paid. A bundling denial asserts the
- * service is included in the payment for another one, so the column-one
- * candidate has to be a line the payer actually paid.
- */
-function paidSiblingCodes(claim: ClaimInput, line: ClaimLineInput): string[] {
-  return claim.lines
-    .filter((l) => l.claimLineId !== line.claimLineId && (l.paidAmount ?? 0) > 0)
-    .map((l) => l.procedureCode);
-}
 
 /**
  * Whether the loaded reference data can speak to this date of service. A file
@@ -144,8 +134,17 @@ function coverageFor(
   return covers ? 'covered' : 'predates';
 }
 
+/**
+ * @param paidSiblingCodes procedure codes on this claim the payer actually
+ *   paid — the column-one candidates. Supplied by the caller rather than
+ *   re-derived here, because "paid" has to include the remittance being
+ *   processed right now: one 835 normally pays one line and denies another in
+ *   the same file, and reading only stored amounts made this module answer
+ *   "CMS publishes no edit" for a pair CMS does in fact publish.
+ */
 export function evaluateNcci(
   input: EngineInput, claim: ClaimInput, line: ClaimLineInput,
+  paidSiblingCodes: string[] = [],
 ): NcciAssessment {
   const setting = settingFor(claim);
   const deniedCode = line.procedureCode;
@@ -174,7 +173,7 @@ export function evaluateNcci(
     };
   }
 
-  const siblings = paidSiblingCodes(claim, line);
+  const siblings = [...new Set(paidSiblingCodes)];
   const candidates = (input.ncciEdits ?? []).filter(
     (e) => e.serviceSetting === setting
       && e.columnTwoCode === deniedCode

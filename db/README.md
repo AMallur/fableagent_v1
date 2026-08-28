@@ -49,10 +49,13 @@ db/
                                           #   + prior-payer paid, pricing_plan +
                                           #   invoice_line + issued-invoice immutability,
                                           #   subscription/feature enforcement functions
-    └── 0027_usage_ledger_ncci_and_attribution_policy.sql
+    ├── 0027_usage_ledger_ncci_and_attribution_policy.sql
                                           # append-only usage_event billing ledger,
                                           #   payer bundling-edit source + client NCCI
                                           #   policy, per-client attribution policy
+    └── 0028_go_live_controls.sql         # client operating_mode (shadow/live) and the
+                                          #   go-live record, signed-agreement reference
+                                          #   on pricing_plan, go_live_check evidence
 ```
 
 The detection engine that consumes this schema lives in [../engine](../engine).
@@ -168,6 +171,9 @@ are skipped.
 | — | `invoice` immutable past `draft` (0026) | A trigger refuses to change the figures on an issued bill or delete it; corrections are a void and reissue. Regenerating a month used to silently rewrite an invoice that had already gone out |
 | — | `usage_event` (0027) | Freezing the invoice totals stopped the bill changing; it did not stop the evidence changing. The ledger is written once per billable fact with the figures as they stood, is append-only in the database (only `invoice_id` may ever move), and is what invoices are built from — so an issued bill can be reconstructed after the operational tables have moved on |
 | — | `client` attribution policy (0027) | Which post-appeal dollars count as recovery is a commercial term, not an engineering constant: basis, window, floor, unallocated handling and clawback rule are per client, each defaulting to the previous hardcoded behavior |
+| — | `client.operating_mode` + `app.client_is_live()` (0028) | A first engagement should detect and prepare while transmitting nothing and billing nothing. Autopilot was the only switch and it was per payer; this makes the pilot posture a property of the client that the appeal path and the billing path both read, so the rule cannot be applied in one place and forgotten in another |
+| — | `pricing_plan.agreement_reference` (0028) | A contingency charged against somebody's recovered cash has to point at a document they signed. An invoice cannot be issued under a plan that names none |
+| — | `go_live_check` (0028) | The preflight result an approver was looking at, kept as evidence — so "who decided we could start billing them" is a row rather than somebody's memory |
 | — | `payer.bundling_edit_source` + `client.ncci_bundling_policy` (0027) | The CMS NCCI tables have been importable since 0022 and nothing read them. These two say how to read them for this payer and what to do when CMS says a bundle can never be unbundled |
 
 ### Other conventions

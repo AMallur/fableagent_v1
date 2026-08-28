@@ -98,14 +98,15 @@ async function seedAppealedCase(
 /** A remittance line paying `paid` against a claim line, created at `createdAt`. */
 async function seedRemittance(
   claimId: string, claimLineId: string | null, paid: number,
-  createdAt: string, opts: { isReversal?: boolean } = {},
+  createdAt: string, opts: { isReversal?: boolean; checkDate?: string } = {},
 ): Promise<void> {
   seq += 1;
   const r = await pool.query(
     `INSERT INTO remittance (tenant_id, client_id, payer_id, check_number, check_date,
                              total_paid, created_at)
-     VALUES ($1,$2,$3,$4,$5::date,$6,$5::timestamptz) RETURNING remittance_id`,
-    [T, C, P, `CHK-${seq}`, createdAt.slice(0, 10), Math.abs(paid)]);
+     VALUES ($1,$2,$3,$4,$5::date,$6,$7::timestamptz) RETURNING remittance_id`,
+    [T, C, P, `CHK-${seq}`, opts.checkDate ?? createdAt.slice(0, 10),
+     Math.abs(paid), createdAt]);
   await pool.query(
     `INSERT INTO remittance_line (tenant_id, remittance_id, claim_id, claim_line_id,
                                   procedure_code, billed_amount, paid_amount, is_reversal)
@@ -139,8 +140,8 @@ describe('usage ledger and attribution policy',
         `INSERT INTO tenant (tenant_id, tenant_name, tenant_type)
          VALUES ($1,'Ledger Tenant','billing_company')`, [T]);
       await pool.query(
-        `INSERT INTO client (client_id, tenant_id, client_name, npi_group, subscription_status)
-         VALUES ($1,$2,'Ledger Group','1234567890','active')`, [C, T]);
+        `INSERT INTO client (client_id, tenant_id, client_name, npi_group, subscription_status, operating_mode)
+         VALUES ($1,$2,'Ledger Group','1234567890','active','live')`, [C, T]);
       await pool.query(
         `INSERT INTO app_user (user_id, tenant_id, email, first_name, last_name, role, password_hash)
          VALUES ($1,$2,'admin@ledger.test','A','Dmin','tenant_admin','x')`, [U, T]);
@@ -151,6 +152,9 @@ describe('usage ledger and attribution policy',
         `INSERT INTO pricing_plan (tenant_id, client_id, plan_name, effective_date,
                                    contingency_percent)
          VALUES ($1,$2,'Contingency only','2026-01-01',20)`, [T, C]);
+      await pool.query(
+        `UPDATE pricing_plan SET agreement_reference = 'MSA-TEST-001',
+           agreement_executed_on = '2026-01-01' WHERE tenant_id = $1`, [T]);
       await pool.query(`SELECT set_config('app.current_tenant_id', $1, false)`, [T]);
     });
 
@@ -318,6 +322,37 @@ describe('usage ledger and attribution policy',
         'payment 80 days after submission is not this appeal doing its work');
     });
 
+    it('measures the window on the payer check date, not when we loaded the file',
+      async () => {
+        // A client backfilling historical remittances stamps every row with
+        // today. If the window were measured on ingestion time, a payment the
+        // payer cut a year after the appeal would look same-day and be billed;
+        // and a timely payment loaded late would be wrongly excluded.
+        await setPolicy({ attribution_window_days: 30 });
+        const late = await seedClaim();
+        const timely = await seedClaim();
+        const a = await seedAppealedCase(late.claimId, late.claimLineId, 400, '2026-06-01');
+        const b = await seedAppealedCase(timely.claimId, timely.claimLineId, 400, '2026-06-01');
+
+        // Backfilled today, but the payer actually paid 5 months later.
+        await seedRemittance(late.claimId, late.claimLineId, 400,
+          '2026-06-05T00:00:00Z', { checkDate: '2026-11-01' });
+        // Paid inside the window, but the file only reached us months after.
+        await seedRemittance(timely.claimId, timely.claimLineId, 400,
+          '2026-12-20T00:00:00Z', { checkDate: '2026-06-20' });
+
+        await reconcile();
+
+        const attributed = async (caseId: string) => Number((await pool.query(
+          `SELECT COALESCE(sum(amount_recovered), 0) AS t FROM payment_event
+           WHERE tenant_id = $1 AND case_id = $2`, [T, caseId])).rows[0].t);
+        assert.equal(await attributed(a), 0,
+          'a backfilled row must not smuggle a late payment inside the window');
+        assert.equal(await attributed(b), 400,
+          'a timely payment stays attributable however late the file arrived');
+        await setPolicy({ attribution_window_days: null });
+      });
+
     it('does not open a billable event for movement below the floor', async () => {
       await setPolicy({ attribution_window_days: null, attribution_min_amount: 25 });
       const noise = await seedClaim();
@@ -479,6 +514,76 @@ describe('usage ledger and attribution policy',
         `SELECT count(*)::int AS n FROM usage_event WHERE invoice_id = $1`,
         [second.invoiceId]);
       assert.equal(claimed.rows[0].n, 1, 'and the ledger row is claimed by it');
+    });
+
+    it('rolls the whole bill back when a write fails mid-flight', async () => {
+      // The defect this guards: generateInvoice releases the ledger rows the
+      // draft holds and then re-claims them. Before it was transactional, a
+      // failure in between left the invoice asserting totals for recoveries
+      // the ledger showed as unbilled — and the next period billed them again.
+      const { generateInvoice } = await import('../src/web/billing.ts');
+      const { claimId, claimLineId } = await seedClaim();
+      const caseId = await seedAppealedCase(claimId, claimLineId, 700, '2026-06-01');
+      await pool.query(
+        `INSERT INTO payment_event (tenant_id, case_id, claim_id, claim_line_id,
+                                    amount_recovered, payment_date, matched_automatically,
+                                    attribution_basis)
+         VALUES ($1,$2,$3,$4,700,'2026-11-09',true,'incremental_net')`,
+        [T, caseId, claimId, claimLineId]);
+
+      const good = await generateInvoice(pool, sess(), scope(), C, '2026-11');
+      assert.equal(good.attributedRecovery, 700);
+      const claimedBefore = await pool.query(
+        `SELECT count(*)::int AS n FROM usage_event WHERE invoice_id = $1`, [good.invoiceId]);
+      assert.equal(claimedBefore.rows[0].n, 1);
+
+      // Fail on the invoice_line insert — after the release and the re-claim,
+      // the worst possible moment.
+      let failed = false;
+      const sabotaged = {
+        query: (text: string, params?: unknown[]) => {
+          if (/INSERT INTO invoice_line/.test(text)) {
+            failed = true;
+            return Promise.reject(new Error('simulated failure mid-invoice'));
+          }
+          return (pool as any).query(text, params);
+        },
+        connect: async () => {
+          const c = await (pool as any).connect();
+          return {
+            query: (text: string, params?: unknown[]) => {
+              if (/INSERT INTO invoice_line/.test(text)) {
+                failed = true;
+                return Promise.reject(new Error('simulated failure mid-invoice'));
+              }
+              return c.query(text, params);
+            },
+            release: () => c.release(),
+          };
+        },
+      } as any;
+
+      await assert.rejects(
+        () => generateInvoice(sabotaged, sess(), scope(), C, '2026-11'),
+        /simulated failure mid-invoice/);
+      assert.equal(failed, true, 'the sabotage actually fired');
+
+      // The ledger row must still be exactly where it was: claimed by the
+      // invoice, billed once, not orphaned.
+      const after = await pool.query(
+        `SELECT count(*)::int AS claimed FROM usage_event WHERE invoice_id = $1`,
+        [good.invoiceId]);
+      assert.equal(after.rows[0].claimed, 1,
+        'a failed regeneration must not release the rows it was rebuilding');
+      const lines = await pool.query(
+        `SELECT count(*)::int AS n FROM invoice_line WHERE invoice_id = $1`, [good.invoiceId]);
+      assert.equal(lines.rows[0].n, 1, 'and must not destroy the lines already billed');
+
+      // And nothing is now double-billable.
+      const unbilled = await pool.query(
+        `SELECT count(*)::int AS n FROM usage_event
+         WHERE tenant_id = $1 AND case_id = $2 AND invoice_id IS NULL`, [T, caseId]);
+      assert.equal(unbilled.rows[0].n, 0);
     });
 
     it('rejects an attribution policy the operator has fat-fingered', async () => {

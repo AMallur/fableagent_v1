@@ -90,8 +90,20 @@ function bundlingScenario(opts: {
   });
 }
 
-const assess = (input: EngineInput) =>
-  evaluateNcci(input, input.claims[0], input.claims[0].lines[1]);
+/**
+ * Mirrors what Step 4 hands the module: the codes on this claim the payer
+ * actually paid. These fixtures carry the payment on the stored claim line, so
+ * that is where it comes from here; the first-pass case — payment present only
+ * on the remittance — is covered end to end through runEngine below.
+ */
+const assess = (input: EngineInput) => {
+  const [claim] = input.claims;
+  const denied = claim.lines[1];
+  const siblings = claim.lines
+    .filter((l) => l.claimLineId !== denied.claimLineId && (l.paidAmount ?? 0) > 0)
+    .map((l) => l.procedureCode);
+  return evaluateNcci(input, claim, denied, siblings);
+};
 
 describe('NCCI reference coverage', () => {
   it('will not conclude anything when no CMS table is loaded', () => {
@@ -261,6 +273,38 @@ describe('NCCI findings reaching the case', () => {
     assert.match(c!.recommendedAction, /modifier 59 was billed/);
     assert.match(c!.evidenceNote ?? '', /modifier indicator 1/);
     assert.equal(c!.recoveryLikelihood, 'high');
+  });
+
+  it('fires on a first-pass ERA that both pays and denies in one file', () => {
+    // The ordinary case: one 835 adjudicates the whole claim, paying line 1
+    // and denying line 2. Before the fix, sibling payment was read only from
+    // stored claim-line amounts — which on a first pass are still empty — so
+    // the denial never became bundling and the CMS tables were never opened.
+    const input = bundlingScenario({ edits: [edit({ modifierIndicator: 1 })], modifiers: ['59'] });
+    // Nothing persisted yet; the payment for line 1 exists only on the remit.
+    input.claims[0].lines[0].paidAmount = null;
+    input.remitLines.push(remitLine({
+      payerClaimNumber: 'ICN-NCCI', procedureCode: '11042',
+      billedAmount: 300, allowedAmount: 220, paidAmount: 220,
+    }));
+
+    const r = runEngine(input);
+    const c = r.casesCreated.find((x) => x.caseType === 'bundling');
+    assert.ok(c, 'a bundling case must be opened on the first pass');
+    assert.match(c!.evidenceNote ?? '', /modifier indicator 1/);
+  });
+
+  it('does not invent a paid sibling from a reversal', () => {
+    // A reversal carries a negative amount and takes cash back. It is not
+    // evidence that another line was paid.
+    const input = bundlingScenario({ edits: [edit({ modifierIndicator: 1 })], modifiers: ['59'] });
+    input.claims[0].lines[0].paidAmount = null;
+    input.remitLines.push(remitLine({
+      payerClaimNumber: 'ICN-NCCI', procedureCode: '11042',
+      billedAmount: 300, allowedAmount: 220, paidAmount: -220, isReversal: true,
+    }));
+    const r = runEngine(input);
+    assert.equal(r.casesCreated.some((x) => x.caseType === 'bundling'), false);
   });
 
   it('scores an unappealable bundle below one the payer got wrong', () => {

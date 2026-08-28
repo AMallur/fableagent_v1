@@ -33,7 +33,7 @@ export function runEngine(input: EngineInput): EngineResult {
 
   // STEP 4 — denial classification -> case candidates (both paths)
   const candidates = [
-    ...candidatesFromDenials(input, variance.denialRoutes),
+    ...candidatesFromDenials(input, variance.denialRoutes, aggregatedMatchedLines),
     ...candidatesFromUnderpayments(input, variance.underpayments),
   ];
 
