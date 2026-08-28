@@ -61,11 +61,11 @@ if (!values.tenant && !NO_TENANT_REQUIRED.has(command)) {
 const { default: pg } = await import('pg');
 const { pgSslConfig } = await import('./web/db_ssl.ts');
 const { readFileSync } = await import('node:fs');
-const { databaseConnectionString } = await import('./db/connection.ts');
-const pool = new pg.Pool({
+const { databaseConnectionString, hardenPool } = await import('./db/connection.ts');
+const pool = hardenPool(new pg.Pool({
   connectionString: databaseConnectionString(),
   ssl: pgSslConfig(readFileSync),
-});
+}));
 const { TenantContextPool } = await import('./db/tenant_pool.ts');
 const tenantPool = new TenantContextPool(pool);
 const runtimePool = values.tenant ? tenantPool.forTenant(values.tenant) : tenantPool;

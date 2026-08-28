@@ -10,3 +10,4 @@ var/
 *.tfstate.*
 *.tfvars
 !*.tfvars.example
+.env.local.test
