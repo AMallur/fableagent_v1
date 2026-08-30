@@ -34,14 +34,14 @@ const VALIDATION_PATH = '/medicalnetwork/professionalclaims/v3/validation';
 function samplePayload(controlNumber: string): Record<string, unknown> {
   return {
     controlNumber,
-    tradingPartnerServiceId: 'MOCKPAYER',
+    tradingPartnerServiceId: '9496',
     submitter: { organizationName: 'ALPHA ORTHOPEDIC GROUP', contactInformation: { name: 'BILLING' } },
     receiver: { organizationName: 'MOCK PAYER' },
     subscriber: {
-      memberId: 'MEM-000001', firstName: 'ALEX', lastName: 'NGUYEN',
+      memberId: '0000000001', firstName: 'ALEX', lastName: 'NGUYEN',
       dateOfBirth: '19800501', gender: 'F',
     },
-    providers: [{ providerType: 'BillingProvider', npi: '1234567890',
+    providers: [{ providerType: 'BillingProvider', npi: '1760854442',
       organizationName: 'ALPHA ORTHOPEDIC GROUP' }],
     claimInformation: {
       claimFilingCode: 'CI',
@@ -49,7 +49,7 @@ function samplePayload(controlNumber: string): Record<string, unknown> {
       claimChargeAmount: '250.00',
       placeOfServiceCode: '11',
       claimFrequencyCode: '7',
-      healthCareCodeInformation: [{ diagnosisTypeCode: 'ABK', diagnosisCode: 'M1711' }],
+      healthCareCodeInformation: [{ diagnosisTypeCode: 'ABK', diagnosisCode: 'J01.90' }],
       serviceLines: [{
         serviceDate: '20260601',
         professionalService: {
