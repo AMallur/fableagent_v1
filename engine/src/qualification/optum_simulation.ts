@@ -318,7 +318,7 @@ export async function runOptumSimulation(): Promise<OptumSimulationReport> {
         + 'payer cannot match to anything',
         claim?.patientControlNumber === 'SIM-0015'
           && claim?.claimChargeAmount === '250.00'
-          && received?.subscriber?.memberId === 'MEM-000001'
+          && received?.subscriber?.memberId === '0000000001'
           && claim?.serviceLines?.[0]?.professionalService?.procedureCode === '99213',
         `controlNumber=${claim?.patientControlNumber} charge=${claim?.claimChargeAmount} `
         + `member=${received?.subscriber?.memberId}`);
