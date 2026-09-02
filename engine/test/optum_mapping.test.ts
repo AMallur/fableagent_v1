@@ -18,7 +18,10 @@ function sampleBundle(overrides: Partial<ClaimSubmissionBundle> = {}): ClaimSubm
       insuranceIdPrimary: 'MEM0001',
     },
     provider: { npiIndividual: '1234567890', name: 'Dr. Smith' },
-    client: { clientName: 'Happy Doctors Group', taxId: '123456789', npiGroup: '1760854442' },
+    client: {
+      clientName: 'Happy Doctors Group', taxId: '123456789', npiGroup: '1760854442',
+      address: { line1: '456 Practice Way', city: 'Nashville', state: 'tn', zip: '372030000' },
+    },
     payer: { payerName: 'Extra Healthy Insurance', payerIdCode: '9496' },
     lines: [
       { lineNumber: 1, procedureCode: 'E0570', modifiers: ['25'], units: 1, billedAmount: 250.5 },
@@ -42,6 +45,9 @@ describe('buildProfessionalClaimSubmission', () => {
     const billing = req.billing as Record<string, unknown>;
     assert.equal(billing.npi, '1760854442'); // prefers group NPI over individual
     assert.equal(billing.employerId, '123456789');
+    const billingAddress = billing.address as Record<string, unknown>;
+    assert.equal(billingAddress.address1, '456 Practice Way');
+    assert.equal(billingAddress.postalCode, '372030000');
 
     const claimInfo = req.claimInformation as Record<string, unknown>;
     assert.equal(claimInfo.patientControlNumber, 'INT-12345');
@@ -63,7 +69,7 @@ describe('buildProfessionalClaimSubmission', () => {
 
   it('falls back to the individual provider NPI when there is no group NPI', () => {
     const req = buildProfessionalClaimSubmission(
-      sampleBundle({ client: { clientName: 'Solo Practice', taxId: null, npiGroup: null } }),
+      sampleBundle({ client: { clientName: 'Solo Practice', taxId: null, npiGroup: null, address: null } }),
       { controlNumber: '1' },
     );
     assert.equal((req.billing as Record<string, unknown>).npi, '1234567890');

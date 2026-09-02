@@ -195,8 +195,83 @@ Measured before and after, same 2,000-claim workload against a growing database:
 - They run against synthetic claims. Real payer files carry denial codes, claim
   structures and edge cases this generator does not produce, and the accuracy of
   detection against real remittances is not what these measure.
-- The payer simulation proves the connector handles failures correctly. It does
-  not prove Optum accepts our payloads; only the sandbox, and then
-  certification, can do that.
 - The load figures are from one machine with one database. They establish
   scaling shape — flat versus growing — not capacity on production hardware.
+
+## Real Optum sandbox submission (2026-09-02)
+
+The payer simulation above proves the connector handles *failures* correctly
+against a mock. It does not prove Optum accepts our payloads — only the real
+sandbox can. That step has now been run.
+
+Using real Optum sandbox OAuth2 credentials (client-credentials flow against
+`https://sandbox-apigw.optum.com/apip/auth/v2/token`) and Optum's own
+[Sandbox Predefined Fields and Values](https://developer.optum.com/eligibilityandclaims/docs/sandbox-predefined-fields-and-values)
+canned test identities, `submitProfessionalClaim` in
+`src/integration/optum_client.ts` was driven over real HTTPS against
+`POST /medicalnetwork/professionalclaims/v3/submission` (via
+`.github/workflows/optum-sandbox.yml`, which holds the sandbox credentials as
+environment-scoped GitHub secrets — nothing here required code changes to the
+connector itself).
+
+Result: **HTTP 200, `"status": "SUCCESS"`, `"editStatus": "SUCCESS"`.**
+
+```json
+{
+  "status": "SUCCESS",
+  "editStatus": "SUCCESS",
+  "controlNumber": "000000001",
+  "payer": {"payerID": "9496", "payerName": "EXTRA HEALTHY INSURANCE"},
+  "claimReference": {
+    "customerClaimNumber": "000000001",
+    "rhclaimNumber": "12345",
+    "submitterId": "12345",
+    "formatVersion": "5010"
+  }
+}
+```
+
+This confirms `optum_client.ts`'s OAuth2 flow and `optum_mapping.ts`'s
+`ClaimSubmissionRequest` field shape (`submitter`, `receiver`, `subscriber`,
+`billing`, `claimInformation`, `serviceLines`) are correct against Optum's
+actual API, not just the mock payer's approximation of it — no connector code
+changed to get from the first 400 to this 200, only the test payload's
+identity fields.
+
+Two real Optum sandbox validation rules were discovered this way, useful for
+anyone extending the mapping later:
+
+- Every identity field (subscriber name, submitter/billing organization name,
+  contact name, control numbers) must exactly match one of Optum's predefined
+  canned sandbox values — arbitrary values are rejected with
+  `"Please use predefined canned users for non-prod environments"`, even
+  though the field is otherwise well-formed.
+- `subscriber.gender` only accepts `'M'`, `'F'`, `'U'`, or `null` — uppercase.
+- A billing provider with an `organizationName` still requires `employerId`
+  (or `ssn`) **and** a full `address` block; omitting either fails
+  `billing.validBillingProviderAdditionalInformation`.
+
+This last rule caught a real mapping gap: `buildProfessionalClaimSubmission`
+did not populate `billing.address`, because `ClaimSubmissionBundle` never
+carried it even though `client.address` has existed in the schema since
+migration `0010_appeals_and_ingest.sql` (used for the appeal letterhead).
+`loadClaimSubmissionBundle`, the `ClaimSubmissionBundle.client` type, and
+`buildProfessionalClaimSubmission` now all thread `client.address` through to
+`billing.address`, with a regression test
+(`test/optum_mapping.test.ts`) asserting it is present. This is fixed as of
+this entry, not an open item — noted here because the sandbox test above
+is what surfaced it; a real submission would otherwise have failed on this
+exact rule for every client without foresight to notice the gap.
+
+**What this does and does not close**, against required external gate 4 in
+`PRODUCTION_READINESS.md` ("Implement and certify the selected
+clearinghouse/payer connector"):
+
+- Closes: proof the connector's transport, auth, and payload shape work
+  against real Optum, not just a mock; the `billing.address` mapping gap the
+  test surfaced.
+- Does not close: Optum partner *certification* (a separate formal process,
+  distinct from sandbox access), a production contract/BAA, and idempotency /
+  acknowledgement-reconciliation behavior, which has only been proven against
+  the mock's fault injection since Optum's sandbox does not offer fault
+  injection.
