@@ -59,6 +59,12 @@ jobs:
           OPTUM_TEST_PAYLOAD: ${{ inputs.test_payload }}
         run: node scripts/optum_sandbox_explore.ts
 
+      - name: Test the real connector (optum_client.ts + optum_mapping.ts)
+        env:
+          OPTUM_CLIENT_ID: ${{ secrets.OPTUM_CLIENT_ID }}
+          OPTUM_CLIENT_SECRET: ${{ secrets.OPTUM_CLIENT_SECRET }}
+        run: node scripts/optum_sandbox_client_test.ts
+
       - name: Print raw sandbox response
         if: always()
         run: |
