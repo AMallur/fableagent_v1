@@ -44,7 +44,12 @@ export interface ClaimSubmissionBundle {
     insuranceIdPrimary: string | null;
   };
   provider: { npiIndividual: string | null; name: string };
-  client: { clientName: string; taxId: string | null; npiGroup: string | null };
+  client: {
+    clientName: string;
+    taxId: string | null;
+    npiGroup: string | null;
+    address: { line1?: string; line2?: string; city?: string; state?: string; zip?: string } | null;
+  };
   payer: { payerName: string; payerIdCode: string | null };
   lines: Array<{
     lineNumber: number;
@@ -65,7 +70,7 @@ export async function loadClaimSubmissionBundle(
             p.dob AS patient_dob, p.gender AS patient_gender, p.address AS patient_address,
             p.insurance_id_primary,
             pr.npi_individual AS provider_npi, pr.name AS provider_name,
-            cl.client_name, cl.tax_id, cl.npi_group,
+            cl.client_name, cl.tax_id, cl.npi_group, cl.address AS client_address,
             py.payer_name, py.payer_id_code
      FROM claim c
      JOIN encounter e ON e.encounter_id = c.encounter_id
@@ -105,7 +110,10 @@ export async function loadClaimSubmissionBundle(
       insuranceIdPrimary: h.insurance_id_primary,
     },
     provider: { npiIndividual: h.provider_npi, name: h.provider_name },
-    client: { clientName: h.client_name, taxId: h.tax_id, npiGroup: h.npi_group },
+    client: {
+      clientName: h.client_name, taxId: h.tax_id, npiGroup: h.npi_group,
+      address: h.client_address ?? null,
+    },
     payer: { payerName: h.payer_name, payerIdCode: h.payer_id_code },
     lines: lines.rows.map((r) => ({
       lineNumber: r.line_number,
@@ -174,6 +182,13 @@ export function buildProfessionalClaimSubmission(
       employerId: bundle.client.taxId ?? undefined,
       organizationName: bundle.client.clientName,
       contactInformation: { name: bundle.client.clientName, phoneNumber: '0000000000' },
+      address: bundle.client.address ? {
+        address1: bundle.client.address.line1,
+        address2: bundle.client.address.line2,
+        city: bundle.client.address.city,
+        state: bundle.client.address.state,
+        postalCode: bundle.client.address.zip,
+      } : undefined,
     },
     claimInformation: {
       claimFilingCode: guessFilingCode(bundle.payer.payerName),
