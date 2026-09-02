@@ -204,39 +204,58 @@ The payer simulation above proves the connector handles *failures* correctly
 against a mock. It does not prove Optum accepts our payloads — only the real
 sandbox can. That step has now been run.
 
-Using real Optum sandbox OAuth2 credentials (client-credentials flow against
+This was done in two rounds, because the first round overclaimed what it
+proved — recorded here rather than silently corrected, since a review caught
+it and the mistake is worth keeping visible.
+
+**Round 1 — exploration, not the connector.** Using real Optum sandbox
+OAuth2 credentials (client-credentials flow against
 `https://sandbox-apigw.optum.com/apip/auth/v2/token`) and Optum's own
 [Sandbox Predefined Fields and Values](https://developer.optum.com/eligibilityandclaims/docs/sandbox-predefined-fields-and-values)
-canned test identities, `submitProfessionalClaim` in
-`src/integration/optum_client.ts` was driven over real HTTPS against
-`POST /medicalnetwork/professionalclaims/v3/submission` (via
+canned test identities, a hand-built JSON payload was POSTed to
+`/medicalnetwork/professionalclaims/v3/submission` via
+`scripts/optum_sandbox_explore.ts` (through
 `.github/workflows/optum-sandbox.yml`, which holds the sandbox credentials as
-environment-scoped GitHub secrets — nothing here required code changes to the
-connector itself).
+environment-scoped GitHub secrets). That script implements its own OAuth
+request and raw `fetch` — it does not import `optum_client.ts` or
+`optum_mapping.ts` — so getting a 200 back from it proved the *payload
+shape* Optum expects, and surfaced real sandbox validation rules, but did
+not prove the connector code itself works. An earlier version of this
+section claimed it did; that was wrong.
 
-Result: **HTTP 200, `"status": "SUCCESS"`, `"editStatus": "SUCCESS"`.**
+**Round 2 — the actual connector.** `scripts/optum_sandbox_client_test.ts`
+builds a `ClaimSubmissionBundle` from the same canned values, runs it
+through the real `buildProfessionalClaimSubmission`, and submits it via the
+real `submitProfessionalClaim` in `src/integration/optum_client.ts` — the
+exact two functions `connectors.ts` calls for a live client/claim. Result:
 
-```json
+```
+status=200 ok=true attempts=1
 {
   "status": "SUCCESS",
   "editStatus": "SUCCESS",
-  "controlNumber": "000000001",
+  "controlNumber": "000000002",
   "payer": {"payerID": "9496", "payerName": "EXTRA HEALTHY INSURANCE"},
   "claimReference": {
     "customerClaimNumber": "000000001",
     "rhclaimNumber": "12345",
     "submitterId": "12345",
     "formatVersion": "5010"
-  }
+  },
+  "meta": {"traceId": "sandbox-client-test-1", "applicationMode": "sandbox"}
 }
 ```
+
+`meta.traceId` echoing back `sandbox-client-test-1` — the exact string the
+script passed as `submitProfessionalClaim`'s `traceId` option — is what
+distinguishes this from round 1: it is Optum echoing a value that only
+`optum_client.ts`'s `x-chng-trace-id` header logic could have sent, so this
+run genuinely exercised the connector, not a hand-rolled substitute for it.
 
 This confirms `optum_client.ts`'s OAuth2 flow and `optum_mapping.ts`'s
 `ClaimSubmissionRequest` field shape (`submitter`, `receiver`, `subscriber`,
 `billing`, `claimInformation`, `serviceLines`) are correct against Optum's
-actual API, not just the mock payer's approximation of it — no connector code
-changed to get from the first 400 to this 200, only the test payload's
-identity fields.
+actual API, not just the mock payer's approximation of it.
 
 Two real Optum sandbox validation rules were discovered this way, useful for
 anyone extending the mapping later:
