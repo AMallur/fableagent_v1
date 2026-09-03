@@ -3,7 +3,12 @@
 **Citation:** 45 CFR §164.308(a)(1)(ii)(A) — "Conduct an accurate and
 thorough assessment of the potential risks and vulnerabilities to the
 confidentiality, integrity, and availability of electronic protected health
-information held by the covered entity or business associate."
+information held by the covered entity or business associate." This is a
+**Required** implementation specification (not Addressable) under the
+Security Management Process standard, §164.308(a)(1). The Security Rule does
+not prescribe a specific methodology or tool — this document's OCR SRA
+Tool-derived structure is a reasonable choice, not a mandated one.
+**Verified against:** [eCFR §164.308](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.308) (2026).
 
 **Prepared by:** [YOUR NAME], HIPAA Security Officer
 **Date of this assessment:** [DATE]

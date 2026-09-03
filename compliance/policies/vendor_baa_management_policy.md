@@ -1,7 +1,13 @@
 # Vendor / Subcontractor Business Associate Agreement Management Policy
 
 **Citation:** 45 CFR §164.308(b) (business associate contracts), §164.502(e)
-(disclosures to business associates).
+(disclosures to business associates). The full regulatory basis for BAA
+content requirements also includes §164.314(a) (Security Rule organizational
+requirements for BA contracts) and §164.504(e) (Privacy Rule organizational
+requirements) — §4 below ("BAA content review") should be read against all
+four sections, not §164.308(b)/§164.502(e) alone.
+**Verified against:** [eCFR §164.308](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.308),
+[eCFR §164.502](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-E/section-164.502) (2026).
 
 **Owner:** HIPAA Security Officer. **Review cycle:** before onboarding any
 new vendor that can access ePHI, and annually thereafter.

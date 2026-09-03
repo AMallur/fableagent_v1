@@ -1,7 +1,12 @@
 # Security Awareness and Training Policy
 
 **Citation:** 45 CFR §164.308(a)(5) — implement a security awareness and
-training program for all workforce members.
+training program for all workforce members. This standard's own
+implementation specifications (security reminders, protection from
+malicious software, log-in monitoring, password management) are all
+**Addressable**; §2 (Content) folding them into one program rather than four
+separate specs is a permitted, common approach.
+**Verified against:** [eCFR §164.308](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.308) (2026).
 
 **Owner:** HIPAA Security Officer. **Review cycle:** annually.
 

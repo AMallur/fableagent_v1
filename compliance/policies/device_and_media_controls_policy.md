@@ -2,7 +2,15 @@
 
 **Citation:** 45 CFR §164.310(d) — policies and procedures governing the
 receipt and removal of hardware/electronic media containing ePHI into and
-out of a facility, and their movement.
+out of a facility, and their movement. Its four implementation
+specifications: disposal (Required, §2.4/§2.5 below), media re-use
+(Required, §2.5), accountability — a record of hardware/media movements and
+the person responsible (Addressable, deferred per §3 below pending
+workforce growth), and data backup and storage — a retrievable exact copy
+before equipment movement (Addressable, satisfied by the RDS/S3 controls
+described in the Encryption Policy and Risk Analysis rather than duplicated
+here).
+**Verified against:** [eCFR §164.310](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.310) (2026).
 
 **Owner:** HIPAA Security Officer. **Review cycle:** annually.
 

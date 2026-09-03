@@ -2,6 +2,16 @@
 
 **Citations:** 45 CFR §164.308(a)(3) (workforce security), §164.308(a)(4)
 (information access management), §164.312(a) (technical access control).
+**Verified against:** [eCFR §164.308](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.308),
+[eCFR §164.312](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.312) (2026).
+§164.312(a)'s implementation specifications are: unique user identification
+(Required), emergency access procedure (Required), automatic logoff
+(Addressable), and encryption/decryption (Addressable) — items 3 and 8 below
+cover unique identity and emergency access; automatic logoff is a session
+control, addressed in
+`compliance/technical_standards/13_Session_Management_Standard.md` rather
+than duplicated here, and encryption/decryption is the Encryption Policy's
+subject.
 
 **Owner:** HIPAA Security Officer. **Review cycle:** annually or after any
 access-model change.
