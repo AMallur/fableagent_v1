@@ -190,11 +190,11 @@ async function buildPacket(
       `UPDATE appeal_packet
        SET packet_status = $1, appeal_type = $2, submission_method = $3,
            auto_submit = $4, needs_review = $5, needs_review_reasons = $6,
-           missing_document_types = $7
-       WHERE packet_id = $8 AND tenant_id = $9`,
+           missing_document_types = $7, letter_category = $8
+       WHERE packet_id = $9 AND tenant_id = $10`,
       [plan.packetStatus, plan.appealType, plan.submissionMethod,
        plan.autoSubmit, plan.needsReview, plan.needsReviewReasons,
-       plan.missingDocumentTypes, packetId, tenantId],
+       plan.missingDocumentTypes, plan.letterCategory, packetId, tenantId],
     );
     await db.query(
       `DELETE FROM appeal_packet_document WHERE packet_id = $1 AND tenant_id = $2`,
@@ -204,10 +204,12 @@ async function buildPacket(
     const inserted = await db.query(
       `INSERT INTO appeal_packet
          (tenant_id, case_id, packet_status, appeal_type, submission_method,
-          auto_submit, needs_review, needs_review_reasons, missing_document_types)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING packet_id`,
+          auto_submit, needs_review, needs_review_reasons, missing_document_types,
+          letter_category)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING packet_id`,
       [tenantId, ctx.caseId, plan.packetStatus, plan.appealType, plan.submissionMethod,
-       plan.autoSubmit, plan.needsReview, plan.needsReviewReasons, plan.missingDocumentTypes],
+       plan.autoSubmit, plan.needsReview, plan.needsReviewReasons, plan.missingDocumentTypes,
+       plan.letterCategory],
     );
     packetId = inserted.rows[0].packet_id;
   }
