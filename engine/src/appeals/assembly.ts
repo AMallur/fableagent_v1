@@ -239,5 +239,6 @@ export function buildDocumentPlan(
     autoSubmit,
     needsReview,
     needsReviewReasons: reasons,
+    letterCategory: category,
   };
 }

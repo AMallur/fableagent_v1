@@ -125,6 +125,15 @@ export interface DocumentPlan {
   autoSubmit: boolean;
   needsReview: boolean;
   needsReviewReasons: string[];
+  /**
+   * The argument category actually used for this packet's letter, frozen at
+   * generation time rather than recomputed later from denialCategory — the
+   * category-to-template mapping in letterCategory() can change over time,
+   * and a future payer-response model needs the historical fact ("this is
+   * the argument that was actually sent"), not a value re-derived from
+   * current logic against past data.
+   */
+  letterCategory: LetterCategory;
 }
 
 export interface CorrectionResult {
