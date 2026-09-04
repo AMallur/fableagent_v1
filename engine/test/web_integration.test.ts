@@ -344,6 +344,76 @@ describe('operational web interface', { skip: !url && 'TEST_DATABASE_URL not set
     assert.ok(r2.totalRecovered > r.totalRecovered);
   });
 
+  it('manual match records the packet outcome when it can be determined safely', async () => {
+    // Reuse an existing claim/client as the template — only the case and
+    // packet under test need to be fresh, deterministic fixtures.
+    const template = await pool.query(
+      `SELECT tenant_id, client_id, claim_id FROM recovery_case LIMIT 1`);
+    const { tenant_id, client_id, claim_id } = template.rows[0];
+
+    const mkCase = () => pool.query(
+      `INSERT INTO recovery_case
+         (tenant_id, client_id, claim_id, case_type, status, expected_amount,
+          paid_amount, recovery_opportunity, priority_level)
+       VALUES ($1, $2, $3, 'underpayment', 'submitted', 500, 300, 200, 'medium')
+       RETURNING case_id`,
+      [tenant_id, client_id, claim_id]).then((r: any) => r.rows[0].case_id);
+    const mkPacket = (caseId: string, submitted: boolean) => pool.query(
+      `INSERT INTO appeal_packet
+         (tenant_id, case_id, packet_status, appeal_type, submission_method, submitted_at)
+       VALUES ($1, $2, 'submitted', 'first_level', 'portal', $3)
+       RETURNING packet_id`,
+      [tenant_id, caseId, submitted ? new Date().toISOString() : null])
+      .then((r: any) => r.rows[0].packet_id);
+
+    // (a) exactly one submitted, unresolved packet -> auto-detected
+    const caseA = await mkCase();
+    const packetA = await mkPacket(caseA, true);
+    const draftOnCaseA = await mkPacket(caseA, false); // draft: must not be picked
+    const ra = await post('/api/reconciliation/match', {
+      caseId: caseA, amount: 123.45, date: '2026-01-15', markWon: true,
+    });
+    assert.equal(ra.outcomePacketId, packetA);
+    const rowA = (await pool.query(
+      `SELECT outcome, outcome_amount, outcome_recorded_at FROM appeal_packet WHERE packet_id = $1`,
+      [packetA])).rows[0];
+    assert.equal(rowA.outcome, 'overturned');
+    assert.equal(Number(rowA.outcome_amount), 123.45);
+    assert.ok(rowA.outcome_recorded_at);
+    const draftRow = (await pool.query(
+      `SELECT outcome FROM appeal_packet WHERE packet_id = $1`, [draftOnCaseA])).rows[0];
+    assert.equal(draftRow.outcome, null, 'a never-submitted draft is not a candidate');
+
+    // (b) two submitted, unresolved packets -> ambiguous, nothing guessed
+    const caseB = await mkCase();
+    const packetB1 = await mkPacket(caseB, true);
+    const packetB2 = await mkPacket(caseB, true);
+    const rb = await post('/api/reconciliation/match', {
+      caseId: caseB, amount: 50, date: '2026-01-15', markWon: true,
+    });
+    assert.equal(rb.outcomePacketId, null);
+    for (const pid of [packetB1, packetB2]) {
+      const row = (await pool.query(
+        `SELECT outcome FROM appeal_packet WHERE packet_id = $1`, [pid])).rows[0];
+      assert.equal(row.outcome, null, 'ambiguous case leaves both packets unrecorded');
+    }
+
+    // (c) explicit packetId overrides auto-detection, and is verified to
+    // actually belong to the case rather than trusted blindly
+    const rbExplicit = await post('/api/reconciliation/match', {
+      caseId: caseB, amount: 50, date: '2026-01-15', markWon: true, packetId: packetB2,
+    });
+    assert.equal(rbExplicit.outcomePacketId, packetB2);
+    const rowB2 = (await pool.query(
+      `SELECT outcome FROM appeal_packet WHERE packet_id = $1`, [packetB2])).rows[0];
+    assert.equal(rowB2.outcome, 'overturned');
+
+    const caseC = await mkCase();
+    await post('/api/reconciliation/match', {
+      caseId: caseC, amount: 50, date: '2026-01-15', markWon: true, packetId: packetA,
+    }, 404); // packetA belongs to caseA, not caseC
+  });
+
   it('team workload: assignees, SLA, overdue, weekly trend', async () => {
     const w = await get('/api/reports/workload') as any;
     assert.ok(w.users.length >= 3);
