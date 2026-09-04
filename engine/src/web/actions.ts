@@ -418,9 +418,30 @@ export async function createManualCase(
 // reconciliation: manual payment match
 // ---------------------------------------------------------------------------
 
+/**
+ * The packet a payment resolves, when it can be determined without asking:
+ * exactly one packet on this case that was actually sent (submitted_at set)
+ * and has no outcome recorded yet. Draft/unsubmitted packets are excluded —
+ * a payer cannot have adjudicated an appeal that was never sent. More than
+ * one candidate (a case with two live appeal levels in flight) is left for
+ * the caller to disambiguate with an explicit packetId rather than guessed.
+ */
+async function soleOpenPacket(db: Queryable, tenantId: UUID, caseId: UUID): Promise<UUID | null> {
+  const rows = await db.query(
+    `SELECT packet_id FROM appeal_packet
+     WHERE tenant_id = $1 AND case_id = $2 AND deleted_at IS NULL
+       AND submitted_at IS NOT NULL AND outcome IS NULL`,
+    [tenantId, caseId],
+  );
+  return rows.rows.length === 1 ? rows.rows[0].packet_id : null;
+}
+
 export async function manualMatch(
   pool: PoolLike, sess: Session, s: Scope,
-  input: { caseId: UUID; remittanceId?: UUID | null; amount: number; date: string; notes?: string; markWon?: boolean },
+  input: {
+    caseId: UUID; remittanceId?: UUID | null; amount: number; date: string; notes?: string;
+    markWon?: boolean; packetId?: UUID | null;
+  },
 ) {
   if (!(input.amount > 0)) throw Object.assign(new Error('amount must be positive'), { status: 400 });
   return tx(pool, s.tenantId, async (db) => {
@@ -436,15 +457,41 @@ export async function manualMatch(
       [s.tenantId, input.caseId, c.claim_line_id ?? null, input.remittanceId ?? null,
        c.claim_id, input.amount, input.date, sess.userId, input.notes ?? null],
     );
+    let outcomePacketId: UUID | null = null;
     if (input.markWon) {
       await db.query(
         `UPDATE recovery_case SET status = 'won' WHERE case_id = $1 AND tenant_id = $2`,
         [input.caseId, s.tenantId],
       );
+      // Explicit packetId always wins; otherwise only act when there is
+      // exactly one candidate. Verify an explicit id actually belongs to
+      // this case/tenant rather than trusting the caller — the same
+      // discipline ownCase already applies to caseId.
+      if (input.packetId) {
+        const owned = await db.query(
+          `SELECT packet_id FROM appeal_packet
+           WHERE packet_id = $1 AND tenant_id = $2 AND case_id = $3 AND deleted_at IS NULL`,
+          [input.packetId, s.tenantId, input.caseId],
+        );
+        if (!owned.rows[0]) throw Object.assign(new Error('packet not found on this case'), { status: 404 });
+        outcomePacketId = input.packetId;
+      } else {
+        outcomePacketId = await soleOpenPacket(db, s.tenantId, input.caseId);
+      }
+      if (outcomePacketId) {
+        await db.query(
+          `UPDATE appeal_packet
+           SET outcome = 'overturned', outcome_amount = $1,
+               outcome_recorded_at = now(), outcome_recorded_by = $2
+           WHERE packet_id = $3 AND tenant_id = $4`,
+          [input.amount, sess.userId, outcomePacketId, s.tenantId],
+        );
+      }
     }
     await logAction(db, s.tenantId, input.caseId, sess.userId, 'payment_received',
       `Payment of $${input.amount.toFixed(2)} matched manually`
-      + `${input.markWon ? '; case marked won' : ''}`);
-    return { ok: true };
+      + `${input.markWon ? '; case marked won' : ''}`
+      + `${outcomePacketId ? `; packet ${outcomePacketId} marked overturned` : ''}`);
+    return { ok: true, outcomePacketId };
   });
 }
