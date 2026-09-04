@@ -1,7 +1,14 @@
 # Encryption and Transmission Security Policy
 
 **Citations:** 45 CFR §164.312(a)(2)(iv) (encryption/decryption), §164.312(e)
-(transmission security).
+(transmission security). Both implementation specifications are
+**Addressable**, not Required — meaning the Company must assess whether they
+are reasonable and appropriate and, if not adopted as specified, document an
+equivalent alternative measure or a documented rationale for not applying
+them; this policy's choice to implement both as mandatory (§1.1, §1.2 below)
+is the Company's own stricter-than-minimum decision, not itself a regulatory
+requirement.
+**Verified against:** [eCFR §164.312](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.312) (2026).
 
 **Owner:** HIPAA Security Officer. **Review cycle:** annually or after any
 infrastructure change affecting encryption.

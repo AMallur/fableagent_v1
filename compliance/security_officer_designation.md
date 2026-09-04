@@ -3,6 +3,7 @@
 **Citation:** 45 CFR §164.308(a)(2) — the Security Rule requires a covered
 entity or business associate to identify the security official responsible
 for developing and implementing its security policies and procedures.
+**Verified against:** [eCFR §164.308](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.308) (2026).
 
 ---
 

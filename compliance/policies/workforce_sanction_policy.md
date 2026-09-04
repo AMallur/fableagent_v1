@@ -2,7 +2,9 @@
 
 **Citation:** 45 CFR §164.308(a)(1)(ii)(C) — apply appropriate sanctions
 against workforce members who fail to comply with the security policies and
-procedures.
+procedures. **Required** implementation specification under the Security
+Management Process standard.
+**Verified against:** [eCFR §164.308](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.308) (2026).
 
 **Owner:** HIPAA Security Officer. **Review cycle:** annually.
 

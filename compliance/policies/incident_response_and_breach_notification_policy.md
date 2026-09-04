@@ -2,6 +2,15 @@
 
 **Citations:** 45 CFR §164.308(a)(6) (security incident procedures), 45 CFR
 §§164.400–414 (Breach Notification Rule).
+**Verified against:** [eCFR §164.308](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-C/section-164.308),
+[eCFR §164.402](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-D/section-164.402),
+[eCFR §164.410](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164/subpart-D/section-164.410) (2026).
+The four-factor test in §3 step 3 and the 60-calendar-day BA→covered-entity
+notification deadline in §3 step 4 match the current regulatory text
+exactly, including that discovery is deemed to occur not only when actually
+learned but when it should have been learned through reasonable diligence
+(§164.410(a)(2)) — the containment step in §3 step 1 should not wait for
+certainty before starting that clock.
 
 **Owner:** HIPAA Security Officer. **Review cycle:** annually, and
 immediately after any real incident (lessons-learned update).
