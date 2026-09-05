@@ -6,6 +6,7 @@
 // ============================================================================
 
 import type { PriorityLevel, UUID } from '../types.ts';
+import type { ArgumentAssessment } from '../intelligence/payer_intelligence.ts';
 
 export type LetterCategory =
   | 'medical_necessity' | 'authorization' | 'bundling' | 'underpayment'
@@ -134,6 +135,16 @@ export interface DocumentPlan {
    * current logic against past data.
    */
   letterCategory: LetterCategory;
+  /**
+   * The payer-outcome flywheel's read at generation time for this packet's
+   * (payer, letter category, appeal level): how this payer has historically
+   * answered this argument, and whether that history forced human review. Null
+   * when no intelligence index was supplied (e.g. pure-unit callers). The
+   * flywheel never changes the legal argument — the denial fixes that — it only
+   * informs routing, review, and auto-submit gating, and is frozen onto the
+   * packet as the audit record of why it was routed as it was.
+   */
+  intelligence: ArgumentAssessment | null;
 }
 
 export interface CorrectionResult {

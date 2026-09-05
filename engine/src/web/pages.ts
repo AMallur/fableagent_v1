@@ -600,6 +600,84 @@ $('#btn-csv').addEventListener('click', () => downloadCsv(d.categories.map((c) =
 
 // ---------------------------------------------------------------------------
 
+export const PAYER_INTEL_BODY = `
+<div class="panel" style="margin-bottom:12px">
+  <div class="sub">The payer-outcome flywheel: how each payer has actually answered
+    each appeal argument, learned from this tenant's own recorded outcomes. Win
+    rates are <b>confidence-adjusted</b> — a cell with only a handful of resolved
+    appeals is marked <i>building</i> and is not leaned on until the sample grows.
+    Cells the payer reliably rejects are surfaced so appeals into them get a human
+    look instead of auto-submission.</div>
+  <div class="sub" id="global" style="margin-top:6px"></div>
+</div>
+<div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+  <button class="btn" id="btn-csv">Export CSV</button></div>
+<div class="panel"><table class="data" id="tbl"><tbody></tbody></table></div>
+<div class="panel" id="detail" style="display:none;margin-top:14px">
+  <h2 id="drill-title">Argument breakdown</h2>
+  <table class="data" id="drill"><tbody></tbody></table></div>`;
+
+export const PAYER_INTEL_JS = `
+let data = [];
+const pct = (x) => (x == null ? '—' : (x * 100).toFixed(0) + '%');
+const confBadge = (c) => '<span class="badge ' +
+  (c === 'high' ? 'won' : c === 'insufficient' ? 'low' : 'high') + '">' +
+  (c === 'insufficient' ? 'building' : esc(c)) + '</span>';
+(async () => {
+  const res = await api('/api/reports/payer-intelligence');
+  data = res.payers;
+  $('#global').innerHTML = 'Tenant-wide base win rate: <b>' + pct(res.globalBaseRate) +
+    '</b> across all resolved appeals. Thin cells are shrunk toward this until they have enough history.';
+  if (data.length === 0) {
+    $('#tbl tbody').innerHTML = '<tr><td>No resolved appeal outcomes recorded yet. ' +
+      'The flywheel begins learning as appeals are answered and outcomes recorded.</td></tr>';
+    return;
+  }
+  $('#tbl tbody').innerHTML =
+    '<tr><th>Payer</th><th class="num">Resolved appeals</th><th class="num">Overall win rate</th>' +
+    '<th class="num">Recovered</th><th>Best channel</th><th>Flagged arguments</th></tr>' +
+    data.map((p, i) => {
+      const flagged = p.categories.filter((c) => !c.estimate.coldStart &&
+        c.estimate.adjustedWinRate <= 0.35);
+      return '<tr class="drill" data-i="' + i + '"><td><b>' + esc(p.payerName) + '</b></td>' +
+        '<td class="num">' + p.resolvedAppeals + '</td>' +
+        '<td class="num">' + pct(p.overallWinRate) + '</td>' +
+        '<td class="num">' + usd(p.totalRecovered) + '</td>' +
+        '<td>' + (p.bestChannel ? esc(p.bestChannel.method) + ' (' + pct(p.bestChannel.adjustedWinRate) + ')' : '—') + '</td>' +
+        '<td>' + (flagged.length ? '<span class="badge lost">' + flagged.length + ' low-win</span>' : '—') + '</td></tr>';
+    }).join('');
+  $$('#tbl .drill').forEach((tr) => tr.addEventListener('click', () => drill(data[tr.dataset.i])));
+})();
+function drill(p) {
+  $('#detail').style.display = '';
+  $('#drill-title').textContent = p.payerName + ' — argument breakdown';
+  $('#drill tbody').innerHTML =
+    '<tr><th>Argument</th><th>Level</th><th class="num">Resolved</th><th class="num">Overturned</th>' +
+    '<th class="num">Partial</th><th class="num">Upheld</th><th class="num">Win rate</th>' +
+    '<th class="num">Adj. win rate</th><th class="num">Exp. $/appeal</th><th>Confidence</th></tr>' +
+    p.categories.map((c) => {
+      const e = c.estimate;
+      const low = !e.coldStart && e.adjustedWinRate <= 0.35;
+      return '<tr' + (low ? ' class="deadline-red"' : '') + '><td>' + esc(c.category.replaceAll('_',' ')) + '</td>' +
+        '<td>' + esc(c.appealType.replaceAll('_',' ')) + '</td>' +
+        '<td class="num">' + e.resolved + '</td><td class="num">' + e.overturned + '</td>' +
+        '<td class="num">' + e.partial + '</td><td class="num">' + e.upheld + '</td>' +
+        '<td class="num">' + pct(e.pointWinRate) + '</td>' +
+        '<td class="num">' + pct(e.adjustedWinRate) + '</td>' +
+        '<td class="num">' + (e.expectedRecoveryPerAttempt == null ? '—' : usd(e.expectedRecoveryPerAttempt)) + '</td>' +
+        '<td>' + confBadge(e.label) + '</td></tr>';
+    }).join('');
+}
+$('#btn-csv').addEventListener('click', () => downloadCsv(data.flatMap((p) => p.categories.map((c) => ({
+  payer: p.payerName, argument: c.category, level: c.appealType,
+  resolved: c.estimate.resolved, overturned: c.estimate.overturned,
+  partial: c.estimate.partial, upheld: c.estimate.upheld,
+  win_rate: c.estimate.pointWinRate, adjusted_win_rate: c.estimate.adjustedWinRate,
+  expected_recovery_per_appeal: c.estimate.expectedRecoveryPerAttempt,
+  confidence: c.estimate.label }))), 'payer-intelligence.csv'));`;
+
+// ---------------------------------------------------------------------------
+
 export const RECON_BODY = `
 <div class="cards">
   <div class="card"><h3>Recovered (period)</h3><div class="big" id="k-rec">—</div>
