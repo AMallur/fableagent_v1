@@ -23,6 +23,7 @@ import type {
   SubmissionMethod,
 } from './types.ts';
 import { letterCategory } from './letter.ts';
+import type { IntelligenceIndex } from '../intelligence/payer_intelligence.ts';
 
 export const AUTO_SUBMIT_CONFIDENCE = 0.85;
 const ELECTRONIC_METHODS: SubmissionMethod[] = ['portal', 'clearinghouse'];
@@ -116,6 +117,7 @@ function timelyFilingProof(ctx: AppealCaseContext): string | null {
 export function buildDocumentPlan(
   ctx: AppealCaseContext,
   correction: CorrectionResult | null,
+  intelligence?: IntelligenceIndex | null,
 ): DocumentPlan {
   const category = letterCategory(ctx);
   const documents: PlannedDocument[] = [];
@@ -199,8 +201,26 @@ export function buildDocumentPlan(
     : ctx.portalUrl ? 'portal'
     : 'mail';
 
+  // payer-outcome flywheel read (advisory: never changes the legal argument,
+  // only informs review / auto-submit gating and is frozen for audit)
+  const assessment = intelligence
+    ? intelligence.assess(ctx.payerId, category, appealType)
+    : null;
+
   // needs_review per spec
   const reasons: string[] = [];
+  // A payer that reliably rejects this argument at this level is not something
+  // to auto-fire into: force a human look. This only ever ADDS review (and so
+  // blocks auto-submit), never removes it, so a pessimistic history can't cause
+  // an appeal to skip review it would otherwise get.
+  if (assessment?.flagForReview) {
+    const e = assessment.estimate;
+    reasons.push(
+      `payer historically rejects ${category} appeals at this level: `
+      + `${Math.round(e.pointWinRate * 100)}% recovered over ${e.resolved} resolved `
+      + `(confidence-adjusted ${Math.round(e.adjustedWinRate * 100)}%); consider escalation`,
+    );
+  }
   if (category === 'medical_necessity') {
     reasons.push('medical necessity appeal requires clinical review');
   }
@@ -240,5 +260,6 @@ export function buildDocumentPlan(
     needsReview,
     needsReviewReasons: reasons,
     letterCategory: category,
+    intelligence: assessment,
   };
 }

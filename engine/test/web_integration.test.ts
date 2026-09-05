@@ -414,6 +414,89 @@ describe('operational web interface', { skip: !url && 'TEST_DATABASE_URL not set
     }, 404); // packetA belongs to caseA, not caseC
   });
 
+  it('payer intelligence: aggregates recorded outcomes, flags reliably-rejected arguments', async () => {
+    const { loadPayerIntelligence } = await import('../src/intelligence/payer_intelligence.ts');
+
+    // A brand-new payer + claim isolates the cells under test from any seed
+    // data, so the assertions are deterministic. Reuse an existing encounter.
+    const tmpl = (await pool.query(
+      `SELECT tenant_id, client_id, encounter_id, claim_type FROM claim LIMIT 1`)).rows[0];
+    const { tenant_id, client_id, encounter_id, claim_type } = tmpl;
+    const stamp = Date.now();
+
+    const payerId = (await pool.query(
+      `INSERT INTO payer (tenant_id, payer_name, payer_type)
+       VALUES ($1, $2, 'commercial') RETURNING payer_id`,
+      [tenant_id, `Flywheel Test Payer ${stamp}`])).rows[0].payer_id;
+    const claimId = (await pool.query(
+      `INSERT INTO claim (tenant_id, client_id, encounter_id, payer_id, claim_type, claim_number_internal)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING claim_id`,
+      [tenant_id, client_id, encounter_id, payerId, claim_type, `FW-${stamp}`])).rows[0].claim_id;
+
+    const mkCase = () => pool.query(
+      `INSERT INTO recovery_case
+         (tenant_id, client_id, claim_id, case_type, status, expected_amount,
+          paid_amount, recovery_opportunity, priority_level)
+       VALUES ($1,$2,$3,'underpayment','won',500,300,200,'medium') RETURNING case_id`,
+      [tenant_id, client_id, claimId]).then((r: any) => r.rows[0].case_id);
+    const mkResolved = (
+      caseId: string, category: string, appealType: string, method: string,
+      outcome: string, amount: number,
+    ) => pool.query(
+      `INSERT INTO appeal_packet
+         (tenant_id, case_id, packet_status, appeal_type, submission_method,
+          letter_category, outcome, outcome_amount, outcome_recorded_at, submitted_at)
+       VALUES ($1,$2,'submitted',$3,$4,$5,$6,$7, now(), now())`,
+      [tenant_id, caseId, appealType, method, category, outcome, amount]);
+
+    const caseId = await mkCase();
+    // bundling / first_level / portal: 2 overturned, 10 upheld -> ~17% win, real sample -> flagged
+    for (let i = 0; i < 2; i++) await mkResolved(caseId, 'bundling', 'first_level', 'portal', 'overturned', 150);
+    for (let i = 0; i < 10; i++) await mkResolved(caseId, 'bundling', 'first_level', 'portal', 'upheld', 0);
+    // medical_necessity / first_level / mail: 9 overturned, 1 upheld -> strong
+    for (let i = 0; i < 9; i++) await mkResolved(caseId, 'medical_necessity', 'first_level', 'mail', 'overturned', 400);
+    await mkResolved(caseId, 'medical_necessity', 'first_level', 'mail', 'upheld', 0);
+
+    const index = await loadPayerIntelligence(pool, { tenantId: tenant_id });
+
+    const weak = index.assess(payerId, 'bundling', 'first_level');
+    assert.equal(weak.estimate.resolved, 12);
+    assert.equal(weak.estimate.overturned, 2);
+    assert.equal(weak.estimate.upheld, 10);
+    assert.equal(weak.estimate.coldStart, false);
+    assert.ok(weak.estimate.adjustedWinRate <= 0.35, `expected low adjusted rate, got ${weak.estimate.adjustedWinRate}`);
+    assert.equal(weak.flagForReview, true);
+
+    const strong = index.assess(payerId, 'medical_necessity', 'first_level');
+    assert.equal(strong.estimate.resolved, 10);
+    assert.equal(strong.flagForReview, false);
+    assert.ok(strong.estimate.adjustedWinRate > 0.35);
+
+    const unseen = index.assess(payerId, 'authorization', 'external_review');
+    assert.equal(unseen.estimate.resolved, 0);
+    assert.equal(unseen.estimate.coldStart, true);
+    assert.equal(unseen.flagForReview, false);
+
+    // best channel ranks by confidence-adjusted win rate: mail (9/10) beats portal (2/12)
+    const best = index.bestChannel(payerId);
+    assert.equal(best?.method, 'mail');
+
+    // tenant filter scopes: a different tenant sees none of this
+    const otherTenant = '00000000-0000-0000-0000-0000000000ff';
+    const emptyIndex = await loadPayerIntelligence(pool, { tenantId: otherTenant });
+    assert.equal(emptyIndex.report().payers.length, 0);
+
+    // and it is reachable over the ops API for the logged-in tenant
+    const rep = await get('/api/reports/payer-intelligence') as any;
+    const row = rep.payers.find((p: any) => p.payerId === payerId);
+    assert.ok(row, 'new payer should appear in the intelligence report');
+    assert.equal(row.resolvedAppeals, 22);
+    assert.equal(row.bestChannel.method, 'mail');
+    const bundlingCell = row.categories.find(
+      (c: any) => c.category === 'bundling' && c.appealType === 'first_level');
+    assert.ok(bundlingCell && bundlingCell.estimate.adjustedWinRate <= 0.35);
+  });
+
   it('team workload: assignees, SLA, overdue, weekly trend', async () => {
     const w = await get('/api/reports/workload') as any;
     assert.ok(w.users.length >= 3);

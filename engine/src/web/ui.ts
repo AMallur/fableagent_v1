@@ -249,6 +249,7 @@ export function layout(opts: {
     ['notifications', '/notifications', 'Notifications <span id="nav-unread" class="navdot"></span>'],
     ['_', '', 'Reports'],
     ['payers', '/reports/payers', 'Payer Performance'],
+    ['payer-intel', '/reports/payer-intelligence', 'Payer Intelligence'],
     ['denials', '/reports/denials', 'Denial Analytics'],
     ['reconciliation', '/reports/reconciliation', 'Reconciliation'],
     ['workload', '/reports/workload', 'Team Workload'],

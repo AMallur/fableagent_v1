@@ -40,6 +40,7 @@ import {
 } from '../security/sso.ts';
 import * as q from './queries.ts';
 import * as reports from './reports.ts';
+import { payerOutcomeIntelligence } from '../intelligence/payer_intelligence.ts';
 import * as actions from './actions.ts';
 import * as auto from './automation_api.ts';
 import { processTrigger } from '../automation/rules.ts';
@@ -435,6 +436,8 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
     page(ctx, 'Appeal Packet Builder', 'builder', pages.BUILDER_BODY, pages.BUILDER_JS));
   authed('GET', /^\/reports\/payers$/, async (ctx) =>
     page(ctx, 'Payer Performance', 'payers', pages.PAYERS_BODY, pages.PAYERS_JS));
+  authed('GET', /^\/reports\/payer-intelligence$/, async (ctx) =>
+    page(ctx, 'Payer Intelligence', 'payer-intel', pages.PAYER_INTEL_BODY, pages.PAYER_INTEL_JS));
   authed('GET', /^\/reports\/denials$/, async (ctx) =>
     page(ctx, 'Denial Analytics', 'denials', pages.DENIALS_BODY, pages.DENIALS_JS));
   authed('GET', /^\/reports\/reconciliation$/, async (ctx) =>
@@ -639,6 +642,10 @@ export async function startServer(pool: PoolLike, opts: ServerOptions = {}) {
       pool, ctx.scope!, Number(ctx.url.searchParams.get('days')) || 30)));
   authed('GET', /^\/api\/reports\/workload$/, async (ctx) =>
     json(ctx, 200, await reports.teamWorkload(pool, ctx.scope!)));
+  // Payer-outcome flywheel: how each payer has historically answered each
+  // argument, computed live from the tenant's own recorded appeal outcomes.
+  authed('GET', /^\/api\/reports\/payer-intelligence$/, async (ctx) =>
+    json(ctx, 200, await payerOutcomeIntelligence(pool, ctx.scope!)));
   authed('POST', /^\/api\/reconciliation\/match$/, async (ctx) => {
     const body = await readJson(ctx.req);
     const out = await actions.manualMatch(pool, ctx.session!, ctx.scope!, body);

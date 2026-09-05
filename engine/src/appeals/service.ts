@@ -24,6 +24,7 @@ import { buildDocumentPlan } from './assembly.ts';
 import { generateAppealLetter } from './letter.ts';
 import { correctionDocument, generateCorrection } from './corrected_claim.ts';
 import { FileSystemDocumentStore, type DocumentStore } from './storage.ts';
+import { loadPayerIntelligence, type IntelligenceIndex } from '../intelligence/payer_intelligence.ts';
 
 export interface GenerateAppealsParams extends AppealScope {
   store?: DocumentStore;
@@ -42,6 +43,10 @@ export interface PacketOutcome {
   missingDocumentTypes: string[];
   documentCount: number;
   correctedClaimId: UUID | null;
+  /** payer-outcome flywheel: whether its read forced human review, and the
+   *  confidence-adjusted win rate it saw (null when cold-start / no index). */
+  intelligenceFlagged: boolean;
+  intelligenceAdjustedWinRate: number | null;
 }
 
 export interface GenerateAppealsResult {
@@ -96,10 +101,20 @@ export async function generateAppealPackets(
 
       const packets: PacketOutcome[] = [];
 
+      // The payer-outcome flywheel, read ONCE for the whole run and looked up
+      // per case in memory — same shape as the category_history aggregation in
+      // context.ts, and for the same reason: a per-case aggregate query would
+      // rescan the tenant's resolved-appeal history for every case in the run.
+      // Learned from the whole tenant's outcomes (no client filter), which is
+      // the point of the flywheel: every client's resolved appeal sharpens the
+      // read for the next one within the same tenant.
+      const intelligence: IntelligenceIndex =
+        await loadPayerIntelligence(client, { tenantId: params.tenantId });
+
       try {
         await client.query('BEGIN');
         for (const ctx of contexts) {
-          packets.push(await buildPacket(client, store, params.tenantId, ctx));
+          packets.push(await buildPacket(client, store, params.tenantId, ctx, intelligence));
         }
         await client.query('COMMIT');
       } catch (err) {
@@ -145,6 +160,7 @@ export async function generateAppealPackets(
 
 async function buildPacket(
   db: Queryable, store: DocumentStore, tenantId: UUID, ctx: AppealCaseContext,
+  intelligence?: IntelligenceIndex | null,
 ): Promise<PacketOutcome> {
   // 1. corrected claim (CO-4/5/6) — one active record per case
   const correction = generateCorrection(ctx);
@@ -172,7 +188,8 @@ async function buildPacket(
   }
 
   // 2. plan
-  const plan: DocumentPlan = buildDocumentPlan(ctx, correction);
+  const plan: DocumentPlan = buildDocumentPlan(ctx, correction, intelligence);
+  const intelSnapshot = plan.intelligence ? JSON.stringify(plan.intelligence.snapshot) : null;
 
   // 3. letter (attachment list = everything else in the packet)
   const attachmentNames = [
@@ -190,11 +207,11 @@ async function buildPacket(
       `UPDATE appeal_packet
        SET packet_status = $1, appeal_type = $2, submission_method = $3,
            auto_submit = $4, needs_review = $5, needs_review_reasons = $6,
-           missing_document_types = $7, letter_category = $8
-       WHERE packet_id = $9 AND tenant_id = $10`,
+           missing_document_types = $7, letter_category = $8, intelligence = $9
+       WHERE packet_id = $10 AND tenant_id = $11`,
       [plan.packetStatus, plan.appealType, plan.submissionMethod,
        plan.autoSubmit, plan.needsReview, plan.needsReviewReasons,
-       plan.missingDocumentTypes, plan.letterCategory, packetId, tenantId],
+       plan.missingDocumentTypes, plan.letterCategory, intelSnapshot, packetId, tenantId],
     );
     await db.query(
       `DELETE FROM appeal_packet_document WHERE packet_id = $1 AND tenant_id = $2`,
@@ -205,11 +222,11 @@ async function buildPacket(
       `INSERT INTO appeal_packet
          (tenant_id, case_id, packet_status, appeal_type, submission_method,
           auto_submit, needs_review, needs_review_reasons, missing_document_types,
-          letter_category)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING packet_id`,
+          letter_category, intelligence)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING packet_id`,
       [tenantId, ctx.caseId, plan.packetStatus, plan.appealType, plan.submissionMethod,
        plan.autoSubmit, plan.needsReview, plan.needsReviewReasons, plan.missingDocumentTypes,
-       plan.letterCategory],
+       plan.letterCategory, intelSnapshot],
     );
     packetId = inserted.rows[0].packet_id;
   }
@@ -263,7 +280,8 @@ async function buildPacket(
      + `status ${plan.packetStatus}`
      + (plan.missingDocumentTypes.length ? ` (missing: ${plan.missingDocumentTypes.join(', ')})` : '')
      + (plan.autoSubmit ? ', queued for auto-submission' : '')
-     + (plan.needsReview ? `, needs review: ${plan.needsReviewReasons.join('; ')}` : ''),
+     + (plan.needsReview ? `, needs review: ${plan.needsReviewReasons.join('; ')}` : '')
+     + (plan.intelligence ? ` — ${plan.intelligence.note}` : ''),
      letterDocId],
   );
 
@@ -280,5 +298,9 @@ async function buildPacket(
     missingDocumentTypes: plan.missingDocumentTypes,
     documentCount: sortOrder,
     correctedClaimId,
+    intelligenceFlagged: plan.intelligence?.flagForReview ?? false,
+    intelligenceAdjustedWinRate:
+      plan.intelligence && !plan.intelligence.estimate.coldStart
+        ? plan.intelligence.estimate.adjustedWinRate : null,
   };
 }
