@@ -86,7 +86,7 @@ jobs:
         run: npm run benchmark:pilot
 
       - name: Upload synthetic benchmark evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: synthetic-pilot-benchmark-${{ github.sha }}
           path: |
@@ -114,7 +114,7 @@ jobs:
               var/cms_public_poc/poc_report.md
 
       - name: Upload CMS public-data POC evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cms-public-poc-${{ github.sha }}
           path: |
@@ -145,7 +145,7 @@ jobs:
               var/pilot_benchmark/benchmark.md
 
       - name: Upload assurance tooling smoke evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: assurance-tooling-smoke-${{ github.sha }}
           path: |
@@ -176,7 +176,7 @@ jobs:
 
       - name: Upload dependency security evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dependency-security-evidence-${{ github.sha }}
           path: |
